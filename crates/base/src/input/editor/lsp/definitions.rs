@@ -137,10 +137,27 @@ impl InputBaseState<EditorMode> {
             return false;
         }
 
-        if self.extras.hover_definition.is_empty() {
-            return false;
-        };
-        if !self.extras.hover_definition.is_same(offset) {
+        if self.extras.hover_definition.is_empty() || !self.extras.hover_definition.is_same(offset) {
+            // The modifier went down without the mouse moving, so nothing was
+            // looked up: ask now and follow the answer when it comes. The
+            // click itself is left to the caller, so the cursor still lands
+            // where it was clicked.
+            let Some(provider) = self.extras.lsp.definition_provider.clone() else {
+                return false;
+            };
+            let task = provider.definitions(&self.text, offset, window, cx);
+            let editor = cx.entity();
+            self.extras.lsp._hover_task = cx.spawn_in(window, async move |_, cx| {
+                let locations = task.await?;
+                _ = editor.update_in(cx, |editor, window, cx| {
+                    if let Some(location) = locations.first() {
+                        editor.go_to_definition(location, window, cx);
+                    }
+                });
+
+                Ok(())
+            });
+
             return false;
         }
 
@@ -159,6 +176,8 @@ impl InputBaseState<EditorMode> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.extras.hover_definition.clear();
+
         let external = location
             .target_uri
             .scheme()
