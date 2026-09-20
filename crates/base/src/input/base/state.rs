@@ -1778,12 +1778,13 @@ impl<M: InputModeKind> InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Check if mouse is within bounds
-        let within_bounds = self
-            .last_bounds
-            .as_ref()
-            .map(|bounds| bounds.contains(&event.position))
-            .unwrap_or(false);
+        // Check if mouse is within bounds. `last_bounds` carries the scroll
+        // offset in its origin (see `index_for_mouse_position`), so testing
+        // against it loses the part of the view the scroll moved up: hover
+        // and Cmd-hover stopped working below it, and everywhere once the
+        // file was scrolled further than its own height. `input_bounds` is
+        // the same rectangle as painted, without the offset.
+        let within_bounds = self.input_bounds.contains(&event.position);
 
         if !within_bounds {
             // Clear hover when mouse leaves the input
