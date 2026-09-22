@@ -22,8 +22,10 @@ const DEFAULT_INLINE_COMPLETION_DEBOUNCE: Duration = Duration::from_millis(300);
 pub struct CompletionMenuOptions {
     /// Maximum width of the popover.
     ///
-    /// Defaults to 320 px, which is fine for most identifiers but can
-    /// truncate longer labels. Widen this when hosting an editor that
+    /// The popover is as wide as its widest row, and never wider than this
+    /// (nor than the room left of the window's right edge). Defaults to
+    /// 320 px, which is fine for most identifiers but can truncate longer
+    /// labels and their detail. Widen this when hosting an editor that
     /// surfaces long completion labels.
     pub max_width: Pixels,
 }

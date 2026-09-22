@@ -663,6 +663,13 @@ pub struct ScrollbarStyles {
 }
 
 impl ScrollbarStyles {
+    /// How much of its scroll area's edge a track in these styles covers:
+    /// its own width, or the default one. Content that must stay readable
+    /// beside an overlay scrollbar keeps this much clear.
+    pub fn track_width(&self) -> Pixels {
+        self.track.width.unwrap_or(WIDTH)
+    }
+
     pub fn track(mut self, build: impl FnOnce(ScrollbarTrackStyle) -> ScrollbarTrackStyle) -> Self {
         self.track = build(self.track);
         self
