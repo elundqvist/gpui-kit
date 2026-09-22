@@ -1,10 +1,11 @@
-use std::{cmp::Reverse, rc::Rc};
+use std::{cmp::Reverse, collections::HashMap, rc::Rc};
 
 use gpui::{
     Action, AnyElement, App, AppContext, AvailableSpace, Context, DismissEvent, Empty, Entity,
-    EventEmitter, Half as _, HighlightStyle, InteractiveElement as _, IntoElement, ParentElement,
-    Pixels, Point, Rems, Render, RenderOnce, SharedString, Styled, StyledText, Subscription,
-    WeakEntity, Window, deferred, div, prelude::FluentBuilder, px, relative, rems, size,
+    EventEmitter, FontId, Half as _, HighlightStyle, InteractiveElement as _, IntoElement,
+    ParentElement, Pixels, Point, Rems, Render, RenderOnce, ScrollStrategy, SharedString, Styled,
+    StyledText, Subscription, WeakEntity, Window, WindowTextSystem, deferred, div,
+    prelude::FluentBuilder, px, relative, rems, size,
 };
 use lsp_types::CompletionItem;
 
@@ -14,9 +15,13 @@ const MIN_MENU_WIDTH: Pixels = px(120.);
 /// set here as well because where the popover fits is worked out from it.
 const MENU_PADDING: Rems = rems(0.25);
 const POPOVER_GAP: Pixels = px(4.);
-/// How many rows are laid out to find the widest: the longest by characters,
-/// so that a long list costs this many layouts and not one per row.
+/// How many rows are laid out to find the widest: those [`RowWidths`] ranks
+/// widest, so that a long list costs this many layouts and not one per row.
 const MEASURED_ROWS: usize = 32;
+/// A row's text size, and the gap between its label and its detail. Shared
+/// by the row and by [`RowWidths`], which must see the row as it is drawn.
+const ROW_TEXT_SIZE: Rems = rems(0.75);
+const ROW_GAP: Rems = rems(0.5);
 
 use crate::{
     ActiveTheme, IndexPath, Selectable, actions, h_flex,
@@ -35,11 +40,67 @@ struct ContextMenuDelegate {
     selected_ix: usize,
 }
 
-/// How long a row's text is, which is what picks the rows worth measuring.
-/// Characters, not bytes: `·` is two bytes and `→` three, and neither is
-/// wider than a letter.
+/// How long a row's text is, which picks the list's sample row: the one it
+/// takes its row height from. Characters, not bytes: `·` is two bytes and
+/// `→` three, and neither is wider than a letter. The menu's width does not
+/// come from this row; see [`CompletionMenu::measure_width`].
 fn row_chars(item: &CompletionItem) -> usize {
     item.label.chars().count() + item.detail.as_deref().map_or(0, |d| d.chars().count())
+}
+
+/// How wide rows are drawn, told cheaply enough to ask of every row in a
+/// long list: each character is laid out once, in the rows' own fonts, and
+/// a row is the sum of its characters. A count of characters is not a
+/// width: an ideograph is about two letters wide, and `i` less than one.
+/// Kerning is left out, so this only ranks the rows; those it ranks widest
+/// are then laid out whole.
+struct RowWidths<'a> {
+    text_system: &'a WindowTextSystem,
+    font_size: Pixels,
+    gap: Pixels,
+    label_font: FontId,
+    detail_font: FontId,
+    chars: HashMap<(FontId, char), Pixels>,
+}
+
+impl<'a> RowWidths<'a> {
+    /// The rows' fonts are the ones inherited where the menu renders, at the
+    /// rows' own size; the detail is italic.
+    fn new(window: &'a Window) -> Self {
+        let font = window.text_style().font();
+        let text_system = window.text_system();
+        Self {
+            label_font: text_system.resolve_font(&font),
+            detail_font: text_system.resolve_font(&font.italic()),
+            font_size: ROW_TEXT_SIZE.to_pixels(window.rem_size()),
+            gap: ROW_GAP.to_pixels(window.rem_size()),
+            text_system,
+            chars: HashMap::default(),
+        }
+    }
+
+    fn text(&mut self, font_id: FontId, text: &str) -> Pixels {
+        let Self {
+            text_system,
+            font_size,
+            chars,
+            ..
+        } = self;
+        text.chars().fold(px(0.), |width, c| {
+            width
+                + *chars
+                    .entry((font_id, c))
+                    .or_insert_with(|| text_system.layout_width(font_id, *font_size, c))
+        })
+    }
+
+    fn row(&mut self, item: &CompletionItem) -> Pixels {
+        let label = self.text(self.label_font, &item.label);
+        match item.detail.as_deref() {
+            Some(detail) => label + self.gap + self.text(self.detail_font, detail),
+            None => label,
+        }
+    }
 }
 
 impl ContextMenuDelegate {
@@ -116,9 +177,9 @@ impl RenderOnce for CompletionMenuItem {
 
         h_flex()
             .id(self.ix)
-            .gap_2()
+            .gap(ROW_GAP)
             .p_1()
-            .text_xs()
+            .text_size(ROW_TEXT_SIZE)
             .line_height(relative(1.))
             .rounded(cx.theme().radius.half())
             .when(item.deprecated.unwrap_or(false), |this| this.line_through())
@@ -193,6 +254,9 @@ pub struct CompletionMenu {
     /// How wide the list is drawn: its widest row, measured on the first
     /// render after the items change. `None` until then.
     width: Option<Pixels>,
+    /// Where the menu was last drawn, relative to the input: under the
+    /// cursor as the editor had laid it out then.
+    drawn_at: Option<Point<Pixels>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -237,6 +301,7 @@ impl CompletionMenu {
                 trigger_start_offset: None,
                 query: SharedString::default(),
                 width: None,
+                drawn_at: None,
                 _subscriptions,
             }
         })
@@ -349,6 +414,9 @@ impl CompletionMenu {
             this.delegate_mut().query = self.query.clone();
             this.delegate_mut().set_items(items);
             this.set_selected_index(Some(IndexPath::new(0)), window, cx);
+            // The first row is selected, so it is shown: a list that had
+            // been scrolled would otherwise keep its offset into the new one.
+            this.scroll_to_item(IndexPath::new(0), ScrollStrategy::Top, window, cx);
             this.set_item_to_measure_index(IndexPath::new(longest_ix), window, cx);
         });
 
@@ -362,29 +430,39 @@ impl CompletionMenu {
     ///
     /// The list cannot tell this itself. It measures one row at the width
     /// it was drawn at last, so a menu that stays open could narrow but
-    /// never widen again, and a menu laid out below a documentation panel
-    /// took the whole `max_width` whatever its rows.
+    /// never widen again, and a menu stacked above its documentation panel
+    /// (column layout) took the whole `max_width` whatever its rows.
     ///
-    /// Only the longest [`MEASURED_ROWS`] rows by characters are laid out.
-    /// Layout asserts it runs inside a draw, so this is called from `render`.
+    /// In a list longer than [`MEASURED_ROWS`], only the rows [`RowWidths`]
+    /// ranks widest are laid out. Layout asserts it runs inside a draw, so
+    /// this is called from `render`.
     fn measure_width(&self, window: &mut Window, cx: &mut App) -> Pixels {
-        let (query, items) = {
+        let (query, row_count, candidates) = {
             let delegate = self.list.read(cx).delegate();
-            (delegate.query.clone(), delegate.items.clone())
+            let items = &delegate.items;
+            let candidates: Vec<(usize, Rc<CompletionItem>)> = if items.len() <= MEASURED_ROWS {
+                items.iter().cloned().enumerate().collect()
+            } else {
+                let mut widths = RowWidths::new(window);
+                let mut ranked: Vec<(Reverse<Pixels>, usize)> = items
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, item)| (Reverse(widths.row(item)), ix))
+                    .collect();
+                ranked.select_nth_unstable(MEASURED_ROWS - 1);
+                ranked.truncate(MEASURED_ROWS);
+                ranked
+                    .into_iter()
+                    .map(|(_, ix)| (ix, items[ix].clone()))
+                    .collect()
+            };
+            (delegate.query.clone(), items.len(), candidates)
         };
-
-        let mut candidates: Vec<usize> = (0..items.len()).collect();
-        if candidates.len() > MEASURED_ROWS {
-            candidates.select_nth_unstable_by_key(MEASURED_ROWS - 1, |&ix| {
-                Reverse(row_chars(&items[ix]))
-            });
-            candidates.truncate(MEASURED_ROWS);
-        }
 
         let available_space = size(AvailableSpace::MaxContent, AvailableSpace::MinContent);
         let (mut width, mut row_height) = (px(0.), px(0.));
-        for ix in candidates {
-            let row = CompletionMenuItem::new(ix, items[ix].clone())
+        for (ix, item) in candidates {
+            let row = CompletionMenuItem::new(ix, item)
                 .highlight_prefix(query.clone())
                 .into_any_element()
                 .layout_as_root(available_space, window, cx);
@@ -392,7 +470,7 @@ impl CompletionMenu {
             row_height = row_height.max(row.height);
         }
 
-        if row_height * items.len() as f32 > MAX_MENU_HEIGHT {
+        if row_height * row_count as f32 > MAX_MENU_HEIGHT {
             width += cx
                 .try_global::<gpui_base::Theme>()
                 .map(|theme| theme.scrollbar.styles().track_width())
@@ -432,6 +510,21 @@ impl Render for CompletionMenu {
         let Some(pos) = self.origin(cx) else {
             return Empty.into_any_element();
         };
+        // The cursor is read as the editor laid it out last, which after an
+        // edit is a frame behind: the editor lays out after this renders. So
+        // look again once the frame is drawn, and draw the menu again if the
+        // cursor has moved, rather than leave it behind until the next
+        // redraw for some other reason. (Weakly: the menu is dropped when
+        // the editor closes its overlays.)
+        self.drawn_at = Some(pos);
+        let menu = cx.weak_entity();
+        window.on_next_frame(move |_, cx| {
+            let _ = menu.update(cx, |this, cx| {
+                if this.open && this.origin(cx) != this.drawn_at {
+                    cx.notify();
+                }
+            });
+        });
 
         let selected_documentation = self
             .list
@@ -635,8 +728,8 @@ mod tests {
         assert_eq!(wide_again.size.width, wide_bounds.size.width);
     }
 
-    /// Laid out below a documentation panel, the popover used to take the
-    /// whole `max_width` whatever its rows.
+    /// Stacked above its documentation panel (column layout), the popover
+    /// used to take the whole `max_width` whatever its rows.
     #[gpui::test]
     fn a_menu_laid_out_in_a_column_is_as_wide_as_its_rows(cx: &mut TestAppContext) {
         let (probe, cx) = probe(cx);
@@ -659,8 +752,7 @@ mod tests {
         let long = "x".repeat(200);
 
         let (measured, capped) = show(&probe, vec![item(&long, None)], cx);
-        let (_, floor) = show(&probe, vec![item("a", None)], cx);
-        let (tiny, _) = show(&probe, vec![item("a", None)], cx);
+        let (tiny, floor) = show(&probe, vec![item("a", None)], cx);
 
         let max_width = cx.update(|_, cx| {
             let state = probe.read(cx).state.clone();
@@ -680,7 +772,12 @@ mod tests {
     #[gpui::test]
     fn the_menu_stays_inside_the_window_at_its_right_edge(cx: &mut TestAppContext) {
         let (probe, cx) = probe(cx);
-        let window_width = cx.update(|window, _| window.bounds().size.width);
+        let (window_width, padding) = cx.update(|window, _| {
+            (
+                window.bounds().size.width,
+                MENU_PADDING.to_pixels(window.rem_size()),
+            )
+        });
         let (_, away) = show(&probe, wide(), cx);
         let (_, floor) = show(&probe, narrow(), cx);
 
@@ -695,9 +792,11 @@ mod tests {
         let (_, wide_at_edge) = show(&probe, wide(), cx);
         let (_, narrow_at_edge) = show(&probe, narrow(), cx);
 
+        // the list is drawn inside the popover's padding, and it is the
+        // popover that must end inside the window
         for (at_edge, away) in [(wide_at_edge, away), (narrow_at_edge, floor)] {
             assert!(
-                at_edge.right() <= window_width,
+                at_edge.right() + padding <= window_width,
                 "{at_edge:?} in a window {window_width:?} wide"
             );
             assert_eq!(at_edge.size.width, away.size.width, "the rows are whole");
@@ -705,20 +804,82 @@ mod tests {
         assert!(wide_at_edge.left() < window_width - px(60.));
     }
 
-    /// The widest row is looked for among the longest by characters: a
-    /// detail full of arrows is long in bytes and no wider than its letters.
+    /// In a long list the rows laid out are those drawn widest, not those
+    /// longest in bytes or in characters: an ideograph is one character and
+    /// about two letters wide, and an arrow is three bytes and one letter.
     #[gpui::test]
-    fn the_widest_row_is_found_by_characters_not_bytes(cx: &mut TestAppContext) {
+    fn the_widest_row_is_found_by_its_width_not_its_length(cx: &mut TestAppContext) {
         let (probe, cx) = probe(cx);
-        let widest = item("abcdefghijklmnopqrstuvwxyz", None);
+        // twelve ideographs from outside the Basic Multilingual Plane, which
+        // the test text system draws two ems wide, as a real font draws any
+        // ideograph: 12 characters, 48 bytes, 24 ems
+        let widest = item(&"𠮷".repeat(12), None);
         let (alone, _) = show(&probe, vec![widest.clone(); MEASURED_ROWS + 8], cx);
 
-        let arrows = item("x", Some("→→→→→→→→→→"));
+        // each longer than the widest in characters (18) and in bytes (52),
+        // and narrower: 18 ems and the gap
+        let arrows = item("x", Some(&"→".repeat(17)));
         let mut items = vec![arrows; MEASURED_ROWS + 7];
         items.insert(MEASURED_ROWS / 2, widest);
         let (among, _) = show(&probe, items, cx);
 
         assert_eq!(among, alone);
+    }
+
+    /// Typing narrows a list the user may have scrolled; the first row is
+    /// selected in the new one, so the new one is shown from the top.
+    #[gpui::test]
+    fn a_new_list_is_shown_from_its_first_row(cx: &mut TestAppContext) {
+        let (probe, cx) = probe(cx);
+        let menu = probe.read_with(cx, |probe, _| probe.menu.clone());
+        let rows = |n| (0..n).map(|i| item(&format!("col_{i:03}"), None)).collect();
+        let scroll_y = |cx: &mut VisualTestContext| {
+            cx.read(|cx| {
+                let list = menu.read(cx).list.read(cx);
+                list.scroll_handle().base_handle().offset().y
+            })
+        };
+
+        show(&probe, rows(300), cx);
+        cx.update(|window, cx| {
+            menu.update(cx, |menu, cx| {
+                menu.list.update(cx, |list, cx| {
+                    list.scroll_to_item(IndexPath::new(200), ScrollStrategy::Top, window, cx)
+                })
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert!(scroll_y(cx) < px(0.), "the list scrolled down");
+
+        show(&probe, rows(120), cx);
+        assert_eq!(scroll_y(cx), px(0.));
+    }
+
+    /// The menu is placed under the cursor as the editor laid it out last,
+    /// which after an edit is a frame behind; the frame after, it follows
+    /// the cursor without waiting for some other redraw.
+    #[gpui::test]
+    fn the_menu_follows_the_cursor_the_frame_after_an_edit(cx: &mut TestAppContext) {
+        let (probe, cx) = probe(cx);
+        let state = probe.read_with(cx, |probe, _| probe.state.clone());
+        let (_, before) = show(&probe, wide(), cx);
+
+        // the edit is drawn at once; the menu with it, where the cursor was
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| state.insert("select ", window, cx));
+        });
+        let list_left = |cx: &mut VisualTestContext| {
+            cx.read(|cx| {
+                let menu = probe.read(cx).menu.read(cx);
+                menu.list.read(cx).scroll_handle().bounds().left()
+            })
+        };
+        assert_eq!(list_left(cx), before.left(), "a frame behind the cursor");
+
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        assert!(list_left(cx) > before.left(), "under the cursor again");
     }
 
     /// The scrollbar is drawn over the rows' ends, so a list that scrolls is
