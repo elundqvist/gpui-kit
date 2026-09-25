@@ -17,7 +17,7 @@ use gpui_base::input::{
 use ropey::Rope;
 use tree_sitter::{InputEdit, ParseOptions, Parser, Point};
 
-use super::{LanguageRegistry, SyntaxHighlighter};
+use super::{InjectionParseData, LanguageRegistry, SyntaxHighlighter};
 
 pub(crate) fn input_highlighter_factory() -> InputHighlighterFactory {
     Rc::new(|language| {
@@ -89,10 +89,21 @@ impl InputHighlighter for TreeSitterInputHighlighter {
         let parse_task = self.parse_task.clone();
         let language = highlighter.borrow().language().clone();
         let old_tree = highlighter.borrow().tree().cloned();
-        let injection_data = highlighter.borrow().injection_parse_data();
+        let cancel = Arc::new(AtomicBool::new(false));
+        // Off the UI thread an injected span may take as long as it needs,
+        // until the next edit cancels it: a span too large to parse in the
+        // time a keystroke gives it is finished here.
+        let injection_data =
+            highlighter
+                .borrow()
+                .injection_parse_data()
+                .map(|data| InjectionParseData {
+                    parse_timeout: None,
+                    cancel: Some(cancel.clone()),
+                    ..data
+                });
         let text = text.clone();
         let text_for_apply = text.clone();
-        let cancel = Arc::new(AtomicBool::new(false));
 
         let task = cx.spawn_in(window, async move |entity, cx| {
             struct CancelOnDrop(Arc<AtomicBool>);
@@ -136,8 +147,11 @@ impl InputHighlighter for TreeSitterInputHighlighter {
                         return None;
                     }
                     let injections = injection_data.map_or_else(Default::default, |data| {
-                        SyntaxHighlighter::compute_injection_layers(data, &tree, &text)
+                        SyntaxHighlighter::compute_injection_layers(data, &tree, &text).0
                     });
+                    if parse_cancel.load(Ordering::Relaxed) {
+                        return None;
+                    }
                     let folds = if folding {
                         extract_fold_ranges(&tree)
                     } else {

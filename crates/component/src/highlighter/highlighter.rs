@@ -7,6 +7,7 @@ use gpui::{HighlightStyle, SharedString};
 use gpui_base::input::RopeExt as _;
 use ropey::{ChunkCursor, Rope};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use std::{
     collections::{BTreeSet, HashMap},
@@ -58,6 +59,8 @@ pub struct SyntaxHighlighter {
     /// Parsed injection trees.
     /// These are built once in update() and queried multiple times in match_styles().
     injection_layers: Vec<InjectionLayer>,
+    /// How long one injected span may parse in update().
+    injection_parse_timeout: Duration,
 }
 
 /// A parsed injection layer.
@@ -68,6 +71,10 @@ pub(crate) struct InjectionLayer {
     pub(crate) ranges: Vec<tree_sitter::Range>,
     pub(crate) byte_range: Range<usize>,
     pub(crate) tree: Tree,
+    /// The span's parse ran out of time, and `tree` is its old tree, edited
+    /// to the text but not parsed again: what the edits touched is left
+    /// plain until a parse of the span finishes.
+    stale: bool,
 }
 
 /// Data needed to compute injection layers on a background thread.
@@ -79,8 +86,11 @@ pub(crate) struct InjectionParseData {
     /// reused when its ranges match the span's new ones, or, for a span that
     /// is not combined, differ only in where the first one starts.
     pub(crate) old_layers: Vec<ReusableInjectionLayer>,
-    /// How long one layer may parse before it keeps its old tree.
-    pub(crate) parse_timeout: Duration,
+    /// How long one layer may parse before it keeps its old tree, or `None`
+    /// for as long as it takes.
+    pub(crate) parse_timeout: Option<Duration>,
+    /// Stops every parse still running once it is set.
+    pub(crate) cancel: Option<Arc<AtomicBool>>,
 }
 
 pub(crate) struct ReusableInjectionLayer {
@@ -377,6 +387,7 @@ impl SyntaxHighlighter {
             parser: Parser::new(),
             tree: None,
             injection_layers: Vec::new(),
+            injection_parse_timeout: INJECTION_PARSE_TIMEOUT,
         }
     }
 
@@ -497,6 +508,7 @@ impl SyntaxHighlighter {
             parser,
             tree: None,
             injection_layers: Vec::new(),
+            injection_parse_timeout: INJECTION_PARSE_TIMEOUT,
         })
     }
 
@@ -554,7 +566,11 @@ impl SyntaxHighlighter {
     /// When `timeout` is `Some`, aborts if parsing exceeds the given duration
     /// and returns `false`. On timeout the old tree is preserved so highlighting
     /// still works with stale data, but `self.text` is updated so that the
-    /// caller can send the current text to a background parse.
+    /// caller can send the current text to a background parse. It also
+    /// returns `false` when an injected span runs out of the time it has of
+    /// its own: the span keeps its old tree, or has no layer if it had none,
+    /// until the background parse, which gives it all the time it needs,
+    /// finishes it.
     /// When `timeout` is `None`, parsing runs to completion and always returns `true`.
     pub fn update(
         &mut self,
@@ -627,8 +643,9 @@ impl SyntaxHighlighter {
         let new_tree = new_tree.unwrap();
         self.tree = Some(new_tree.clone());
         self.text = text.clone();
-        self.parse_injection_layers(&new_tree);
-        true
+        let injections_finished = self.parse_injection_layers(&new_tree);
+        // Only a caller with a time limit parses again in the background.
+        injections_finished || timeout.is_none()
     }
 
     /// Returns the data needed to compute injection layers on a background thread.
@@ -649,18 +666,20 @@ impl SyntaxHighlighter {
                     tree: layer.tree.clone(),
                 })
                 .collect(),
-            parse_timeout: INJECTION_PARSE_TIMEOUT,
+            parse_timeout: Some(self.injection_parse_timeout),
+            cancel: None,
         })
     }
 
-    /// Compute injection layers from a freshly-parsed main tree.
+    /// Compute injection layers from a freshly-parsed main tree, and whether
+    /// every span's parse finished in time.
     /// This is pure computation with no side effects and is safe to run on a
     /// background thread.
     pub(crate) fn compute_injection_layers(
         data: InjectionParseData,
         tree: &Tree,
         text: &Rope,
-    ) -> Vec<InjectionLayer> {
+    ) -> (Vec<InjectionLayer>, bool) {
         struct CombinedRanges {
             ranges: Vec<tree_sitter::Range>,
             byte_count: usize,
@@ -775,6 +794,7 @@ impl SyntaxHighlighter {
                     .get(&(language_name.clone(), front_moved_key(ranges)))
                     .copied()
             };
+        let mut finished = true;
         // Query objects are relatively expensive. Reuse one Arc per language
         // from the previous parse and compile only languages present in this
         // document, rather than eagerly retaining every registered grammar.
@@ -872,7 +892,8 @@ impl SyntaxHighlighter {
                     ranges,
                     old_tree,
                     text,
-                    data.parse_timeout,
+                    &data,
+                    &mut finished,
                 ) {
                     new_layers.push(layer);
                 }
@@ -899,28 +920,32 @@ impl SyntaxHighlighter {
                 ranges,
                 old_tree,
                 text,
-                data.parse_timeout,
+                &data,
+                &mut finished,
             ) {
                 new_layers.push(layer);
             }
         }
         new_layers.sort_by_key(|layer| layer.byte_range.start);
-        new_layers
+        (new_layers, finished)
     }
 
     /// Parse one injection layer over the given included ranges, from the
     /// span's old tree (edited to the text) when there is one.
     ///
-    /// A parse that runs out of `timeout` keeps the old tree, so the span
-    /// keeps its last highlights until a parse of it finishes, instead of going
-    /// plain; a span with no old tree is left out.
+    /// A parse that runs out of the data's `parse_timeout`, or is cancelled,
+    /// clears `finished` and keeps the old tree as a stale layer, so the span
+    /// keeps its last highlights where the edits did not touch it until a
+    /// parse of it finishes, instead of going plain; a span with no old tree
+    /// is left out.
     fn parse_injection_layer(
         language_name: &SharedString,
         highlight_query: Arc<Query>,
         ranges: Vec<tree_sitter::Range>,
         old_tree: Option<&Tree>,
         text: &Rope,
-        timeout: Duration,
+        data: &InjectionParseData,
+        finished: &mut bool,
     ) -> Option<InjectionLayer> {
         let config = LanguageRegistry::singleton().language(language_name)?;
         let mut parser = Parser::new();
@@ -929,7 +954,14 @@ impl SyntaxHighlighter {
         let parse_start = Instant::now();
         let mut timed_out = false;
         let mut progress = |_: &tree_sitter::ParseState| -> ControlFlow<()> {
-            if parse_start.elapsed() > timeout {
+            if data
+                .parse_timeout
+                .is_some_and(|timeout| parse_start.elapsed() > timeout)
+                || data
+                    .cancel
+                    .as_ref()
+                    .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+            {
                 timed_out = true;
                 ControlFlow::Break(())
             } else {
@@ -950,9 +982,12 @@ impl SyntaxHighlighter {
             old_tree,
             Some(options),
         );
-        let tree = match new_tree {
-            Some(tree) if !timed_out => tree,
-            _ => old_tree?.clone(),
+        let (tree, stale) = match new_tree {
+            Some(tree) if !timed_out => (tree, false),
+            _ => {
+                *finished = false;
+                (old_tree?.clone(), true)
+            }
         };
 
         let byte_range = bounding_byte_range(&ranges)?;
@@ -962,6 +997,7 @@ impl SyntaxHighlighter {
             ranges,
             byte_range,
             tree,
+            stale,
         })
     }
 
@@ -984,14 +1020,17 @@ impl SyntaxHighlighter {
         self.injection_layers = injection_layers;
     }
 
-    /// Parse injection layers after the main tree is updated.
+    /// Parse injection layers after the main tree is updated, and return
+    /// whether every span's parse finished in time.
     /// pattern: parse once in update, query many times in render.
-    fn parse_injection_layers(&mut self, tree: &Tree) {
+    fn parse_injection_layers(&mut self, tree: &Tree) -> bool {
         let Some(data) = self.injection_parse_data() else {
             self.injection_layers.clear();
-            return;
+            return true;
         };
-        self.injection_layers = Self::compute_injection_layers(data, tree, &self.text.clone());
+        let (layers, finished) = Self::compute_injection_layers(data, tree, &self.text.clone());
+        self.injection_layers = layers;
+        finished
     }
 
     /// Match the visible ranges of nodes in the Tree for highlighting.
@@ -1043,6 +1082,14 @@ impl SyntaxHighlighter {
                     .any(|prop| prop.key.as_ref() == "highlight.allow-overlap");
 
                 for cap in m.captures {
+                    // In a stale layer, a node an edit touched stretches over
+                    // or shrinks with whatever the edit did, and says nothing
+                    // true about what is there now: a token grown over a paste
+                    // would colour all of it.
+                    if layer.stale && cap.node.has_changes() {
+                        continue;
+                    }
+
                     let node_range = cap.node.start_byte()..cap.node.end_byte();
 
                     if !allow_overlapping_captures && node_range.start < last_end {
@@ -1639,6 +1686,37 @@ console.log(answer);
         range.map(|i| format!("let n{i} = {i};\n")).collect()
     }
 
+    /// Apply `edit` as a keystroke that lands in a span too large to parse
+    /// again in the time it has: the main tree has all the time it needs,
+    /// and the injected spans have none. Returns what `update` does.
+    #[cfg(feature = "tree-sitter-languages")]
+    fn update_out_of_time(
+        highlighter: &mut SyntaxHighlighter,
+        edit: InputEdit,
+        source: &str,
+    ) -> bool {
+        highlighter.injection_parse_timeout = Duration::ZERO;
+        let text = Rope::from_str(source);
+        let finished = highlighter.update(Some(edit), &text, Some(Duration::MAX));
+        highlighter.injection_parse_timeout = INJECTION_PARSE_TIMEOUT;
+        finished
+    }
+
+    /// Parse the injected spans again with as long as they take, as the
+    /// editor's background parse does. Returns whether every one finished.
+    #[cfg(feature = "tree-sitter-languages")]
+    fn parse_injections_with_time(highlighter: &mut SyntaxHighlighter) -> bool {
+        let tree = highlighter.tree().unwrap().clone();
+        let text = highlighter.text().clone();
+        let data = InjectionParseData {
+            parse_timeout: None,
+            ..highlighter.injection_parse_data().unwrap()
+        };
+        let (layers, finished) = SyntaxHighlighter::compute_injection_layers(data, &tree, &text);
+        highlighter.apply_background_tree(tree, &text, layers);
+        finished
+    }
+
     #[cfg(feature = "tree-sitter-languages")]
     fn fresh_highlighter(language: &str, source: &str) -> SyntaxHighlighter {
         let mut highlighter = SyntaxHighlighter::new(language);
@@ -1678,28 +1756,170 @@ console.log(answer);
             assert!(highlighter.update(None, &Rope::from_str(&source), None));
 
             let (edit, source) = replace(&source, at..at, &statements(50..150));
-            let text = Rope::from_str(&source);
-            highlighter.edit_tree(Some(edit), &text);
-            let tree = highlighter
-                .parser
-                .parse(&source, highlighter.tree.as_ref())
-                .unwrap();
-            let mut data = highlighter.injection_parse_data().unwrap();
-            data.parse_timeout = Duration::ZERO;
-            let layers = SyntaxHighlighter::compute_injection_layers(data, &tree, &text);
             assert!(
-                layers
+                !update_out_of_time(&mut highlighter, edit, &source),
+                "a span out of time should ask for another parse"
+            );
+            assert!(
+                highlighter
+                    .injection_layers
                     .iter()
                     .any(|layer| layer.language_name.as_ref() == "javascript"),
                 "a script whose parse runs out of time should keep its layer"
             );
 
-            highlighter.apply_background_tree(tree, &text, layers);
             let highlights = highlighter.match_styles(0..source.len());
             for name in ["first", "last"] {
                 assert!(
                     has_highlight_covering(&highlights, &source, name, "variable"),
                     "{name:?} should keep its highlight, moved with the text"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_injection_layer_out_of_time_leaves_what_an_edit_touched_plain() {
+        // An edit grows the token it lands in, or the one it follows, over
+        // everything it inserts. A layer out of time must not colour a
+        // hundred pasted lines as the one string or comment they went into.
+        let source = format!(
+            "<p>hi</p>\n<script>\nconst first = 1;\nconst label = \"a string\";\n// a comment\n{}const last = 2;\n</script>\n",
+            statements(0..50)
+        );
+        for at in [
+            source.find("a string").unwrap() + 1,
+            source.find("// a comment").unwrap() + "// a comment".len(),
+        ] {
+            let mut highlighter = SyntaxHighlighter::new("html");
+            assert!(highlighter.update(None, &Rope::from_str(&source), None));
+            let (edit, source) = replace(&source, at..at, &statements(50..150));
+            assert!(!update_out_of_time(&mut highlighter, edit, &source));
+
+            let highlights = highlighter.match_styles(0..source.len());
+            for name in ["string", "comment"] {
+                assert!(
+                    !has_highlight_covering(&highlights, &source, "let n99 = 99;", name),
+                    "pasted lines should not be read as one {name}"
+                );
+            }
+            for name in ["first", "last"] {
+                assert!(has_highlight_covering(
+                    &highlights,
+                    &source,
+                    name,
+                    "variable"
+                ));
+            }
+
+            assert!(parse_injections_with_time(&mut highlighter));
+            assert_eq!(
+                highlight_names(&highlighter, &source),
+                highlight_names(&fresh_highlighter("html", &source), &source)
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_injection_layer_out_of_time_is_finished_by_a_parse_with_time() {
+        // `/*` typed at the top of a script makes all of it a comment up to
+        // the `*/` further down; deleting it again means reading all of it
+        // again, which a large script has no time for on a keystroke.
+        let source = format!(
+            "<script>\nconst first = 1;\n{}/* note */\nconst last = 2;\n</script>\n",
+            statements(0..100)
+        );
+        let mut highlighter = SyntaxHighlighter::new("html");
+        assert!(highlighter.update(None, &Rope::from_str(&source), None));
+        let at = source.find("const first").unwrap();
+        let (edit, opened) = replace(&source, at..at, "/*");
+        assert!(highlighter.update(Some(edit), &Rope::from_str(&opened), None));
+        let highlights = highlighter.match_styles(0..opened.len());
+        assert!(has_highlight_covering(
+            &highlights,
+            &opened,
+            "n50",
+            "comment"
+        ));
+
+        let (edit, closed) = replace(&opened, at..at + 2, "");
+        assert!(!update_out_of_time(&mut highlighter, edit, &closed));
+        let highlights = highlighter.match_styles(0..closed.len());
+        assert!(
+            !has_highlight_covering(&highlights, &closed, "n50", "comment"),
+            "a comment closed again should not still be read as one"
+        );
+
+        // A parse that is cancelled stops, however long it may take.
+        let tree = highlighter.tree().unwrap().clone();
+        let data = InjectionParseData {
+            parse_timeout: None,
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+            ..highlighter.injection_parse_data().unwrap()
+        };
+        let (_, finished) =
+            SyntaxHighlighter::compute_injection_layers(data, &tree, highlighter.text());
+        assert!(!finished);
+
+        assert!(parse_injections_with_time(&mut highlighter));
+        let highlights = highlighter.match_styles(0..closed.len());
+        assert!(has_highlight_covering(
+            &highlights,
+            &closed,
+            "n50",
+            "variable"
+        ));
+        assert_eq!(
+            highlight_names(&highlighter, &closed),
+            highlight_names(&fresh_highlighter("html", &closed), &closed)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_injection_span_closed_early_out_of_time_colours_nothing_after_it() {
+        for (language, source, close) in [
+            (
+                "html",
+                format!(
+                    "<script>\nconst first = 1;\n{}let tail_word = 1;\n{}</script>\n",
+                    statements(0..50),
+                    statements(50..100)
+                ),
+                "</script>\n",
+            ),
+            (
+                "markdown",
+                format!(
+                    "```js\nconst first = 1;\n{}let tail_word = 1;\n{}```\n",
+                    statements(0..50),
+                    statements(50..100)
+                ),
+                "```\n\n",
+            ),
+        ] {
+            let mut highlighter = SyntaxHighlighter::new(language);
+            assert!(highlighter.update(None, &Rope::from_str(&source), None));
+            let at = source.find("let n40").unwrap();
+            let (edit, source) = replace(&source, at..at, close);
+            assert!(
+                !update_out_of_time(&mut highlighter, edit, &source),
+                "{language}: a span with no old tree to keep should ask for another parse"
+            );
+
+            let highlights = highlighter.match_styles(0..source.len());
+            assert!(
+                !has_highlight_covering(&highlights, &source, "tail_word", "variable"),
+                "{language}: text after a span closed early should not be coloured as the span"
+            );
+            for layer in &highlighter.injection_layers {
+                let root = layer.tree.root_node();
+                assert!(
+                    layer.byte_range.start <= root.start_byte()
+                        && root.end_byte() <= layer.byte_range.end,
+                    "{language}: a layer's tree should lie within its span"
                 );
             }
         }
