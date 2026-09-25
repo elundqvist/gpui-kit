@@ -76,8 +76,10 @@ pub(crate) struct InjectionParseData {
     pub(crate) content_capture_index: Option<u32>,
     pub(crate) language_capture_index: Option<u32>,
     /// The previous layers, edited to the current text: a span's old tree is
-    /// reused when its ranges match the span's new ones.
+    /// reused when its ranges match or overlap the span's new ones.
     pub(crate) old_layers: Vec<ReusableInjectionLayer>,
+    /// How long one layer may parse before it keeps its old tree.
+    pub(crate) parse_timeout: Duration,
 }
 
 pub(crate) struct ReusableInjectionLayer {
@@ -152,6 +154,27 @@ fn bounding_byte_range(ranges: &[tree_sitter::Range]) -> Option<Range<usize>> {
     let start = ranges.iter().map(|r| r.start_byte).min()?;
     let end = ranges.iter().map(|r| r.end_byte).max()?;
     Some(start..end)
+}
+
+/// An old layer of `language_name` whose span overlaps `ranges`, for a span
+/// whose ranges no longer match any old layer's exactly: text typed at its
+/// very start, or a span split or joined by an edit. The parser compares the
+/// tree's included ranges with the new ones and parses again where they
+/// differ, so the old tree only saves the work where they agree.
+fn overlapping_old_tree<'a>(
+    old_layers: &'a [ReusableInjectionLayer],
+    language_name: &SharedString,
+    ranges: &[tree_sitter::Range],
+) -> Option<&'a Tree> {
+    let span = bounding_byte_range(ranges)?;
+    old_layers
+        .iter()
+        .find(|layer| {
+            &layer.language_name == language_name
+                && bounding_byte_range(&layer.ranges)
+                    .is_some_and(|old| old.start < span.end && span.start < old.end)
+        })
+        .map(|layer| &layer.tree)
 }
 
 fn injection_ranges_within_limits(ranges: &[tree_sitter::Range]) -> bool {
@@ -646,6 +669,7 @@ impl SyntaxHighlighter {
                     tree: layer.tree.clone(),
                 })
                 .collect(),
+            parse_timeout: INJECTION_PARSE_TIMEOUT,
         })
     }
 
@@ -825,13 +849,15 @@ impl SyntaxHighlighter {
                 non_combined_parses += 1;
                 let old_tree = old_layer_trees
                     .get(&(language_name.clone(), ranges_cache_key(&ranges)))
-                    .copied();
+                    .copied()
+                    .or_else(|| overlapping_old_tree(&data.old_layers, &language_name, &ranges));
                 if let Some(layer) = Self::parse_injection_layer(
                     &language_name,
                     highlight_query,
                     ranges,
                     old_tree,
                     text,
+                    data.parse_timeout,
                 ) {
                     new_layers.push(layer);
                 }
@@ -850,13 +876,19 @@ impl SyntaxHighlighter {
             }
             let old_tree = old_layer_trees
                 .get(&(language_name.clone(), ranges_cache_key(&ranges)))
-                .copied();
+                .copied()
+                .or_else(|| overlapping_old_tree(&data.old_layers, &language_name, &ranges));
             let Some(highlight_query) = highlight_queries.get(&language_name).cloned() else {
                 continue;
             };
-            if let Some(layer) =
-                Self::parse_injection_layer(&language_name, highlight_query, ranges, old_tree, text)
-            {
+            if let Some(layer) = Self::parse_injection_layer(
+                &language_name,
+                highlight_query,
+                ranges,
+                old_tree,
+                text,
+                data.parse_timeout,
+            ) {
                 new_layers.push(layer);
             }
         }
@@ -864,15 +896,19 @@ impl SyntaxHighlighter {
         new_layers
     }
 
-    /// Parse one injection layer over the given included ranges.
-    /// Reuses the previous tree, edited to the text, when the language and
-    /// byte ranges still match.
+    /// Parse one injection layer over the given included ranges, from the
+    /// span's old tree (edited to the text) when there is one.
+    ///
+    /// A parse that runs out of `timeout` keeps the old tree, so the span
+    /// keeps its last highlights until a parse of it finishes, instead of going
+    /// plain; a span with no old tree is left out.
     fn parse_injection_layer(
         language_name: &SharedString,
         highlight_query: Arc<Query>,
         ranges: Vec<tree_sitter::Range>,
         old_tree: Option<&Tree>,
         text: &Rope,
+        timeout: Duration,
     ) -> Option<InjectionLayer> {
         let config = LanguageRegistry::singleton().language(language_name)?;
         let mut parser = Parser::new();
@@ -881,7 +917,7 @@ impl SyntaxHighlighter {
         let parse_start = Instant::now();
         let mut timed_out = false;
         let mut progress = |_: &tree_sitter::ParseState| -> ControlFlow<()> {
-            if parse_start.elapsed() > INJECTION_PARSE_TIMEOUT {
+            if parse_start.elapsed() > timeout {
                 timed_out = true;
                 ControlFlow::Break(())
             } else {
@@ -901,10 +937,11 @@ impl SyntaxHighlighter {
             },
             old_tree,
             Some(options),
-        )?;
-        if timed_out {
-            return None;
-        }
+        );
+        let tree = match new_tree {
+            Some(tree) if !timed_out => tree,
+            _ => old_tree?.clone(),
+        };
 
         let byte_range = bounding_byte_range(&ranges)?;
         Some(InjectionLayer {
@@ -912,7 +949,7 @@ impl SyntaxHighlighter {
             highlight_query,
             ranges,
             byte_range,
-            tree: new_tree,
+            tree,
         })
     }
 
@@ -1580,6 +1617,58 @@ console.log(answer);
             "variable"
         ));
         assert!(has_highlight_covering(&highlights, &source, "42", "number"));
+    }
+
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_injection_layer_out_of_time_keeps_its_last_highlights() {
+        let statements = |range: Range<usize>| {
+            range
+                .map(|i| format!("let n{i} = {i};\n"))
+                .collect::<String>()
+        };
+        let source = format!(
+            "<p>hi</p>\n<script>\nconst first = 1;\n{}const last = 2;\n</script>\n",
+            statements(0..50)
+        );
+
+        // A hundred statements pasted into the middle of the script, and at
+        // its very start, where the span's new ranges match none of its old
+        // ones exactly. Either is far more than the parser gets through before
+        // it first asks whether time is up, and with no time at all it is.
+        for at in [
+            source.find("const last").unwrap(),
+            source.find("\nconst first").unwrap(),
+        ] {
+            let mut highlighter = SyntaxHighlighter::new("html");
+            assert!(highlighter.update(None, &Rope::from_str(&source), None));
+
+            let (edit, source) = replace(&source, at..at, &statements(50..150));
+            let text = Rope::from_str(&source);
+            highlighter.edit_tree(Some(edit), &text);
+            let tree = highlighter
+                .parser
+                .parse(&source, highlighter.tree.as_ref())
+                .unwrap();
+            let mut data = highlighter.injection_parse_data().unwrap();
+            data.parse_timeout = Duration::ZERO;
+            let layers = SyntaxHighlighter::compute_injection_layers(data, &tree, &text);
+            assert!(
+                layers
+                    .iter()
+                    .any(|layer| layer.language_name.as_ref() == "javascript"),
+                "a script whose parse runs out of time should keep its layer"
+            );
+
+            highlighter.apply_background_tree(tree, &text, layers);
+            let highlights = highlighter.match_styles(0..source.len());
+            for name in ["first", "last"] {
+                assert!(
+                    has_highlight_covering(&highlights, &source, name, "variable"),
+                    "{name:?} should keep its highlight, moved with the text"
+                );
+            }
+        }
     }
 
     #[test]
