@@ -75,7 +75,8 @@ pub(crate) struct InjectionParseData {
     pub(crate) query: Arc<Query>,
     pub(crate) content_capture_index: Option<u32>,
     pub(crate) language_capture_index: Option<u32>,
-    /// Old injection trees that can be reused when the injected ranges are unchanged.
+    /// The previous layers, edited to the current text: a span's old tree is
+    /// reused when its ranges match the span's new ones.
     pub(crate) old_layers: Vec<ReusableInjectionLayer>,
 }
 
@@ -145,6 +146,12 @@ fn injection_range_len(range: &tree_sitter::Range) -> usize {
 
 fn injection_ranges_byte_count(ranges: &[tree_sitter::Range]) -> usize {
     ranges.iter().map(injection_range_len).sum()
+}
+
+fn bounding_byte_range(ranges: &[tree_sitter::Range]) -> Option<Range<usize>> {
+    let start = ranges.iter().map(|r| r.start_byte).min()?;
+    let end = ranges.iter().map(|r| r.end_byte).max()?;
+    Some(start..end)
 }
 
 fn injection_ranges_within_limits(ranges: &[tree_sitter::Range]) -> bool {
@@ -502,10 +509,30 @@ impl SyntaxHighlighter {
     /// Apply only the structural `edit` to the existing tree and update the stored text,
     /// without re-parsing.
     pub fn edit_tree(&mut self, edit: Option<InputEdit>, text: &Rope) {
-        if let (Some(edit), Some(tree)) = (edit, self.tree.as_mut()) {
-            tree.edit(&edit);
+        if let Some(edit) = edit {
+            if let Some(tree) = self.tree.as_mut() {
+                tree.edit(&edit);
+            }
+            self.edit_injection_layers(&edit);
         }
         self.text = text.clone();
+    }
+
+    /// Apply `edit` to every injection layer as to the main tree: its tree is
+    /// edited and its ranges move with the text. A layer is then found again
+    /// at its new place and parsed again only as far as the edit reaches, and
+    /// an edit that leaves a span's length as it was (an overtype) is parsed
+    /// again rather than hidden by an old tree that never saw it.
+    fn edit_injection_layers(&mut self, edit: &InputEdit) {
+        for layer in &mut self.injection_layers {
+            layer.tree.edit(edit);
+            for range in &mut layer.ranges {
+                edit.edit_range(range);
+            }
+            if let Some(byte_range) = bounding_byte_range(&layer.ranges) {
+                layer.byte_range = byte_range;
+            }
+        }
     }
 
     /// Returns the language name for this highlighter.
@@ -556,6 +583,7 @@ impl SyntaxHighlighter {
             .take()
             .unwrap_or(self.parser.parse("", None).unwrap());
         old_tree.edit(&edit);
+        self.edit_injection_layers(&edit);
 
         let mut timed_out = false;
         let start = Instant::now();
@@ -837,7 +865,8 @@ impl SyntaxHighlighter {
     }
 
     /// Parse one injection layer over the given included ranges.
-    /// Reuses the previous tree only when the language and byte ranges still match.
+    /// Reuses the previous tree, edited to the text, when the language and
+    /// byte ranges still match.
     fn parse_injection_layer(
         language_name: &SharedString,
         highlight_query: Arc<Query>,
@@ -845,11 +874,6 @@ impl SyntaxHighlighter {
         old_tree: Option<&Tree>,
         text: &Rope,
     ) -> Option<InjectionLayer> {
-        fn bounding_byte_range(ranges: &[tree_sitter::Range]) -> Option<Range<usize>> {
-            let start = ranges.iter().map(|r| r.start_byte).min()?;
-            let end = ranges.iter().map(|r| r.end_byte).max()?;
-            Some(start..end)
-        }
         let config = LanguageRegistry::singleton().language(language_name)?;
         let mut parser = Parser::new();
         parser.set_language(config.language.as_ref()?).ok()?;
@@ -1364,6 +1388,29 @@ mod tests {
         })
     }
 
+    /// Replace `range` of `text` with `new_text`, as the editor does on a
+    /// keystroke: the edit it gives the highlighter, and the text after it.
+    #[cfg(feature = "tree-sitter-languages")]
+    fn replace(text: &str, range: Range<usize>, new_text: &str) -> (InputEdit, String) {
+        fn point(text: &str, offset: usize) -> Point {
+            let before = &text[..offset];
+            let column = offset - before.rfind('\n').map_or(0, |newline| newline + 1);
+            Point::new(before.matches('\n').count(), column)
+        }
+
+        let edited = format!("{}{new_text}{}", &text[..range.start], &text[range.end..]);
+        let new_end = range.start + new_text.len();
+        let edit = InputEdit {
+            start_byte: range.start,
+            old_end_byte: range.end,
+            new_end_byte: new_end,
+            start_position: point(text, range.start),
+            old_end_position: point(text, range.end),
+            new_end_position: point(&edited, new_end),
+        };
+        (edit, edited)
+    }
+
     #[track_caller]
     fn assert_unique_styles(
         range: Range<usize>,
@@ -1456,6 +1503,83 @@ console.log(answer);
             has_highlight_covering(&highlights, html, "answer", "variable"),
             "JavaScript identifiers inside script elements should be highlighted"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_injection_overtyped_with_the_same_length_is_highlighted_again() {
+        // Overtyping a character leaves every injected range where it was, so
+        // the span's old tree is reused, and it must have been told of the
+        // edit or it describes the text before it.
+        for (language, source) in [
+            (
+                "html",
+                "<script>\nconst answer = 42;\nlet total = 21;\n</script>\n",
+            ),
+            (
+                "markdown",
+                "```js\nconst answer = 42;\nlet total = 21;\n```\n",
+            ),
+        ] {
+            let mut highlighter = SyntaxHighlighter::new(language);
+            assert!(highlighter.update(None, &Rope::from_str(source), None));
+            let highlights = highlighter.match_styles(0..source.len());
+            assert!(has_highlight_covering(&highlights, source, "42", "number"));
+            assert!(has_highlight_covering(
+                &highlights,
+                source,
+                "let",
+                "keyword"
+            ));
+
+            let at = source.find("42").unwrap();
+            let (edit, source) = replace(source, at..at + 1, "x");
+            assert!(highlighter.update(Some(edit), &Rope::from_str(&source), None));
+            let at = source.find("let").unwrap();
+            let (edit, source) = replace(&source, at..at + 1, "m");
+            assert!(highlighter.update(Some(edit), &Rope::from_str(&source), None));
+
+            let highlights = highlighter.match_styles(0..source.len());
+            assert!(
+                has_highlight_covering(&highlights, &source, "x2", "variable")
+                    && !has_highlight_covering(&highlights, &source, "x2", "number"),
+                "{language}: `42` overtyped to `x2` should be a variable, not a number"
+            );
+            assert!(
+                !has_highlight_covering(&highlights, &source, "met", "keyword"),
+                "{language}: `let` overtyped to `met` should not be a keyword"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_injection_layers_move_with_an_edit_before_it_is_parsed() {
+        // While a parse is pending (text too large to parse on the keystroke,
+        // or a parse that ran out of time) styles come from the last layers,
+        // which must follow the text rather than stay at their old offsets.
+        let source = "<h1>Title</h1>\n<script>\nconst answer = 42;\n</script>\n";
+        let mut highlighter = SyntaxHighlighter::new("html");
+        assert!(highlighter.update(None, &Rope::from_str(source), None));
+
+        let at = source.find("Title").unwrap();
+        let (edit, source) = replace(source, at..at, "A longer ");
+        highlighter.edit_tree(Some(edit), &Rope::from_str(&source));
+
+        let highlights = highlighter.match_styles(0..source.len());
+        assert!(has_highlight_covering(
+            &highlights,
+            &source,
+            "const",
+            "keyword"
+        ));
+        assert!(has_highlight_covering(
+            &highlights,
+            &source,
+            "answer",
+            "variable"
+        ));
+        assert!(has_highlight_covering(&highlights, &source, "42", "number"));
     }
 
     #[test]
