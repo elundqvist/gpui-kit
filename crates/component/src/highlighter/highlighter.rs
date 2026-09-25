@@ -76,7 +76,8 @@ pub(crate) struct InjectionParseData {
     pub(crate) content_capture_index: Option<u32>,
     pub(crate) language_capture_index: Option<u32>,
     /// The previous layers, edited to the current text: a span's old tree is
-    /// reused when its ranges match or overlap the span's new ones.
+    /// reused when its ranges match the span's new ones, or, for a span that
+    /// is not combined, differ only in where the first one starts.
     pub(crate) old_layers: Vec<ReusableInjectionLayer>,
     /// How long one layer may parse before it keeps its old tree.
     pub(crate) parse_timeout: Duration,
@@ -154,27 +155,6 @@ fn bounding_byte_range(ranges: &[tree_sitter::Range]) -> Option<Range<usize>> {
     let start = ranges.iter().map(|r| r.start_byte).min()?;
     let end = ranges.iter().map(|r| r.end_byte).max()?;
     Some(start..end)
-}
-
-/// An old layer of `language_name` whose span overlaps `ranges`, for a span
-/// whose ranges no longer match any old layer's exactly: text typed at its
-/// very start, or a span split or joined by an edit. The parser compares the
-/// tree's included ranges with the new ones and parses again where they
-/// differ, so the old tree only saves the work where they agree.
-fn overlapping_old_tree<'a>(
-    old_layers: &'a [ReusableInjectionLayer],
-    language_name: &SharedString,
-    ranges: &[tree_sitter::Range],
-) -> Option<&'a Tree> {
-    let span = bounding_byte_range(ranges)?;
-    old_layers
-        .iter()
-        .find(|layer| {
-            &layer.language_name == language_name
-                && bounding_byte_range(&layer.ranges)
-                    .is_some_and(|old| old.start < span.end && span.start < old.end)
-        })
-        .map(|layer| &layer.tree)
 }
 
 fn injection_ranges_within_limits(ranges: &[tree_sitter::Range]) -> bool {
@@ -718,6 +698,21 @@ impl SyntaxHighlighter {
             ranges.iter().map(|r| (r.start_byte, r.end_byte)).collect()
         }
 
+        /// The key of ranges that differ only in where the first one starts.
+        /// Text typed at the very start of a span moves that start and no
+        /// other, so the span's ranges match none of the old ones exactly; the
+        /// parser reads the new bytes at the front and reuses what follows.
+        /// Ranges that differ anywhere else get no old tree: the parser can
+        /// reuse an old node that was read up to a range end that has since
+        /// moved, and highlight otherwise than a fresh parse does.
+        fn front_moved_key(ranges: &[tree_sitter::Range]) -> Vec<(usize, usize)> {
+            let mut key = ranges_cache_key(ranges);
+            if let Some(first) = key.first_mut() {
+                first.0 = usize::MAX;
+            }
+            key
+        }
+
         fn resolve_language(
             language_name: &str,
             query_cache: &mut HashMap<SharedString, Arc<Query>>,
@@ -757,6 +752,29 @@ impl SyntaxHighlighter {
                 )
             })
             .collect();
+        let front_moved_old_layer_trees: HashMap<_, _> = data
+            .old_layers
+            .iter()
+            .map(|layer| {
+                (
+                    (layer.language_name.clone(), front_moved_key(&layer.ranges)),
+                    &layer.tree,
+                )
+            })
+            .collect();
+        // A combined layer takes an old tree only when its ranges match
+        // exactly: one whose first range had moved was seen to highlight
+        // otherwise than a fresh parse.
+        let old_tree_for =
+            |language_name: &SharedString, ranges: &[tree_sitter::Range], combined: bool| {
+                let exact = old_layer_trees.get(&(language_name.clone(), ranges_cache_key(ranges)));
+                if exact.is_some() || combined {
+                    return exact.copied();
+                }
+                front_moved_old_layer_trees
+                    .get(&(language_name.clone(), front_moved_key(ranges)))
+                    .copied()
+            };
         // Query objects are relatively expensive. Reuse one Arc per language
         // from the previous parse and compile only languages present in this
         // document, rather than eagerly retaining every registered grammar.
@@ -847,10 +865,7 @@ impl SyntaxHighlighter {
                 }
 
                 non_combined_parses += 1;
-                let old_tree = old_layer_trees
-                    .get(&(language_name.clone(), ranges_cache_key(&ranges)))
-                    .copied()
-                    .or_else(|| overlapping_old_tree(&data.old_layers, &language_name, &ranges));
+                let old_tree = old_tree_for(&language_name, &ranges, false);
                 if let Some(layer) = Self::parse_injection_layer(
                     &language_name,
                     highlight_query,
@@ -874,10 +889,7 @@ impl SyntaxHighlighter {
             if ranges.is_empty() {
                 continue;
             }
-            let old_tree = old_layer_trees
-                .get(&(language_name.clone(), ranges_cache_key(&ranges)))
-                .copied()
-                .or_else(|| overlapping_old_tree(&data.old_layers, &language_name, &ranges));
+            let old_tree = old_tree_for(&language_name, &ranges, true);
             let Some(highlight_query) = highlight_queries.get(&language_name).cloned() else {
                 continue;
             };
@@ -1014,8 +1026,11 @@ impl SyntaxHighlighter {
 
             let query = &layer.highlight_query;
 
+            // A layer's tree has nothing to say outside the layer's span.
             let mut query_cursor = QueryCursor::new();
-            query_cursor.set_byte_range(range.clone());
+            query_cursor.set_byte_range(
+                range.start.max(layer.byte_range.start)..range.end.min(layer.byte_range.end),
+            );
 
             let mut matches =
                 query_cursor.matches(query, layer.tree.root_node(), TextProvider(&self.text));
@@ -1619,14 +1634,33 @@ console.log(answer);
         assert!(has_highlight_covering(&highlights, &source, "42", "number"));
     }
 
+    #[cfg(feature = "tree-sitter-languages")]
+    fn statements(range: Range<usize>) -> String {
+        range.map(|i| format!("let n{i} = {i};\n")).collect()
+    }
+
+    #[cfg(feature = "tree-sitter-languages")]
+    fn fresh_highlighter(language: &str, source: &str) -> SyntaxHighlighter {
+        let mut highlighter = SyntaxHighlighter::new(language);
+        assert!(highlighter.update(None, &Rope::from_str(source), None));
+        highlighter
+    }
+
+    #[cfg(feature = "tree-sitter-languages")]
+    fn highlight_names(
+        highlighter: &SyntaxHighlighter,
+        source: &str,
+    ) -> Vec<(Range<usize>, SharedString)> {
+        highlighter
+            .match_styles(0..source.len())
+            .into_iter()
+            .map(|item| (item.range, item.name))
+            .collect()
+    }
+
     #[test]
     #[cfg(feature = "tree-sitter-languages")]
     fn test_injection_layer_out_of_time_keeps_its_last_highlights() {
-        let statements = |range: Range<usize>| {
-            range
-                .map(|i| format!("let n{i} = {i};\n"))
-                .collect::<String>()
-        };
         let source = format!(
             "<p>hi</p>\n<script>\nconst first = 1;\n{}const last = 2;\n</script>\n",
             statements(0..50)
@@ -1668,6 +1702,60 @@ console.log(answer);
                     "{name:?} should keep its highlight, moved with the text"
                 );
             }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_injection_layers_after_an_edit_match_a_fresh_parse() {
+        let script = format!("<script>\n{}</script>\n<p>after</p>\n", statements(0..20));
+        let fence = format!("```js\n{}```\n\nafter\n", statements(0..20));
+        let at_script = script.find("let n10").unwrap();
+        let at_fence = fence.find("let n10").unwrap();
+        for (language, source, range, new_text) in [
+            // A paragraph that joins the combined inline layer.
+            ("markdown", "d` e\ng*\n\n".to_string(), 9..9, "`"),
+            // A fence that becomes a paragraph.
+            (
+                "markdown",
+                "```python\nx = 1\n```\n".to_string(),
+                3..9,
+                "py```\nthon",
+            ),
+            // A span closed early, and one split in two.
+            ("html", script.clone(), at_script..at_script, "</script>\n"),
+            (
+                "html",
+                script.clone(),
+                at_script..at_script,
+                "</script>\n<script>\n",
+            ),
+            ("markdown", fence.clone(), at_fence..at_fence, "```\n\n"),
+            (
+                "markdown",
+                fence.clone(),
+                at_fence..at_fence,
+                "```\n\n```js\n",
+            ),
+            // Text typed at a span's very start, and deleted there.
+            ("html", script.clone(), 8..8, "\nlet typed = 1;"),
+            ("html", script.clone(), 9..13, ""),
+            ("markdown", fence.clone(), 6..6, "let typed = 1;\n"),
+        ] {
+            let mut highlighter = fresh_highlighter(language, &source);
+            let (edit, source) = replace(&source, range, new_text);
+            assert!(highlighter.update(Some(edit), &Rope::from_str(&source), None));
+            let fresh = fresh_highlighter(language, &source);
+            assert_eq!(
+                highlighter.tree().unwrap().root_node().to_sexp(),
+                fresh.tree().unwrap().root_node().to_sexp(),
+                "{source:?}"
+            );
+            assert_eq!(
+                highlight_names(&highlighter, &source),
+                highlight_names(&fresh, &source),
+                "{source:?}"
+            );
         }
     }
 
