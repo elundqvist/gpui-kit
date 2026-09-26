@@ -2348,9 +2348,11 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// the `\n` lands before the `\r`.
     fn offset_before(&self, offset: usize) -> usize {
         let offset = self.text.clip_offset(offset.saturating_sub(1), Bias::Left);
+        // both are single bytes, so a byte comparison needs no char boundary,
+        // and `offset - 1` may be inside the character stepped over
         if offset > 0
-            && self.text.char_at(offset) == Some('\n')
-            && self.text.char_at(offset - 1) == Some('\r')
+            && self.text.get_byte(offset) == Some(b'\n')
+            && self.text.get_byte(offset - 1) == Some(b'\r')
         {
             return offset - 1;
         }
@@ -2362,8 +2364,8 @@ impl<M: InputModeKind> InputBaseState<M> {
     fn offset_after(&self, offset: usize) -> usize {
         let offset = self.text.clip_offset(offset + 1, Bias::Right);
         if offset > 0
-            && self.text.char_at(offset - 1) == Some('\r')
-            && self.text.char_at(offset) == Some('\n')
+            && self.text.get_byte(offset - 1) == Some(b'\r')
+            && self.text.get_byte(offset) == Some(b'\n')
         {
             return offset + 1;
         }
@@ -4493,6 +4495,33 @@ mod tests {
                 state.set_selected_range(4..4, cx);
                 state.delete_to_beginning_of_line(&DeleteToBeginningOfLine, window, cx);
                 assert_eq!(state.value(), "abcd\r\n");
+
+                // a double-click on the line's end takes the pair whole, so Right
+                // steps out of the selection onto the next line, not onto the \n;
+                // a triple-click stops before the \r
+                state.set_value("ab\r\ncd\r\n", window, cx);
+                state.select_word(2, window, cx);
+                assert_eq!(state.selected_range, Selection::new(2, 4), "the double-click takes the pair");
+                state.right(&MoveRight, window, cx);
+                assert_eq!(state.cursor(), 4);
+                state.select_line(1, window, cx);
+                assert_eq!(state.selected_range, Selection::new(0, 2), "the triple-click stops before the \\r");
+
+                // a character of more than one byte before the pair
+                state.set_value("中\r\ncd\r\n", window, cx);
+                state.set_selected_range(0..0, cx);
+                state.right(&MoveRight, window, cx);
+                assert_eq!(state.cursor(), 3);
+                state.right(&MoveRight, window, cx);
+                assert_eq!(state.cursor(), 5, "Right steps over the pair after a wide character");
+                state.left(&MoveLeft, window, cx);
+                assert_eq!(state.cursor(), 3);
+                state.delete(&Delete, window, cx);
+                assert_eq!(state.value(), "中cd\r\n");
+                state.set_selected_range(5..5, cx);
+                state.backspace(&Backspace, window, cx);
+                state.backspace(&Backspace, window, cx);
+                assert_eq!(state.value(), "中\r\n", "Backspace takes the pair, then the wide character");
 
                 // a \r that no \n follows is text, and the caret goes round it as it does any character
                 state.set_value("a\rb\n", window, cx);

@@ -32,6 +32,22 @@ pub(crate) fn word_range_from_chars(
     following: impl Iterator<Item = char>,
 ) -> Range<usize> {
     let kind = CharacterKind::from(character);
+    if matches!(kind, CharacterKind::Newline) {
+        // A newline connects to nothing, and a `\r\n` is one character to
+        // the selection as it is to the caret: a double-click on the end of
+        // a CRLF line takes the pair, never the `\r` alone, out of which
+        // Right would step onto the `\n`. A `\r` no `\n` follows is text.
+        let (mut previous, mut following) = (previous, following);
+        let start = match character {
+            '\n' if previous.next() == Some('\r') => offset - 1,
+            _ => offset,
+        };
+        let end = match character {
+            '\r' if following.next() == Some('\n') => offset + 2,
+            _ => offset + 1,
+        };
+        return start..end;
+    }
     let connects = |next| {
         matches!(
             (kind, CharacterKind::from(next)),

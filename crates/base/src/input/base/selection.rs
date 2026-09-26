@@ -149,5 +149,28 @@ mod tests {
             let actual = rope.slice(range).to_string();
             assert_eq!(actual, expected, "line {}, column {}", line, column);
         }
+
+        // a CRLF line ends before its \r, also to a click on the \r or the \n
+        let rope = Rope::from("first\r\nsecond\r\nthird");
+        for (offset, expected) in [(0, "first"), (5, "first"), (6, "first"), (10, "second"), (16, "third")] {
+            let range = TextSelector::line_range(&rope, offset);
+            assert_eq!(rope.slice(range).to_string(), expected, "offset {offset}");
+        }
+    }
+
+    /// A double-click on the end of a CRLF line takes the pair whole: the
+    /// caret never stands between its bytes, so nor does a selection's edge.
+    #[test]
+    fn a_crlf_is_one_word_to_the_double_click() {
+        let rope = Rope::from("ab\r\ncd\r\n\r\n");
+        assert_eq!(TextSelector::word_range(&rope, 2), Some(2..4), "on the \\r");
+        assert_eq!(TextSelector::word_range(&rope, 3), Some(2..4), "on the \\n");
+        assert_eq!(TextSelector::word_range(&rope, 8), Some(8..10), "an empty line");
+        assert_eq!(TextSelector::word_range(&rope, 1), Some(0..2), "the word before it");
+        // a \r that no \n follows, and a \n that no \r precedes, stand alone
+        let rope = Rope::from("a\rb\n\rc");
+        assert_eq!(TextSelector::word_range(&rope, 1), Some(1..2));
+        assert_eq!(TextSelector::word_range(&rope, 3), Some(3..4));
+        assert_eq!(TextSelector::word_range(&rope, 4), Some(4..5));
     }
 }

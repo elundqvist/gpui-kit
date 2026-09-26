@@ -186,7 +186,7 @@ pub trait RopeExt {
 
     /// Get char at the given offset (byte).
     ///
-    /// - If the offset is in the middle of a multi-byte character will panic.
+    /// - If the offset is in the middle of a multi-byte character, return None.
     /// - If the offset is out of bounds, return None.
     fn char_at(&self, offset: usize) -> Option<char>;
 
@@ -585,6 +585,15 @@ mod tests {
     }
 
     #[test]
+    fn test_offset_inside_a_terminator_is_the_end_of_its_line() {
+        let rope = Rope::from("ab\r\ncd");
+        assert_eq!(rope.offset_to_position(2), Position::new(0, 2));
+        assert_eq!(rope.offset_to_position(3), Position::new(0, 2), "between the \\r and the \\n");
+        assert_eq!(rope.offset_to_position(4), Position::new(1, 0));
+        assert_eq!(rope.offset_to_position(6), Position::new(1, 2));
+    }
+
+    #[test]
     fn test_offset_to_point() {
         let rope = Rope::from("a 中文🎉 test\nRope");
         assert_eq!(rope.offset_to_point(0), Point::new(0, 0));
@@ -620,6 +629,7 @@ mod tests {
         assert_eq!(rope.char_at(34), Some('🎉'));
         assert_eq!(rope.char_at(38), Some('\n'));
         assert_eq!(rope.char_at(50), None);
+        assert_eq!(rope.char_at(29), None, "inside a multi-byte character");
     }
 
     #[test]

@@ -27,7 +27,7 @@ pub enum WrappingIndent {
 /// A line with soft wrapped lines info.
 #[derive(Debug, Clone)]
 pub(crate) struct LineItem {
-    /// The byte length of the line, without the end `\n`.
+    /// The byte length of the line, without its terminator (`\n` or `\r\n`).
     len: usize,
     /// Number of leading characters of the line reserved as indentation for continuation wrapped
     /// lines, when [`WrappingIndent::Same`] is used.
@@ -36,7 +36,7 @@ pub(crate) struct LineItem {
     pub(crate) indent: u32,
     /// The soft wrapped lines relative byte range (0..len) of this line (Include first line).
     ///
-    /// Not contains the line end `\n`.
+    /// Not contains the line's terminator (`\n` or `\r\n`).
     pub(crate) wrapped_lines: SmallVec<[Range<usize>; 1]>,
 }
 
@@ -61,7 +61,7 @@ pub(crate) struct LineSummary {
     buffer_rows: usize,
     /// Number of wrap rows (sum of each line's `lines_len()`).
     wrap_rows: usize,
-    /// Sum of byte lengths of the buffer lines (without the trailing `\n`).
+    /// Sum of byte lengths of the buffer lines (without their terminators, `\n` or `\r\n`).
     bytes: usize,
     /// Byte length of the longest line in this subtree.
     max_line_len: usize,

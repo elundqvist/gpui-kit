@@ -1466,7 +1466,7 @@ impl<M: InputModeKind> TextElement<M> {
             |start_line: usize, end_line: usize, skip: bool, styles: &mut Vec<_>| {
                 let byte_start = text.line_start_offset(start_line);
                 let byte_end = if is_multi_line {
-                    // +1 for `\n`
+                    // the whole terminator, two bytes in a CRLF file
                     text.line_start_offset(end_line + 1)
                 } else {
                     text.line_end_offset(end_line)
