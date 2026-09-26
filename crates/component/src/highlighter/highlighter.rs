@@ -598,12 +598,24 @@ impl SyntaxHighlighter {
         let (start, old_end, new_end) = (edit.start_byte, edit.old_end_byte, edit.new_end_byte);
         let delta = new_end as isize - old_end as isize;
         let moved = |at: usize| (at as isize + delta).max(0) as usize;
+        let mut points = Vec::new();
         for r in &mut self.edited {
             if r.end < start {
                 continue;
             }
             if r.start > old_end {
                 *r = moved(r.start)..moved(r.end);
+                continue;
+            }
+            // a deletion is a point, and stays one: widened into a later
+            // insertion at the same place it would lose its reach to the
+            // nodes at its edges, and the `/*` deleted then a space typed
+            // would serve the comment again. The node that stood at the
+            // point stands at the insertion's end now, so the point is
+            // kept there too
+            if r.is_empty() {
+                points.push(new_end..new_end);
+                *r = start..start;
                 continue;
             }
             r.start = r.start.min(start);
@@ -614,6 +626,7 @@ impl SyntaxHighlighter {
             }
             .max(new_end);
         }
+        self.edited.extend(points);
         // one that lies within another already is that one's
         if !self
             .edited
@@ -2594,6 +2607,21 @@ $x = 1;
             highlight_names(&highlighter, &edited),
             highlight_names(&fresh_highlighter("markdown", &edited), &edited)
         );
+
+        // `/*` deleted and a space typed where it was: the comment it
+        // opened is still gone
+        let commented = format!("/*{}*/\nlet z = 1;\n", statements(0..20));
+        let mut highlighter = fresh_highlighter("javascript", &commented);
+        let (edit, opened) = replace(&commented, 0..2, "");
+        highlighter.edit_tree(Some(edit), &Rope::from_str(&opened));
+        let (edit, spaced) = replace(&opened, 0..0, " ");
+        highlighter.edit_tree(Some(edit), &Rope::from_str(&spaced));
+        let highlights = highlighter.match_styles(0..spaced.len());
+        assert!(
+            !has_highlight_covering(&highlights, &spaced, "let n10", "comment"),
+            "the comment stays gone"
+        );
+        assert!(has_highlight_at(&highlights, &spaced, "let z", "keyword"));
 
         // the whole text replaced at once is plain until parsed
         let mut highlighter = fresh_highlighter("javascript", source);
