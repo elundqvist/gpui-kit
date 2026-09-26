@@ -613,7 +613,7 @@ impl SyntaxHighlighter {
             // would serve the comment again. The node that stood at the
             // point stands at the insertion's end now, so the point is
             // kept there too
-            if r.is_empty() {
+            if Range::is_empty(r) {
                 points.push(new_end..new_end);
                 *r = start..start;
                 continue;
