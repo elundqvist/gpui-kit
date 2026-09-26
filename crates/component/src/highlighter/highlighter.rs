@@ -243,6 +243,25 @@ fn normalize_combined_injection_ranges(
     normalized
 }
 
+/// Whether a language's spans are parsed from scratch on every change,
+/// never from their old tree.
+///
+/// tree-sitter-markdown's inline grammar (tree-sitter-md 0.5.3) is not sound
+/// under incremental parsing: parsed again from its edited old tree, it can
+/// give another tree than a fresh parse of the same text, and the difference
+/// is always an emphasis or strikethrough delimiter run (`*`, `_`, `~`) read
+/// as opening or closing otherwise than a fresh parse reads it. A random edit
+/// of a short text, with no included ranges, differed in 3% of 20,000 tries;
+/// texts with no delimiter runs never differed in 20,000. The paragraph the
+/// edit lands in does not bound it: an edit in one paragraph changed the
+/// emphasis of another. A fresh inline parse costs about what the parse from
+/// the old tree does here (198 KB of prose: 180 to 200 ms fresh, 160 ms from
+/// the old tree), so this layer gains nothing by reuse but the wrong colour.
+/// Its old tree is still what a span keeps when a parse runs out of time.
+fn injection_parses_from_scratch(language_name: &str) -> bool {
+    language_name == "markdown_inline"
+}
+
 fn should_include_injection_range(
     language_name: &SharedString,
     range: &tree_sitter::Range,
@@ -931,7 +950,8 @@ impl SyntaxHighlighter {
     }
 
     /// Parse one injection layer over the given included ranges, from the
-    /// span's old tree (edited to the text) when there is one.
+    /// span's old tree (edited to the text) when there is one and the
+    /// language's incremental parse can be trusted (`injection_parses_from_scratch`).
     ///
     /// A parse that runs out of the data's `parse_timeout`, or is cancelled,
     /// clears `finished` and keeps the old tree as a stale layer, so the span
@@ -970,6 +990,11 @@ impl SyntaxHighlighter {
         };
         let options = ParseOptions::new().progress_callback(&mut progress);
 
+        let parse_from = if injection_parses_from_scratch(language_name) {
+            None
+        } else {
+            old_tree
+        };
         let new_tree = parser.parse_with_options(
             &mut |offset, _| {
                 if offset >= text.len() {
@@ -979,7 +1004,7 @@ impl SyntaxHighlighter {
                     &chunk[offset - chunk_byte_ix..]
                 }
             },
-            old_tree,
+            parse_from,
             Some(options),
         );
         let (tree, stale) = match new_tree {
@@ -2225,6 +2250,104 @@ $x = 1;
                     && item.range.end >= prose_end
             }),
             "plain prose after the list should not be highlighted as a code span"
+        );
+    }
+
+    /// The inline layer after an edit is what a fresh parse of the text
+    /// gives: tree-sitter-markdown's inline grammar, parsed again from its
+    /// old tree, reads some emphasis otherwise than from scratch, so the
+    /// layer is never parsed from its old tree.
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_markdown_inline_layer_after_an_edit_matches_a_fresh_parse() {
+        // Found by the #34 fuzz: the first `)` replaced loses the emphasis.
+        let source = "\n`\n\\\\**[a](b)[a](b)\n\n";
+        let at = source.find(')').unwrap();
+        let mut highlighter = fresh_highlighter("markdown", source);
+        let (edit, source) = replace(source, at..at + 1, "[a](b)*");
+        assert!(highlighter.update(Some(edit), &Rope::from_str(&source), None));
+        let fresh = fresh_highlighter("markdown", &source);
+        assert_eq!(
+            highlight_names(&highlighter, &source),
+            highlight_names(&fresh, &source),
+            "{source:?}"
+        );
+        assert!(
+            highlight_names(&fresh, &source)
+                .iter()
+                .any(|(_, name)| name.as_ref() == "emphasis"),
+            "the edited text holds an emphasis: {source:?}"
+        );
+
+        // Random edits of random inline text, as the fuzz did, and as a user
+        // does: closing and opening delimiters, and typing in one paragraph
+        // while another holds emphasis.
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut next = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        const PIECES: &[&str] = &[
+            "a", "b", " ", "\n", "*", "**", "_", "`", "[", "]", "(", ")", "\\", "!", "<", ">", "~",
+            "\n\n", "- ",
+        ];
+        let mut text = |len: usize, next: &mut dyn FnMut(usize) -> usize| -> String {
+            (0..len).map(|_| PIECES[next(PIECES.len())]).collect()
+        };
+        for _ in 0..300 {
+            let len = 3 + next(12);
+            let source = text(len, &mut next);
+            let start = next(source.len() + 1);
+            let end = start + next(source.len() - start + 1);
+            let len = next(4);
+            let typed = text(len, &mut next);
+            let mut highlighter = fresh_highlighter("markdown", &source);
+            let (edit, edited) = replace(&source, start..end, &typed);
+            assert!(highlighter.update(Some(edit), &Rope::from_str(&edited), None));
+            let fresh = fresh_highlighter("markdown", &edited);
+            assert_eq!(
+                highlight_names(&highlighter, &edited),
+                highlight_names(&fresh, &edited),
+                "{source:?} with {start}..{end} replaced by {typed:?}"
+            );
+        }
+    }
+
+    /// The inline layer still keeps its old tree, edited to the text, when
+    /// its parse runs out of time: what an edit did not touch keeps its
+    /// colours until the background parse finishes.
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_markdown_inline_layer_out_of_time_keeps_its_last_highlights() {
+        let source = format!(
+            "*one* and `two`\n\n{}three *four*\n",
+            (0..200)
+                .map(|i| format!("*a{i}* b `c{i}`\n\n"))
+                .collect::<String>()
+        );
+        let mut highlighter = fresh_highlighter("markdown", &source);
+        let at = source.find("three ").unwrap() + "three ".len();
+        let (edit, source) = replace(&source, at..at, "typed ");
+        assert!(!update_out_of_time(&mut highlighter, edit, &source));
+        let highlights = highlighter.match_styles(0..source.len());
+        assert!(has_highlight_covering(
+            &highlights,
+            &source,
+            "one",
+            "emphasis"
+        ));
+        assert!(has_highlight_covering(
+            &highlights,
+            &source,
+            "two",
+            "text.code.span"
+        ));
+        assert!(parse_injections_with_time(&mut highlighter));
+        assert_eq!(
+            highlight_names(&highlighter, &source),
+            highlight_names(&fresh_highlighter("markdown", &source), &source)
         );
     }
 
