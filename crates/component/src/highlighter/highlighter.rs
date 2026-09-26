@@ -61,6 +61,16 @@ pub struct SyntaxHighlighter {
     injection_layers: Vec<InjectionLayer>,
     /// How long one injected span may parse in update().
     injection_parse_timeout: Duration,
+    /// `tree` was edited to the text but not parsed again, as it is while
+    /// a large file waits for the background parse or a parse ran out of
+    /// time: what the edits touched in it says nothing true about what is
+    /// there now, and is left plain until a parse finishes.
+    stale: bool,
+    /// Where the edits since the last finished parse lie in the text. A
+    /// node an edit lands in has changes, but so has the first node after
+    /// an edit in the space before it, which the edit did not touch: only
+    /// a node one of these reaches is left plain.
+    edited: Vec<Range<usize>>,
 }
 
 /// A parsed injection layer.
@@ -407,6 +417,8 @@ impl SyntaxHighlighter {
             tree: None,
             injection_layers: Vec::new(),
             injection_parse_timeout: INJECTION_PARSE_TIMEOUT,
+            stale: false,
+            edited: Vec::new(),
         }
     }
 
@@ -528,6 +540,8 @@ impl SyntaxHighlighter {
             tree: None,
             injection_layers: Vec::new(),
             injection_parse_timeout: INJECTION_PARSE_TIMEOUT,
+            stale: false,
+            edited: Vec::new(),
         })
     }
 
@@ -541,15 +555,64 @@ impl SyntaxHighlighter {
     }
 
     /// Apply only the structural `edit` to the existing tree and update the stored text,
-    /// without re-parsing.
+    /// without re-parsing. The tree and every layer are then stale: what
+    /// the edit touched in them is left plain until a parse finishes, since
+    /// a token an edit lands in grows over all it inserts, and the rest
+    /// keeps its colours, moved with the text.
     pub fn edit_tree(&mut self, edit: Option<InputEdit>, text: &Rope) {
         if let Some(edit) = edit {
             if let Some(tree) = self.tree.as_mut() {
                 tree.edit(&edit);
             }
             self.edit_injection_layers(&edit);
+            self.note_edit(&edit);
+            self.mark_stale();
         }
         self.text = text.clone();
+    }
+
+    /// The tree and every layer were edited to the text and not parsed
+    /// again.
+    fn mark_stale(&mut self) {
+        self.stale = true;
+        for layer in &mut self.injection_layers {
+            layer.stale = true;
+        }
+    }
+
+    /// Keep where an edit lies, in the text as it is after it, and move
+    /// the earlier ones with it, as the trees are moved.
+    fn note_edit(&mut self, edit: &InputEdit) {
+        let (start, old_end, new_end) = (edit.start_byte, edit.old_end_byte, edit.new_end_byte);
+        let delta = new_end as isize - old_end as isize;
+        let moved = |at: usize| (at as isize + delta).max(0) as usize;
+        for r in &mut self.edited {
+            if r.end < start {
+                continue;
+            }
+            if r.start > old_end {
+                *r = moved(r.start)..moved(r.end);
+                continue;
+            }
+            r.start = r.start.min(start);
+            r.end = if r.end >= old_end {
+                moved(r.end)
+            } else {
+                new_end
+            }
+            .max(new_end);
+        }
+        self.edited.push(start..new_end);
+    }
+
+    /// Whether an edit since the last finished parse reached the node: a
+    /// stale node's colour is worth keeping only where nothing touched it.
+    fn touched(&self, node: &tree_sitter::Node) -> bool {
+        node.has_changes()
+            && self
+                .edited
+                .iter()
+                .any(|r| r.start <= node.end_byte() && node.start_byte() <= r.end)
     }
 
     /// Apply `edit` to every injection layer as to the main tree: its tree is
@@ -622,6 +685,7 @@ impl SyntaxHighlighter {
             .unwrap_or(self.parser.parse("", None).unwrap());
         old_tree.edit(&edit);
         self.edit_injection_layers(&edit);
+        self.note_edit(&edit);
 
         let mut timed_out = false;
         let start = Instant::now();
@@ -656,13 +720,18 @@ impl SyntaxHighlighter {
             // Restore the old tree so highlighting continues with stale data.
             self.tree = Some(old_tree);
             self.text = text.clone();
+            self.mark_stale();
             return false;
         }
 
         let new_tree = new_tree.unwrap();
         self.tree = Some(new_tree.clone());
+        self.stale = false;
         self.text = text.clone();
         let injections_finished = self.parse_injection_layers(&new_tree);
+        if injections_finished {
+            self.edited.clear();
+        }
         // Only a caller with a time limit parses again in the background.
         injections_finished || timeout.is_none()
     }
@@ -1042,7 +1111,9 @@ impl SyntaxHighlighter {
         }
 
         self.tree = Some(tree);
+        self.stale = false;
         self.injection_layers = injection_layers;
+        self.edited.clear();
     }
 
     /// Parse injection layers after the main tree is updated, and return
@@ -1111,7 +1182,7 @@ impl SyntaxHighlighter {
                     // or shrinks with whatever the edit did, and says nothing
                     // true about what is there now: a token grown over a paste
                     // would colour all of it.
-                    if layer.stale && cap.node.has_changes() {
+                    if layer.stale && self.touched(&cap.node) {
                         continue;
                     }
 
@@ -1145,6 +1216,13 @@ impl SyntaxHighlighter {
             while let Some(query_match) = matches.next() {
                 for cap in query_match.captures {
                     let node = cap.node;
+
+                    // In a stale tree, as in a stale layer, a node an edit
+                    // touched stretches over or shrinks with whatever the
+                    // edit did: a string pasted into would colour the paste
+                    if self.stale && self.touched(&node) {
+                        continue;
+                    }
 
                     let Some(highlight_name) = query.capture_names().get(cap.index as usize) else {
                         continue;
@@ -2250,6 +2328,165 @@ $x = 1;
                     && item.range.end >= prose_end
             }),
             "plain prose after the list should not be highlighted as a code span"
+        );
+    }
+
+    /// Whether a highlight of the name begins where `text` begins in the
+    /// source: a keyword covers its word and no more.
+    #[cfg(feature = "tree-sitter-languages")]
+    fn has_highlight_at(
+        highlights: &[HighlightItem],
+        source: &str,
+        text: &str,
+        highlight_name: &str,
+    ) -> bool {
+        let start = source.find(text).expect("text should exist in source");
+        highlights
+            .iter()
+            .any(|item| item.name.as_ref() == highlight_name && item.range.start == start)
+    }
+
+    /// Above the size the editor parses on a keystroke, an edit reaches the
+    /// tree and every layer without a parse: what it touched is plain until
+    /// the background parse, and the rest keeps its colours. A paste into a
+    /// string grows the string's node over the paste; a keyword typed
+    /// beside a string leaves the string as it was.
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_an_edit_without_a_parse_leaves_what_it_touched_plain() {
+        let html = format!(
+            "<p>hi</p>\n<script>\nconst greeting = \"hello\";\n{}const last = 2;\n</script>\n",
+            statements(0..20)
+        );
+        let pasted = statements(100..4100);
+        let script_at = html.find("hello").unwrap() + "hello".len();
+        let fence = format!(
+            "# Title\n\n```js\nconst greeting = \"hello\";\n{}```\n\n*after*\n",
+            statements(0..20)
+        );
+        let fence_at = fence.find("hello").unwrap() + "hello".len();
+        for (language, source, at) in [("html", html, script_at), ("markdown", fence, fence_at)] {
+            let mut highlighter = fresh_highlighter(language, &source);
+            let (edit, source) = replace(&source, at..at, &pasted);
+            highlighter.edit_tree(Some(edit), &Rope::from_str(&source));
+            let highlights = highlighter.match_styles(0..source.len());
+            // the string the paste landed in stretches over it, and is plain
+            assert!(
+                !has_highlight_covering(&highlights, &source, "let n100", "string"),
+                "{language}: the paste is not a string"
+            );
+            assert!(
+                !highlights
+                    .iter()
+                    .any(|h| h.range.start <= at && h.range.end >= at + pasted.len()),
+                "{language}: nothing colours the whole paste"
+            );
+            // the tokens before and after it keep their colours, and so does
+            // the host around the script or the fence
+            assert!(
+                has_highlight_covering(&highlights, &source, "const", "keyword"),
+                "{language}: the keyword before the paste"
+            );
+            assert!(
+                has_highlight_at(&highlights, &source, "let n19 = 19", "keyword"),
+                "{language}: a keyword after the paste"
+            );
+            if language == "html" {
+                assert!(
+                    has_highlight_at(&highlights, &source, "p>hi", "tag"),
+                    "the host keeps its colours"
+                );
+            } else {
+                assert!(
+                    has_highlight_covering(&highlights, &source, "Title", "title"),
+                    "the host keeps its colours"
+                );
+            }
+            // a keystroke beside the string leaves the string as it was
+            let (edit, source) = replace(
+                &source,
+                at + pasted.len() + 2..at + pasted.len() + 2,
+                "\nconst typed = 1;",
+            );
+            highlighter.edit_tree(Some(edit), &Rope::from_str(&source));
+            let highlights = highlighter.match_styles(0..source.len());
+            assert!(
+                has_highlight_covering(&highlights, &source, "const", "keyword"),
+                "{language}: still the keyword before"
+            );
+            assert!(
+                !has_highlight_covering(&highlights, &source, "let n100", "string"),
+                "{language}: the paste is still not a string"
+            );
+            // the background parse then colours the paste as a fresh parse
+            // would: a string broken open by four thousand lines is what
+            // the grammar makes of it, and no longer one green block
+            let mut parser = Parser::new();
+            parser
+                .set_language(
+                    LanguageRegistry::singleton()
+                        .language(language)
+                        .unwrap()
+                        .language
+                        .as_ref()
+                        .unwrap(),
+                )
+                .unwrap();
+            let tree = parser.parse(&source, highlighter.tree()).unwrap();
+            let text = Rope::from_str(&source);
+            let data = InjectionParseData {
+                parse_timeout: None,
+                ..highlighter.injection_parse_data().unwrap()
+            };
+            let (layers, finished) =
+                SyntaxHighlighter::compute_injection_layers(data, &tree, &text);
+            assert!(finished);
+            highlighter.apply_background_tree(tree, &text, layers);
+            let highlights = highlighter.match_styles(0..source.len());
+            assert_eq!(
+                highlight_names(&highlighter, &source),
+                highlight_names(&fresh_highlighter(language, &source), &source),
+                "{language}"
+            );
+        }
+    }
+
+    /// A keystroke whose parse of the host runs out of time keeps the host's
+    /// tree, edited, the same way: the token typed into is plain, the rest
+    /// keeps its colours, and the tree is served whole again by the next
+    /// parse that finishes.
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_a_parse_out_of_time_leaves_what_the_edit_touched_plain() {
+        let source = format!("const greeting = \"hello\";\n{}", statements(0..3000));
+        let mut highlighter = fresh_highlighter("javascript", &source);
+        let at = source.find("hello").unwrap() + "hello".len();
+        let (edit, source) = replace(&source, at..at, &statements(5000..5100));
+        assert!(!highlighter.update(Some(edit), &Rope::from_str(&source), Some(Duration::ZERO)));
+        let highlights = highlighter.match_styles(0..source.len());
+        assert!(!has_highlight_covering(
+            &highlights,
+            &source,
+            "let n5000",
+            "string"
+        ));
+        assert!(has_highlight_covering(
+            &highlights,
+            &source,
+            "const",
+            "keyword"
+        ));
+        assert!(has_highlight_at(
+            &highlights,
+            &source,
+            "let n2999 = 2999",
+            "keyword"
+        ));
+        let source = format!("{source} ");
+        assert!(highlighter.update(None, &Rope::from_str(&source), None));
+        assert_eq!(
+            highlight_names(&highlighter, &source),
+            highlight_names(&fresh_highlighter("javascript", &source), &source)
         );
     }
 
