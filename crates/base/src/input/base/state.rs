@@ -1216,22 +1216,12 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.select_to(self.next_boundary(self.cursor()), cx);
     }
 
-    pub(super) fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
-        if self.is_single_line() {
-            return;
-        }
-        self.undo_manager.break_transaction_coalescing();
-        let offset = self.start_of_line().saturating_sub(1);
-        self.select_to(self.previous_boundary(offset), cx);
+    pub(super) fn select_up(&mut self, _: &SelectUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_vertical(-1, window, cx);
     }
 
-    pub(super) fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
-        if self.is_single_line() {
-            return;
-        }
-        self.undo_manager.break_transaction_coalescing();
-        let offset = (self.end_of_line() + 1).min(self.text.len());
-        self.select_to(self.next_boundary(offset), cx);
+    pub(super) fn select_down(&mut self, _: &SelectDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_vertical(1, window, cx);
     }
 
     pub(super) fn on_action_select_all(
@@ -2869,7 +2859,10 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         M::refresh_language_features(self, window, cx);
         self.selected_range = (new_offset..new_offset).into();
         self.ime_marked_range.take();
-        self.update_preferred_column();
+        // The layout is older than the text now, so the caret's place in it
+        // is not the column: a vertical move takes that from the layout
+        // current then.
+        self.preferred_column = None;
         self.update_search(cx);
         if self.is_multi_line() {
             self.mode.update_auto_grow(&self.display_map);
@@ -4531,6 +4524,79 @@ mod tests {
                 state.set_selected_range(1..1, cx);
                 state.right(&MoveRight, window, cx);
                 assert_eq!(state.cursor(), 2);
+            });
+        });
+    }
+
+    /// Shift+Up and Shift+Down go by column, as Up and Down do: from the
+    /// middle of a line to the same column of the next, from the end of a
+    /// line to the end of the next, and no further. Shift+Down went to the
+    /// next line's start and one character on, whatever the column was, so
+    /// what was typed over the selection ate that character; in a CRLF file
+    /// the one character was the `\r`. Up and Down right after typing keep
+    /// the column too: the edit drops the preferred column, since the layout
+    /// is older than the text, and the move takes it from the caret's place.
+    #[gpui::test]
+    fn a_vertical_move_keeps_its_column(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("/target\n*.swp\nabcdefgh\nij", window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                // from the end of "/target", to the end of the shorter "*.swp"
+                state.set_selected_range(7..7, cx);
+                state.select_down(&SelectDown, window, cx);
+                assert_eq!(state.selected_range, Selection::new(7, 13), "Shift+Down from a line end stops at the next line's end");
+                // from column 2 to column 2, twice
+                state.set_selected_range(2..2, cx);
+                state.select_down(&SelectDown, window, cx);
+                assert_eq!(state.selected_range, Selection::new(2, 10));
+                state.select_down(&SelectDown, window, cx);
+                assert_eq!(state.selected_range, Selection::new(2, 16), "and keeps the column");
+                // up from column 5 of "abcdefgh", over the shorter line, to column 5 of the first
+                state.set_selected_range(19..19, cx);
+                state.select_up(&SelectUp, window, cx);
+                assert_eq!(state.selected_range, Selection::new(13, 19), "Shift+Up stops at a shorter line's end");
+                state.select_up(&SelectUp, window, cx);
+                assert_eq!(state.selected_range, Selection::new(5, 19), "and keeps the column");
+                // on the first line up reaches the start of the text, on the last line down its end
+                state.select_up(&SelectUp, window, cx);
+                assert_eq!(state.selected_range, Selection::new(0, 19));
+                state.set_selected_range(24..24, cx);
+                state.select_down(&SelectDown, window, cx);
+                assert_eq!(state.selected_range, Selection::new(24, 25));
+
+                // typing at the end of "/target" drops the preferred column
+                state.set_selected_range(7..7, cx);
+                state.insert("b", window, cx);
+                assert_eq!(state.value(), "/targetb\n*.swp\nabcdefgh\nij");
+            });
+        });
+        // the layout catches up with the text before the next key
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.down(&MoveDown, window, cx);
+                assert_eq!(state.cursor(), 14, "Down after typing at a line end lands at the next line's end, not its start");
+                state.set_selected_range(2..2, cx);
+                state.insert("x", window, cx);
+                assert_eq!(state.cursor(), 3);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.down(&MoveDown, window, cx);
+                assert_eq!(state.cursor(), 13, "Down after typing mid-line keeps the caret's column");
             });
         });
     }

@@ -88,9 +88,66 @@ impl<M: InputModeKind> InputBaseState<M> {
         if self.is_single_line() {
             return;
         }
-        let Some(last_layout) = &self.last_layout else {
+        let Some((new_offset, new_affinity)) = self.vertical_target(move_lines) else {
             return;
         };
+        let was_preferred_column = self.preferred_column;
+
+        self.pause_blink_cursor(cx);
+        let direction = if move_lines < 0 {
+            MoveDirection::Up
+        } else {
+            MoveDirection::Down
+        };
+        self.move_to_with_affinity(new_offset, Some(direction), new_affinity, cx);
+        // Set back the preferred_column
+        self.preferred_column = was_preferred_column;
+        cx.notify();
+    }
+
+    /// Extend the selection vertically by `move_lines`, to where the caret would go: the same
+    /// column, or the end of a shorter line. Up on the first line reaches the start of the text
+    /// and down on the last line its end. It went to the next line's start and one character on,
+    /// whatever the column was, so typing over the selection ate that character.
+    pub(super) fn select_vertical(
+        &mut self,
+        move_lines: isize,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_single_line() {
+            return;
+        }
+        let Some((new_offset, new_affinity)) = self.vertical_target(move_lines) else {
+            return;
+        };
+        let was_preferred_column = self.preferred_column;
+        let new_offset = if new_offset == self.cursor()
+            && new_affinity == self.cursor_line_end_affinity
+        {
+            // the caret would not move: the first line going up, or the last going down
+            if move_lines < 0 { 0 } else { self.text.len() }
+        } else {
+            new_offset
+        };
+
+        self.undo_manager.break_transaction_coalescing();
+        self.select_to_with_affinity(new_offset, new_affinity, cx);
+        self.preferred_column = was_preferred_column;
+    }
+
+    /// Where a vertical move by `move_lines` lands the caret, and whether it sticks to the end
+    /// of a wrapped row there; None without a layout.
+    ///
+    /// The caret keeps the column it had before the first of a run of vertical moves, the
+    /// preferred column, across shorter lines. An edit drops it, the layout being older than the
+    /// text then; the layout is current by the time of the move, so the caret's own place gives
+    /// the column. Without one the move went to column 0.
+    fn vertical_target(&mut self, move_lines: isize) -> Option<(usize, bool)> {
+        if self.preferred_column.is_none() {
+            self.update_preferred_column();
+        }
+        let last_layout = self.last_layout.as_ref()?;
 
         let offset = self.cursor();
         let was_preferred_column = self.preferred_column;
@@ -153,16 +210,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             }
         }
 
-        self.pause_blink_cursor(cx);
-        let direction = if move_lines < 0 {
-            MoveDirection::Up
-        } else {
-            MoveDirection::Down
-        };
-        self.move_to_with_affinity(new_offset, Some(direction), new_affinity, cx);
-        // Set back the preferred_column
-        self.preferred_column = was_preferred_column;
-        cx.notify();
+        Some((new_offset, new_affinity))
     }
 
     pub(super) fn left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
