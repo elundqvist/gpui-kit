@@ -1403,8 +1403,10 @@ impl<M: InputModeKind> TextElement<M> {
                 .with_whitespaces(whitespace_indicators.clone());
             lines.push(line_layout);
 
-            // +1 for the `\n`
-            run_offset += line_text.len() + 1;
+            // the runs cover every byte of the line, its terminator too,
+            // which is two bytes in a CRLF file and none on the last line
+            run_offset += display_text.line_start_offset(buffer_line + 1)
+                - display_text.line_start_offset(buffer_line);
         }
 
         lines

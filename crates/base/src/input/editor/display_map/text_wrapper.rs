@@ -856,16 +856,14 @@ mod tests {
         #[track_caller]
         fn assert_wrapper_lines(text: &Rope, wrapper: &TextWrapper, expected_lines: &[&[&str]]) {
             let mut actual_lines = vec![];
-            let mut offset = 0;
-            for line in wrapper.iter_lines() {
+            for (row, line) in wrapper.iter_lines().enumerate() {
+                let offset = text.line_start_offset(row);
                 actual_lines.push(
                     line.wrapped_lines
                         .iter()
                         .map(|range| text.slice(offset + range.start..offset + range.end))
                         .collect::<Vec<_>>(),
                 );
-                // +1 \n
-                offset += line.len() + 1;
             }
             assert_eq!(actual_lines, expected_lines);
         }
@@ -876,7 +874,7 @@ mod tests {
             &text,
             &wrapper,
             &[
-                &["Hello, 世界!\r"],
+                &["Hello, 世界!"],
                 &["This is second line."],
                 &["This is third line."],
                 &["这里是第 4 行。"],
@@ -898,7 +896,7 @@ mod tests {
             &text,
             &wrapper,
             &[
-                &["Hello, 世界!\r"],
+                &["Hello, 世界!"],
                 &["This is second line."],
                 &["This is third line."],
                 &["这里是第 4 行。New text"],
@@ -919,7 +917,7 @@ mod tests {
             &text,
             &wrapper,
             &[
-                &["AAA, 世界!\r"],
+                &["AAA, 世界!"],
                 &["This is second line."],
                 &["This is third line."],
                 &["这里是第 4 行。New text"],
@@ -941,7 +939,7 @@ mod tests {
             &text,
             &wrapper,
             &[
-                &["AAA, 世界!\r"],
+                &["AAA, 世界!"],
                 &["This is third line."],
                 &["这里是第 4 行。New text"],
             ],

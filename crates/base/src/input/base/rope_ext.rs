@@ -92,25 +92,28 @@ pub trait RopeExt {
     /// ```
     fn line_start_offset(&self, row: usize) -> usize;
 
-    /// Line the end offset (including `\n`) of the line at the given row (0-based) index.
+    /// The end offset of the line at the given row (0-based) index: where its
+    /// terminator begins, the `\n` or the `\r` of a `\r\n`.
     ///
     /// Return the end of the rope if the row is out of bounds.
     ///
     /// ```
     /// use gpui_base::input::{Rope, RopeExt};
     /// let rope = Rope::from("Hello\nWorld\r\nThis is a test 中文\nRope");
-    /// assert_eq!(rope.line_end_offset(0), 5); // "Hello\n"
-    /// assert_eq!(rope.line_end_offset(1), 12); // "World\r\n"
+    /// assert_eq!(rope.line_end_offset(0), 5); // "Hello"
+    /// assert_eq!(rope.line_end_offset(1), 11); // "World"
     /// ```
     fn line_end_offset(&self, row: usize) -> usize;
 
-    /// Return a line slice at the given row (0-based) index. including `\r` if present, but not `\n`.
+    /// Return a line slice at the given row (0-based) index, without its
+    /// terminator: neither the `\n` nor the `\r` before it. A `\r` that no
+    /// `\n` follows is text.
     ///
     /// ```
     /// use gpui_base::input::{Rope, RopeExt};
     /// let rope = Rope::from("Hello\nWorld\r\nThis is a test 中文\nRope");
     /// assert_eq!(rope.slice_line(0).to_string(), "Hello");
-    /// assert_eq!(rope.slice_line(1).to_string(), "World\r");
+    /// assert_eq!(rope.slice_line(1).to_string(), "World");
     /// assert_eq!(rope.slice_line(2).to_string(), "This is a test 中文");
     /// assert_eq!(rope.slice_line(6).to_string(), ""); // out of bounds
     /// ```
@@ -123,7 +126,7 @@ pub trait RopeExt {
     /// ```
     /// use gpui_base::input::{Rope, RopeExt};
     /// let rope = Rope::from("Hello\nWorld\r\nThis is a test 中文\nRope");
-    /// assert_eq!(rope.slice_lines(0..2).to_string(), "Hello\nWorld\r");
+    /// assert_eq!(rope.slice_lines(0..2).to_string(), "Hello\nWorld");
     /// assert_eq!(rope.slice_lines(1..3).to_string(), "World\r\nThis is a test 中文");
     /// assert_eq!(rope.slice_lines(2..5).to_string(), "This is a test 中文\nRope");
     /// assert_eq!(rope.slice_lines(3..10).to_string(), "Rope");
@@ -133,13 +136,13 @@ pub trait RopeExt {
 
     /// Return an iterator over all lines in the rope.
     ///
-    /// Each line slice includes `\r` if present, but not `\n`.
+    /// Each line slice is without its terminator, `\n` or `\r\n`.
     ///
     /// ```
     /// use gpui_base::input::{Rope, RopeExt};
     /// let rope = Rope::from("Hello\nWorld\r\nThis is a test 中文\nRope");
     /// let lines: Vec<_> = rope.iter_lines().map(|r| r.to_string()).collect();
-    /// assert_eq!(lines, vec!["Hello", "World\r", "This is a test 中文", "Rope"]);
+    /// assert_eq!(lines, vec!["Hello", "World", "This is a test 中文", "Rope"]);
     /// ```
     fn iter_lines(&self) -> RopeLines<'_>;
 
@@ -152,7 +155,7 @@ pub trait RopeExt {
     /// ```
     fn lines_len(&self) -> usize;
 
-    /// Return the length of the row (0-based) in characters, including `\r` if present, but not `\n`.
+    /// Return the length of the row (0-based) in bytes, without its terminator.
     ///
     /// If the row is out of bounds, return 0.
     ///
@@ -160,7 +163,7 @@ pub trait RopeExt {
     /// use gpui_base::input::{Rope, RopeExt};
     /// let rope = Rope::from("Hello\nWorld\r\nThis is a test 中文\nRope");
     /// assert_eq!(rope.line_len(0), 5); // "Hello"
-    /// assert_eq!(rope.line_len(1), 6); // "World\r"
+    /// assert_eq!(rope.line_len(1), 5); // "World"
     /// assert_eq!(rope.line_len(2), 21); // "This is a test 中文"
     /// assert_eq!(rope.line_len(4), 0); // out of bounds
     /// ```
@@ -282,14 +285,20 @@ impl RopeExt for Rope {
         }
 
         let line = self.line(row, LineType::LF);
-        if line.len() > 0 {
-            let line_end = line.len() - 1;
-            if line.is_char_boundary(line_end) && line.char(line_end) == '\n' {
-                return line.slice(..line_end);
+        // The terminator is not part of the line: the `\n`, and the `\r`
+        // before it in a CRLF file. Both are single bytes, so a byte
+        // comparison needs no char boundary. The caret works in these
+        // offsets, and an editor whose line ended after the `\r` put what
+        // was typed at its end between the `\r` and the `\n`.
+        let mut end = line.len();
+        if end > 0 && line.byte(end - 1) == b'\n' {
+            end -= 1;
+            if end > 0 && line.byte(end - 1) == b'\r' {
+                end -= 1;
             }
         }
 
-        line
+        line.slice(..end)
     }
 
     fn slice_lines(&self, rows_range: Range<usize>) -> RopeSlice<'_> {
@@ -337,7 +346,9 @@ impl RopeExt for Rope {
     fn offset_to_position(&self, offset: usize) -> Position {
         let point = self.offset_to_point(offset);
         let line = self.slice_line(point.row);
-        let offset = line.utf16_to_byte_idx(line.byte_to_utf16_idx(point.column));
+        // an offset inside the terminator is the end of the line
+        let column = point.column.min(line.len());
+        let offset = line.utf16_to_byte_idx(line.byte_to_utf16_idx(column));
         let character = line.slice(..offset).chars().count();
         Position::new(point.row as u32, character as u32)
     }
@@ -459,7 +470,7 @@ mod tests {
     fn test_slice_line() {
         let rope = Rope::from("Hello\nWorld\r\nThis is a test 中文\nRope");
         assert_eq!(rope.slice_line(0).to_string(), "Hello");
-        assert_eq!(rope.slice_line(1).to_string(), "World\r");
+        assert_eq!(rope.slice_line(1).to_string(), "World");
         assert_eq!(rope.slice_line(2).to_string(), "This is a test 中文");
         assert_eq!(rope.slice_line(3).to_string(), "Rope");
 
@@ -470,6 +481,15 @@ mod tests {
         let rope = Rope::from("Hello\r");
         assert_eq!(rope.slice_line(0).to_string(), "Hello\r");
         assert_eq!(rope.slice_line(1).to_string(), "");
+
+        // a \r before the \n is the terminator's, a \r anywhere else is text
+        let rope = Rope::from("a\rb\r\n\r\n\r");
+        assert_eq!(rope.slice_line(0).to_string(), "a\rb");
+        assert_eq!(rope.slice_line(1).to_string(), "");
+        assert_eq!(rope.slice_line(2).to_string(), "\r");
+        assert_eq!(rope.line_len(0), 3);
+        assert_eq!(rope.line_end_offset(0), 3);
+        assert_eq!(rope.line_end_offset(1), 5);
     }
 
     #[test]
@@ -492,7 +512,7 @@ mod tests {
         let lines: Vec<_> = rope.iter_lines().map(|r| r.to_string()).collect();
         assert_eq!(
             lines,
-            vec!["Hello", "World\r", "This is a test 中文", "Rope\r"]
+            vec!["Hello", "World", "This is a test 中文", "Rope\r"]
         );
     }
 
@@ -515,7 +535,7 @@ mod tests {
             .take(2)
             .map(|r| r.to_string())
             .collect();
-        assert_eq!(lines, vec!["World\r", "This is a test 中文"]);
+        assert_eq!(lines, vec!["World", "This is a test 中文"]);
     }
 
     #[test]
@@ -525,7 +545,7 @@ mod tests {
         assert_eq!(rope.line_end_offset(0), 5);
 
         assert_eq!(rope.line_start_offset(1), 6);
-        assert_eq!(rope.line_end_offset(1), 12);
+        assert_eq!(rope.line_end_offset(1), 11);
 
         assert_eq!(rope.line_start_offset(2), 13);
         assert_eq!(rope.line_end_offset(2), 34);

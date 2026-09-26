@@ -1514,7 +1514,7 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         let mut offset = self.start_of_line();
         if offset == self.cursor() {
-            offset = offset.saturating_sub(1);
+            offset = self.offset_before(offset);
         }
         self.replace_text_in_range_silent(
             Some(self.range_to_utf16(&(offset..self.cursor()))),
@@ -1539,7 +1539,7 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         let mut offset = self.end_of_line();
         if offset == self.cursor() {
-            offset = (offset + 1).clamp(0, self.text.len());
+            offset = self.offset_after(offset);
         }
         self.replace_text_in_range_silent(
             Some(self.range_to_utf16(&(self.cursor()..offset))),
@@ -2336,25 +2336,38 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub(super) fn previous_boundary(&self, offset: usize) -> usize {
-        let mut offset = self.text.clip_offset(offset.saturating_sub(1), Bias::Left);
-        if let Some(ch) = self.text.char_at(offset) {
-            if ch == '\r' {
-                offset -= 1;
-            }
-        }
-
-        self.clamp_offset_to_visible_backward(offset)
+        self.clamp_offset_to_visible_backward(self.offset_before(offset))
     }
 
     pub(super) fn next_boundary(&self, offset: usize) -> usize {
-        let mut offset = self.text.clip_offset(offset + 1, Bias::Right);
-        if let Some(ch) = self.text.char_at(offset) {
-            if ch == '\r' {
-                offset += 1;
-            }
-        }
+        self.clamp_offset_to_visible_forward(self.offset_after(offset))
+    }
 
-        self.clamp_offset_to_visible_forward(offset)
+    /// The offset one character before `offset`. A `\r\n` is one character
+    /// to the caret, which never stands between its bytes: a step back over
+    /// the `\n` lands before the `\r`.
+    fn offset_before(&self, offset: usize) -> usize {
+        let offset = self.text.clip_offset(offset.saturating_sub(1), Bias::Left);
+        if offset > 0
+            && self.text.char_at(offset) == Some('\n')
+            && self.text.char_at(offset - 1) == Some('\r')
+        {
+            return offset - 1;
+        }
+        offset
+    }
+
+    /// The offset one character after `offset`: past the `\n` as well when
+    /// the step crossed the `\r` of a `\r\n`.
+    fn offset_after(&self, offset: usize) -> usize {
+        let offset = self.text.clip_offset(offset + 1, Bias::Right);
+        if offset > 0
+            && self.text.char_at(offset - 1) == Some('\r')
+            && self.text.char_at(offset) == Some('\n')
+        {
+            return offset + 1;
+        }
+        offset
     }
 
     /// Returns the true to let InputElement to render cursor, when Input is focused and current BlinkCursor is visible.
@@ -4425,6 +4438,72 @@ mod tests {
         });
 
         cx.run_until_parked();
+    }
+
+    /// In a CRLF file the caret never stands between the `\r` and the `\n`:
+    /// End and Shift+End stop before the `\r`, what is typed there goes
+    /// before it, Left and Right step over the pair as one character, and
+    /// Backspace and Delete take both bytes or neither.
+    #[gpui::test]
+    fn the_caret_never_splits_a_crlf(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("ab\r\ncd\r\n", window, cx);
+
+                state.set_selected_range(1..1, cx);
+                state.end(&MoveEnd, window, cx);
+                assert_eq!(state.cursor(), 2, "End stops before the \\r");
+                state.insert("x", window, cx);
+                assert_eq!(state.value(), "abx\r\ncd\r\n");
+                state.enter(&Enter { secondary: false, shift: false }, window, cx);
+                assert_eq!(state.value(), "abx\n\r\ncd\r\n", "Enter opens the line before the pair");
+
+                state.set_selected_range(0..0, cx);
+                state.select_to_end_of_line(&SelectToEndOfLine, window, cx);
+                assert_eq!(state.selected_range, Selection::new(0, 3), "Shift+End stops before the \\r");
+
+                state.set_value("ab\r\ncd\r\n", window, cx);
+                state.set_selected_range(2..2, cx);
+                state.right(&MoveRight, window, cx);
+                assert_eq!(state.cursor(), 4, "Right steps over the pair");
+                state.left(&MoveLeft, window, cx);
+                assert_eq!(state.cursor(), 2, "Left steps back over it");
+                state.set_selected_range(1..1, cx);
+                state.right(&MoveRight, window, cx);
+                assert_eq!(state.cursor(), 2, "Right from inside the line stops before the \\r");
+
+                state.set_selected_range(4..4, cx);
+                state.backspace(&Backspace, window, cx);
+                assert_eq!(state.value(), "abcd\r\n", "Backspace at a line start joins the lines");
+                state.set_value("ab\r\ncd\r\n", window, cx);
+                state.set_selected_range(2..2, cx);
+                state.delete(&Delete, window, cx);
+                assert_eq!(state.value(), "abcd\r\n", "Delete at a line end joins the lines");
+
+                state.set_value("ab\r\ncd\r\n", window, cx);
+                state.set_selected_range(2..2, cx);
+                state.delete_to_end_of_line(&DeleteToEndOfLine, window, cx);
+                assert_eq!(state.value(), "abcd\r\n");
+                state.set_value("ab\r\ncd\r\n", window, cx);
+                state.set_selected_range(4..4, cx);
+                state.delete_to_beginning_of_line(&DeleteToBeginningOfLine, window, cx);
+                assert_eq!(state.value(), "abcd\r\n");
+
+                // a \r that no \n follows is text, and the caret goes round it as it does any character
+                state.set_value("a\rb\n", window, cx);
+                state.set_selected_range(0..0, cx);
+                state.end(&MoveEnd, window, cx);
+                assert_eq!(state.cursor(), 3);
+                state.set_selected_range(1..1, cx);
+                state.right(&MoveRight, window, cx);
+                assert_eq!(state.cursor(), 2);
+            });
+        });
     }
 
     /// `replace_all` on a multi-line (non-code-editor) input clears the
