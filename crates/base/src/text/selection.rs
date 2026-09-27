@@ -1,82 +1,11 @@
 use std::ops::Range;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CharType {
-    /// a-z, A-Z, 0-9, _
-    Word,
-    /// '\t', ' ', '\u{00A0}' etc.
-    Whitespace,
-    /// \n, \r
-    Newline,
-    /// . , ; : ( ) [ ] { } ... or CJK characters: `汉`, `🎉` etc.
-    Other,
-}
+use crate::text_boundary::word_range_from_chars;
 
-/// Implementation based on <https://github.com/zed-industries/zed/blob/main/crates/gpui/src/text_system/line_wrapper.rs>
-fn is_word_char(c: char) -> bool {
-    matches!(c, '_')
-        // ASCII alphanumeric characters, for English, numbers: `Hello123`, etc.
-        || c.is_ascii_alphanumeric()
-        // Latin script in Unicode for French, German, Spanish, etc.
-        || matches!(c, '\u{00C0}'..='\u{00FF}')
-        || matches!(c, '\u{0100}'..='\u{017F}')
-        || matches!(c, '\u{0180}'..='\u{024F}')
-        // Cyrillic for Russian, Ukrainian, etc.
-        || matches!(c, '\u{0400}'..='\u{04FF}')
-        // Vietnamese
-        || matches!(c, '\u{1E00}'..='\u{1EFF}')
-        || matches!(c, '\u{0300}'..='\u{036F}')
-}
-
-impl From<char> for CharType {
-    fn from(c: char) -> Self {
-        match c {
-            c if is_word_char(c) => CharType::Word,
-            c if c == '\n' || c == '\r' => CharType::Newline,
-            c if c.is_whitespace() => CharType::Whitespace,
-            _ => CharType::Other,
-        }
-    }
-}
-
-impl CharType {
-    fn is_connectable(self, c: char) -> bool {
-        matches!(
-            (self, CharType::from(c)),
-            (CharType::Word, CharType::Word) | (CharType::Whitespace, CharType::Whitespace)
-        )
-    }
-}
-
-pub(crate) fn word_range_from_chars(
-    offset: usize,
-    c: char,
-    prev_chars: impl Iterator<Item = char>,
-    next_chars: impl Iterator<Item = char>,
-) -> Range<usize> {
-    let char_type = CharType::from(c);
-    let mut start = offset;
-    let mut end = offset + c.len_utf8();
-
-    for prev in prev_chars.take(128) {
-        if char_type.is_connectable(prev) {
-            start -= prev.len_utf8();
-        } else {
-            break;
-        }
-    }
-
-    for next in next_chars.take(128) {
-        if char_type.is_connectable(next) {
-            end += next.len_utf8();
-        } else {
-            break;
-        }
-    }
-
-    start..end
-}
-
+/// The word a double-click in a TextView takes, by the editor's own
+/// boundaries (`text_boundary`), so a `\r\n` is one character here as it is
+/// there: a double-click on the end of a CRLF line takes the pair, and a
+/// copy of the selection never carries a lone `\r`.
 pub(crate) fn word_range_at(text: &str, offset: usize) -> Option<Range<usize>> {
     if text.is_empty() {
         return None;
@@ -114,32 +43,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_char_type_from_char() {
-        assert_eq!(CharType::from('a'), CharType::Word);
-        assert_eq!(CharType::from('Z'), CharType::Word);
-        assert_eq!(CharType::from('0'), CharType::Word);
-        assert_eq!(CharType::from('_'), CharType::Word);
-        assert_eq!(CharType::from('.'), CharType::Other);
-        assert_eq!(CharType::from(','), CharType::Other);
-        assert_eq!(CharType::from(';'), CharType::Other);
-        assert_eq!(CharType::from('!'), CharType::Other);
-        assert_eq!(CharType::from('?'), CharType::Other);
-        assert_eq!(CharType::from('['), CharType::Other);
-        assert_eq!(CharType::from('{'), CharType::Other);
-        assert_eq!(CharType::from(' '), CharType::Whitespace);
-        assert_eq!(CharType::from('\t'), CharType::Whitespace);
-        assert_eq!(CharType::from('\u{00A0}'), CharType::Whitespace);
-        assert_eq!(CharType::from('\n'), CharType::Newline);
-        assert_eq!(CharType::from('\r'), CharType::Newline);
-        assert_eq!(CharType::from('汉'), CharType::Other);
-        assert_eq!(CharType::from('é'), CharType::Word);
-        assert_eq!(CharType::from('ä'), CharType::Word);
-        assert_eq!(CharType::from('ö'), CharType::Word);
-        assert_eq!(CharType::from('ü'), CharType::Word);
-        assert_eq!(CharType::from('д'), CharType::Word);
-    }
-
-    #[test]
     fn test_word_range_at() {
         let text =
             "test text\nabcde 中文🎉 test\nhello[()]\ntest_connector ____\nRope\nrök\ngrande île";
@@ -168,5 +71,23 @@ mod tests {
             let actual = word_range_at(text, offset).map(|range| text[range].to_string());
             assert_eq!(actual.as_deref(), expected, "offset {offset}");
         }
+    }
+
+    /// A `\r\n` is one character to the double-click, as it is to the
+    /// editor's: on either byte it takes the pair, never the `\r` alone.
+    #[test]
+    fn a_crlf_is_one_word_to_the_double_click() {
+        let text = "ab\r\ncd\r\n\r\nef";
+        let at = |offset| word_range_at(text, offset);
+        assert_eq!(at(2), Some(2..4), "on the \\r");
+        assert_eq!(at(3), Some(2..4), "on the \\n");
+        assert_eq!(at(8), Some(8..10), "an empty line");
+        assert_eq!(at(1), Some(0..2), "the word before it");
+        assert_eq!(at(4), Some(4..6), "the word after it");
+        // a \r that no \n follows, and a \n that no \r precedes, stand alone
+        let text = "a\rb\n\rc";
+        assert_eq!(word_range_at(text, 1), Some(1..2));
+        assert_eq!(word_range_at(text, 3), Some(3..4));
+        assert_eq!(word_range_at(text, 4), Some(4..5));
     }
 }

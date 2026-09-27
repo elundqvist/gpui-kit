@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CharacterKind {
     Word,
     Whitespace,
@@ -95,4 +95,25 @@ fn clip_offset_left(text: &str, offset: usize) -> usize {
         offset -= 1;
     }
     offset
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_character_kind_from_char() {
+        for c in ['a', 'Z', '0', '_', 'é', 'ä', 'ö', 'ü', 'д'] {
+            assert_eq!(CharacterKind::from(c), CharacterKind::Word, "{c:?}");
+        }
+        for c in ['.', ',', ';', '!', '?', '[', '{', '汉'] {
+            assert_eq!(CharacterKind::from(c), CharacterKind::Other, "{c:?}");
+        }
+        for c in [' ', '\t', '\u{00A0}'] {
+            assert_eq!(CharacterKind::from(c), CharacterKind::Whitespace, "{c:?}");
+        }
+        for c in ['\n', '\r'] {
+            assert_eq!(CharacterKind::from(c), CharacterKind::Newline, "{c:?}");
+        }
+    }
 }
