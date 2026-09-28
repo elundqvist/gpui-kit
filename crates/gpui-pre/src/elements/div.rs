@@ -3628,6 +3628,17 @@ pub(crate) fn clear_active_tooltip_if_not_hoverable(
     }
 }
 
+/// Cancels a tooltip still waiting to show, and leaves a shown one as it is.
+fn cancel_tooltip_waiting_for_show(active_tooltip: &Rc<RefCell<Option<ActiveTooltip>>>) {
+    let is_waiting = matches!(
+        active_tooltip.borrow().as_ref(),
+        Some(ActiveTooltip::WaitingForShow { .. })
+    );
+    if is_waiting {
+        active_tooltip.borrow_mut().take();
+    }
+}
+
 pub(crate) fn set_tooltip_on_window(
     active_tooltip: &Rc<RefCell<Option<ActiveTooltip>>>,
     window: &mut Window,
@@ -3677,6 +3688,9 @@ pub(crate) fn register_tooltip_mouse_handlers(
         let active_tooltip = active_tooltip.clone();
         move |_: &MouseDownEvent, _phase, window: &mut Window, _cx| {
             if !tooltip_id.is_some_and(|tooltip_id| tooltip_id.is_hovered(window)) {
+                // A tooltip due when its element is pressed would show over whatever the press
+                // opened, so a press ends a tooltip still waiting to show as well as a shown one.
+                cancel_tooltip_waiting_for_show(&active_tooltip);
                 clear_active_tooltip_if_not_hoverable(&active_tooltip, window);
             }
         }
@@ -4944,6 +4958,51 @@ mod tests {
                 );
             })
             .unwrap();
+
+        assert!(active_tooltip.borrow().is_none());
+    }
+
+    #[test]
+    fn tooltip_waiting_for_show_is_cancelled_by_a_mouse_down() {
+        let (mut test_app, any_window, captured_active_tooltip) = setup_tooltip_owner_test(None);
+
+        let weak_active_tooltip = captured_active_tooltip.borrow().clone().unwrap();
+        let active_tooltip = weak_active_tooltip.upgrade().unwrap();
+        assert!(matches!(
+            active_tooltip.borrow().as_ref(),
+            Some(ActiveTooltip::WaitingForShow { .. })
+        ));
+
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position: point(px(10.), px(10.)),
+                        button: MouseButton::Left,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    MouseUpEvent {
+                        position: point(px(10.), px(10.)),
+                        button: MouseButton::Left,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            })
+            .unwrap();
+
+        test_app
+            .dispatcher
+            .advance_clock(DEFAULT_TOOLTIP_SHOW_DELAY);
+        test_app.run_until_parked();
 
         assert!(active_tooltip.borrow().is_none());
     }
