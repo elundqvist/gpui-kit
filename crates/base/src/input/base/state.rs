@@ -710,6 +710,8 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     /// Set highlighter language for for [`LayoutMode::CodeEditor`] mode.
+    ///
+    /// The highlighter for the new language is made at the next frame.
     pub fn set_highlighter(
         &mut self,
         new_language: impl Into<SharedString>,
@@ -723,6 +725,10 @@ impl<M: InputModeKind> InputBaseState<M> {
             } => {
                 *language = new_language.into();
                 *highlighter.borrow_mut() = None;
+                // The next frame makes the new highlighter and parses the
+                // text, so the editor keeps drawing its colours and
+                // diagnostics without waiting for an edit.
+                self._pending_update = true;
             }
             _ => {}
         }
@@ -4699,6 +4705,88 @@ mod tests {
                 );
             });
         });
+    }
+
+    /// A highlighter swapped by `set_highlighter` is made, and parses the
+    /// text, at the next frame, with no edit after the swap.
+    #[gpui::test]
+    fn a_swapped_highlighter_is_made_at_the_next_frame(cx: &mut TestAppContext) {
+        use crate::input::{FoldRange, HighlightStyleResolver, InputEdit, InputHighlighter};
+
+        /// Knows its language and counts the parses it was asked for.
+        struct Named(SharedString, Rc<Cell<usize>>);
+
+        impl InputHighlighter for Named {
+            fn language(&self) -> SharedString {
+                self.0.clone()
+            }
+
+            fn update(
+                &mut self,
+                _: Option<InputEdit>,
+                _: &Rope,
+                _: bool,
+                _: &mut Window,
+                _: &mut Context<crate::input::EditorState>,
+            ) {
+                self.1.set(self.1.get() + 1);
+            }
+
+            fn styles(
+                &self,
+                range: &Range<usize>,
+                _: &dyn HighlightStyleResolver,
+            ) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
+                vec![(range.clone(), gpui::HighlightStyle::default())]
+            }
+
+            fn fold_ranges(&self, _: &Rope) -> Vec<FoldRange> {
+                Vec::new()
+            }
+        }
+
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let parses = Rc::new(Cell::new(0));
+
+        let factory_parses = parses.clone();
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_highlighter_factory(
+                    Rc::new(move |language: &str| {
+                        Some(Box::new(Named(
+                            SharedString::from(language.to_string()),
+                            factory_parses.clone(),
+                        )) as Box<dyn InputHighlighter>)
+                    }),
+                    cx,
+                );
+                state.set_value("-- a note\nselect 1", window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let language = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                input.read_with(cx, |state, _| {
+                    let highlighter = state.mode.highlighter()?.borrow();
+                    highlighter.as_ref().map(|h| h.language())
+                })
+            })
+        };
+        assert_eq!(language(&mut cx), Some("sql".into()));
+        let before = parses.get();
+
+        // a swap with no edit after it, as when an edit elsewhere turns
+        // the text into another language
+        cx.update(|_, cx| input.update(cx, |state, cx| state.set_highlighter("json", cx)));
+        cx.run_until_parked();
+        assert_eq!(
+            language(&mut cx),
+            Some("json".into()),
+            "the frame after the swap has the new highlighter"
+        );
+        assert!(parses.get() > before, "and it has parsed the text");
     }
 
     #[gpui::test]
