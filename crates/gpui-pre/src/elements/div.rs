@@ -32,7 +32,7 @@ use refineable::Refineable;
 use smallvec::SmallVec;
 use std::{
     any::{Any, TypeId},
-    cell::RefCell,
+    cell::{Cell, RefCell},
     cmp::Ordering,
     fmt::Debug,
     marker::PhantomData,
@@ -2338,6 +2338,17 @@ impl Interactivity {
                                 None
                             };
 
+                            // A shown tooltip asks during the window's prepaint whether this
+                            // element is still hovered, which this frame's hitbox answers.
+                            if self.tooltip_builder.is_some()
+                                && let Some(element_state) = element_state.as_mut()
+                            {
+                                element_state
+                                    .tooltip_hitbox
+                                    .get_or_insert_with(Rc::default)
+                                    .set(hitbox.as_ref().map(|hitbox| hitbox.id));
+                            }
+
                             let scroll_offset =
                                 self.clamp_scroll_position(bounds, &style, window, cx);
                             let result = f(&style, scroll_offset, hitbox, window, cx);
@@ -3136,14 +3147,20 @@ impl Interactivity {
                 let build_tooltip = Rc::new(move |window: &mut Window, cx: &mut App| {
                     Some(((tooltip_builder.build)(window, cx), tooltip_is_hoverable))
                 });
-                // Use bounds instead of testing hitbox since this is called during prepaint.
+                // This is called during the window's prepaint, before the frame's hit test, so
+                // it tests the hitbox this element inserted in that frame's prepaint, which a
+                // hitbox inserted in front of it since, like a modal's backdrop, occludes.
                 let check_is_hovered_during_prepaint = Rc::new({
                     let pending_mouse_down = pending_mouse_down.clone();
-                    let source_bounds = hitbox.bounds;
+                    let tooltip_hitbox = element_state
+                        .tooltip_hitbox
+                        .get_or_insert_with(Rc::default)
+                        .clone();
                     move |window: &Window| {
-                        !window.last_input_was_keyboard()
-                            && pending_mouse_down.borrow().is_none()
-                            && source_bounds.contains(&window.mouse_position())
+                        pending_mouse_down.borrow().is_none()
+                            && tooltip_hitbox
+                                .get()
+                                .is_some_and(|hitbox| hitbox.is_hovered_during_prepaint(window))
                     }
                 });
                 let check_is_hovered = Rc::new({
@@ -3556,6 +3573,8 @@ pub struct InteractiveElementState {
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
+    /// The hitbox this element inserted when it was last prepainted, while it has a tooltip.
+    pub(crate) tooltip_hitbox: Option<Rc<Cell<Option<HitboxId>>>>,
 }
 
 /// Whether or not the element or a group that contains it is clicked by the mouse.
@@ -3710,13 +3729,13 @@ pub(crate) fn register_tooltip_mouse_handlers(
 ///
 /// The mouse hovering logic also relies on being called from window prepaint in order to handle the
 /// case where the element the tooltip is on is not rendered - in that case its mouse listeners are
-/// also not registered. During window prepaint, the hitbox information is not available, so
-/// `check_is_hovered_during_prepaint` is used which bases the check off of the absolute bounds of
-/// the element.
+/// also not registered. During window prepaint, the frame's hit test is not done yet, so
+/// `check_is_hovered_during_prepaint` is used. A div's tests the hitbox it inserted in that
+/// frame's prepaint against the hitboxes inserted in front of it, so a tooltip whose element is
+/// occluded after it is shown, as by a modal's backdrop, hides.
 ///
-/// TODO: There's a minor bug due to the use of absolute bounds while checking during prepaint - it
-/// does not know if the hitbox is occluded. In the case where a tooltip gets displayed and then
-/// gets occluded after display, it will stick around until the mouse exits the hover bounds.
+/// TODO: `InteractiveText` still checks against the absolute bounds of the element, which do not
+/// know if its hitbox is occluded, so its tooltip sticks around until the mouse exits them.
 fn handle_tooltip_mouse_move(
     active_tooltip: &Rc<RefCell<Option<ActiveTooltip>>>,
     build_tooltip: &Rc<dyn Fn(&mut Window, &mut App) -> Option<(AnyView, bool)>>,
@@ -4741,6 +4760,7 @@ mod tests {
     struct TooltipOwner {
         captured_active_tooltip: CapturedActiveTooltip,
         show_delay_override: Option<Duration>,
+        backdrop: bool,
     }
 
     impl Render for TooltipOwner {
@@ -4758,6 +4778,9 @@ mod tests {
                                 this.tooltip_show_delay(delay)
                             }),
                     )
+                    .when(self.backdrop, |this| {
+                        this.child(div().absolute().top_0().left_0().size_full().occlude())
+                    })
                     .into_any_element(),
                 captured_active_tooltip: self.captured_active_tooltip.clone(),
             }
@@ -4816,6 +4839,7 @@ mod tests {
             move |_, _| TooltipOwner {
                 captured_active_tooltip,
                 show_delay_override,
+                backdrop: false,
             }
         });
         let any_window = window.into();
@@ -5004,6 +5028,54 @@ mod tests {
             .advance_clock(DEFAULT_TOOLTIP_SHOW_DELAY);
         test_app.run_until_parked();
 
+        assert!(active_tooltip.borrow().is_none());
+    }
+
+    #[test]
+    fn tooltip_hides_when_a_backdrop_covers_its_origin() {
+        let (mut test_app, any_window, captured_active_tooltip) = setup_tooltip_owner_test(None);
+        let owner = any_window.downcast::<TooltipOwner>().unwrap();
+
+        let weak_active_tooltip = captured_active_tooltip.borrow().clone().unwrap();
+        let active_tooltip = weak_active_tooltip.upgrade().unwrap();
+
+        test_app
+            .dispatcher
+            .advance_clock(DEFAULT_TOOLTIP_SHOW_DELAY);
+        test_app.run_until_parked();
+
+        let draw = |test_app: &mut TestAppContext, backdrop: bool| {
+            owner
+                .update(test_app, |owner, _, cx| {
+                    owner.backdrop = backdrop;
+                    cx.notify();
+                })
+                .unwrap();
+            test_app
+                .update_window(any_window, |_, window, cx| {
+                    window.draw(cx).clear(cx);
+                    window.tooltip_bounds.is_some()
+                })
+                .unwrap()
+        };
+
+        // Drawn again with the mouse still over its origin, whose hitbox is a new one, it stays.
+        assert!(draw(&mut test_app, false));
+        assert!(matches!(
+            active_tooltip.borrow().as_ref(),
+            Some(ActiveTooltip::Visible { .. })
+        ));
+
+        // A backdrop drawn over the origin hides it, though the mouse is still within its bounds.
+        assert!(!draw(&mut test_app, true));
+        assert!(active_tooltip.borrow().is_none());
+
+        // Nor does it come back when the backdrop goes, until the mouse moves.
+        assert!(!draw(&mut test_app, false));
+        test_app
+            .dispatcher
+            .advance_clock(DEFAULT_TOOLTIP_SHOW_DELAY);
+        test_app.run_until_parked();
         assert!(active_tooltip.borrow().is_none());
     }
 

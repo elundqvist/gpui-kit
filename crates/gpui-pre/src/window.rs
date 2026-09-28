@@ -794,6 +794,25 @@ impl HitboxId {
         self.hit_test(window)
     }
 
+    /// Checks if the hitbox with this ID is hovered in the frame being drawn, as
+    /// [`HitboxId::is_hovered`] does in the frame drawn last. For use in the window's prepaint
+    /// after the hitboxes are inserted, before the frame's hit test: a hitbox inserted in front
+    /// of this one since the last frame, like a modal's backdrop, occludes it here already.
+    pub(crate) fn is_hovered_during_prepaint(self, window: &Window) -> bool {
+        if window.captured_hitbox == Some(self) {
+            return true;
+        }
+        if window.last_input_was_keyboard() {
+            return false;
+        }
+        let hit_test = window.next_frame.hit_test(window.mouse_position());
+        hit_test
+            .ids
+            .iter()
+            .take(hit_test.hover_hitbox_count)
+            .any(|id| self == *id)
+    }
+
     fn hit_test(self, window: &Window) -> bool {
         let hit_test = &window.mouse_hit_test;
         for id in hit_test.ids.iter().take(hit_test.hover_hitbox_count) {
