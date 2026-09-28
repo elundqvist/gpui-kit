@@ -3156,11 +3156,17 @@ impl Interactivity {
                         .tooltip_hitbox
                         .get_or_insert_with(Rc::default)
                         .clone();
-                    move |window: &Window| {
-                        pending_mouse_down.borrow().is_none()
-                            && tooltip_hitbox
-                                .get()
-                                .is_some_and(|hitbox| hitbox.is_hovered_during_prepaint(window))
+                    move |window: &Window| match tooltip_hitbox.get() {
+                        Some(hitbox)
+                            if pending_mouse_down.borrow().is_none()
+                                && hitbox.is_hovered_during_prepaint(window) =>
+                        {
+                            TooltipOriginHover::Hovered
+                        }
+                        Some(hitbox) if hitbox.is_covered_during_prepaint(window) => {
+                            TooltipOriginHover::Covered
+                        }
+                        _ => TooltipOriginHover::Away,
                     }
                 });
                 let check_is_hovered = Rc::new({
@@ -3619,6 +3625,19 @@ pub(crate) enum ActiveTooltip {
     },
 }
 
+/// Where the mouse is, as the window's prepaint finds it, for an element with a tooltip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TooltipOriginHover {
+    /// Over the element.
+    Hovered,
+    /// Within the element's bounds, with something drawn in front of the element, like a modal's
+    /// backdrop, taking the mouse. A hoverable tooltip then hides at once rather than waiting for
+    /// the mouse to reach it, since the mouse has not left the element.
+    Covered,
+    /// Anywhere else, or the element is pressed, or the last input was the keyboard.
+    Away,
+}
+
 pub(crate) fn clear_active_tooltip(
     active_tooltip: &Rc<RefCell<Option<ActiveTooltip>>>,
     window: &mut Window,
@@ -3676,7 +3695,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
     tooltip_id: Option<TooltipId>,
     build_tooltip: Rc<dyn Fn(&mut Window, &mut App) -> Option<(AnyView, bool)>>,
     check_is_hovered: Rc<dyn Fn(&Window) -> bool>,
-    check_is_hovered_during_prepaint: Rc<dyn Fn(&Window) -> bool>,
+    check_is_hovered_during_prepaint: Rc<dyn Fn(&Window) -> TooltipOriginHover>,
     show_delay: Option<Duration>,
     window: &mut Window,
 ) {
@@ -3732,7 +3751,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
 /// also not registered. During window prepaint, the frame's hit test is not done yet, so
 /// `check_is_hovered_during_prepaint` is used. A div's tests the hitbox it inserted in that
 /// frame's prepaint against the hitboxes inserted in front of it, so a tooltip whose element is
-/// occluded after it is shown, as by a modal's backdrop, hides.
+/// occluded after it is shown, as by a modal's backdrop, hides, a hoverable one at once.
 ///
 /// TODO: `InteractiveText` still checks against the absolute bounds of the element, which do not
 /// know if its hitbox is occluded, so its tooltip sticks around until the mouse exits them.
@@ -3740,7 +3759,7 @@ fn handle_tooltip_mouse_move(
     active_tooltip: &Rc<RefCell<Option<ActiveTooltip>>>,
     build_tooltip: &Rc<dyn Fn(&mut Window, &mut App) -> Option<(AnyView, bool)>>,
     check_is_hovered: &Rc<dyn Fn(&Window) -> bool>,
-    check_is_hovered_during_prepaint: &Rc<dyn Fn(&Window) -> bool>,
+    check_is_hovered_during_prepaint: &Rc<dyn Fn(&Window) -> TooltipOriginHover>,
     tooltip_id: Option<TooltipId>,
     current_view: EntityId,
     phase: DispatchPhase,
@@ -3864,7 +3883,7 @@ fn handle_tooltip_mouse_move(
 fn handle_tooltip_check_visible_and_update(
     active_tooltip: &Rc<RefCell<Option<ActiveTooltip>>>,
     tooltip_is_hoverable: bool,
-    check_is_hovered: &Rc<dyn Fn(&Window) -> bool>,
+    check_is_hovered: &Rc<dyn Fn(&Window) -> TooltipOriginHover>,
     tooltip_bounds: Bounds<Pixels>,
     window: &mut Window,
     cx: &mut App,
@@ -3878,14 +3897,18 @@ fn handle_tooltip_check_visible_and_update(
         CancelHide(AnyTooltip),
     }
 
-    let is_hovered = check_is_hovered(window)
+    let origin = check_is_hovered(window);
+    let is_hovered = origin == TooltipOriginHover::Hovered
         || (tooltip_is_hoverable && tooltip_bounds.contains(&window.mouse_position()));
+    // A hoverable tooltip waits a while for a mouse that left its origin, which may be on its way
+    // to the tooltip. A mouse still within an origin that something now covers is not.
+    let is_covered = origin == TooltipOriginHover::Covered;
     let action = match active_tooltip.borrow().as_ref() {
         Some(ActiveTooltip::Visible { tooltip, .. }) => {
             if is_hovered {
                 Action::None
             } else {
-                if tooltip_is_hoverable {
+                if tooltip_is_hoverable && !is_covered {
                     Action::ScheduleHide(tooltip.clone())
                 } else {
                     Action::Hide
@@ -3895,6 +3918,8 @@ fn handle_tooltip_check_visible_and_update(
         Some(ActiveTooltip::WaitingForHide { tooltip, .. }) => {
             if is_hovered {
                 Action::CancelHide(tooltip.clone())
+            } else if is_covered {
+                Action::Hide
             } else {
                 Action::None
             }
@@ -5129,17 +5154,33 @@ mod tests {
 
     /// A 50px control at the window's top left, with a tooltip that says the control's name.
     fn named_tooltip_control(name: &'static str, painted: &PaintedTooltips) -> Stateful<Div> {
+        named_tooltip_control_with(name, painted, false)
+    }
+
+    fn named_tooltip_control_with(
+        name: &'static str,
+        painted: &PaintedTooltips,
+        hoverable: bool,
+    ) -> Stateful<Div> {
         let painted = painted.clone();
-        div().id(name).size(px(50.)).tooltip(move |_, cx| {
+        let build = move |_: &mut Window, cx: &mut App| {
             let painted = painted.clone();
             cx.new(|_| NamedTooltip { name, painted }).into()
-        })
+        };
+        let control = div().id(name).size(px(50.));
+        if hoverable {
+            control.hoverable_tooltip(build)
+        } else {
+            control.tooltip(build)
+        }
     }
 
     /// What is drawn over the control, at the window's top left, under the mouse.
     #[derive(Clone, Copy, PartialEq)]
     enum Cover {
         Nothing,
+        /// A backdrop that occludes the window.
+        Backdrop,
         /// A backdrop that occludes the window, with a control of the dialog's own on it.
         Dialog,
         /// A backdrop that occludes the window, and over it a popover drawn deferred, with a
@@ -5149,6 +5190,7 @@ mod tests {
 
     struct CoveredTooltipOwner {
         cover: Cover,
+        hoverable: bool,
         painted: PaintedTooltips,
     }
 
@@ -5157,7 +5199,12 @@ mod tests {
             let backdrop = || div().absolute().top_0().left_0().size_full().occlude();
             div()
                 .size_full()
-                .child(named_tooltip_control("control", &self.painted))
+                .child(named_tooltip_control_with(
+                    "control",
+                    &self.painted,
+                    self.hoverable,
+                ))
+                .when(self.cover == Cover::Backdrop, |this| this.child(backdrop()))
                 .when(self.cover == Cover::Dialog, |this| {
                     this.child(backdrop().child(named_tooltip_control("dialog", &self.painted)))
                 })
@@ -5258,6 +5305,7 @@ mod tests {
             let painted = painted.clone();
             move |_, _| CoveredTooltipOwner {
                 cover: Cover::Nothing,
+                hoverable: false,
                 painted,
             }
         });
@@ -5295,6 +5343,7 @@ mod tests {
             let painted = painted.clone();
             move |_, _| CoveredTooltipOwner {
                 cover: Cover::Popover,
+                hoverable: false,
                 painted,
             }
         });
@@ -5305,6 +5354,73 @@ mod tests {
                 ["popover"]
             );
         }
+    }
+
+    #[test]
+    fn hoverable_tooltip_hides_at_once_when_its_origin_is_covered() {
+        let painted = PaintedTooltips::default();
+        let (mut test_app, window) = setup_named_tooltip_test({
+            let painted = painted.clone();
+            move |_, _| CoveredTooltipOwner {
+                cover: Cover::Nothing,
+                hoverable: true,
+                painted,
+            }
+        });
+        wait_for_tooltip(&mut test_app);
+        assert_eq!(
+            draw_named(&mut test_app, window.into(), &painted),
+            ["control"]
+        );
+
+        // A press on its origin leaves a hoverable tooltip up,
+        press(&mut test_app, window.into(), point(px(10.), px(10.)));
+        assert_eq!(
+            draw_named(&mut test_app, window.into(), &painted),
+            ["control"]
+        );
+
+        // and a backdrop drawn over the origin, as by a dialog the press opens, ends it at once:
+        // a mouse still within the origin's bounds is not on its way to the tooltip.
+        window
+            .update(&mut test_app, |owner, _, cx| {
+                owner.cover = Cover::Backdrop;
+                cx.notify();
+            })
+            .unwrap();
+        assert!(draw_named(&mut test_app, window.into(), &painted).is_empty());
+    }
+
+    #[test]
+    fn hoverable_tooltip_waits_for_a_mouse_that_leaves_its_origin() {
+        let painted = PaintedTooltips::default();
+        let (mut test_app, window) = setup_named_tooltip_test({
+            let painted = painted.clone();
+            move |_, _| CoveredTooltipOwner {
+                cover: Cover::Nothing,
+                hoverable: true,
+                painted,
+            }
+        });
+        wait_for_tooltip(&mut test_app);
+        assert_eq!(
+            draw_named(&mut test_app, window.into(), &painted),
+            ["control"]
+        );
+
+        // The mouse leaves the origin, not toward the tooltip: it stays a while in case it is,
+        move_mouse(&mut test_app, window.into(), point(px(75.), px(75.)));
+        assert_eq!(
+            draw_named(&mut test_app, window.into(), &painted),
+            ["control"]
+        );
+
+        // and goes after that.
+        test_app
+            .dispatcher
+            .advance_clock(HOVERABLE_TOOLTIP_HIDE_DELAY);
+        test_app.run_until_parked();
+        assert!(draw_named(&mut test_app, window.into(), &painted).is_empty());
     }
 
     struct CachedTooltipParent {

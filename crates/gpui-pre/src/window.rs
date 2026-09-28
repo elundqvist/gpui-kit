@@ -813,6 +813,30 @@ impl HitboxId {
             .any(|id| self == *id)
     }
 
+    /// Checks if the mouse is within the bounds of the hitbox with this ID in the frame being
+    /// drawn while a hitbox inserted in front of it, like a modal's backdrop, keeps it from being
+    /// hovered, as [`HitboxId::is_hovered_during_prepaint`] finds it. Never while the pointer is
+    /// captured or the last input was the keyboard.
+    pub(crate) fn is_covered_during_prepaint(self, window: &Window) -> bool {
+        if window.captured_hitbox == Some(self) || window.last_input_was_keyboard() {
+            return false;
+        }
+        let position = window.mouse_position();
+        let within = window
+            .next_frame
+            .hitboxes
+            .iter()
+            .rev()
+            .find(|hitbox| hitbox.id == self)
+            .is_some_and(|hitbox| {
+                hitbox
+                    .bounds
+                    .intersect(&hitbox.content_mask.bounds)
+                    .contains(&position)
+            });
+        within && !self.is_hovered_during_prepaint(window)
+    }
+
     fn hit_test(self, window: &Window) -> bool {
         let hit_test = &window.mouse_hit_test;
         for id in hit_test.ids.iter().take(hit_test.hover_hitbox_count) {

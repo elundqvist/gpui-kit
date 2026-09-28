@@ -2,8 +2,8 @@ use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
-    TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
-    WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
+    TextRun, TextStyle, TooltipId, TooltipOriginHover, TruncateFrom, WhiteSpace, Window,
+    WrappedLine, WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
 };
 use anyhow::Context as _;
 use gpui_util::ResultExt;
@@ -1228,11 +1228,16 @@ impl Element for InteractiveText {
                         let text_layout = text_layout.clone();
                         let pending_mouse_down = interactive_state.mouse_down_index.clone();
                         move |window: &Window| {
-                            text_layout
+                            if text_layout
                                 .index_for_position(window.mouse_position())
                                 .is_ok()
                                 && source_bounds.contains(&window.mouse_position())
                                 && pending_mouse_down.get().is_none()
+                            {
+                                TooltipOriginHover::Hovered
+                            } else {
+                                TooltipOriginHover::Away
+                            }
                         }
                     });
 
