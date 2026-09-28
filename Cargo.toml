@@ -30,6 +30,12 @@ members = [
     "crates/shell",
     "crates/component-shell",
 ]
+# gpui-pre as published to crates.io, carried so that fixes to gpui itself can
+# sit on top of it. It is a workspace of its own and builds with the lock it
+# was published with; an application takes it through `[patch.crates-io]`,
+# which also hands it to the gpui-pre-* platform crates that ask for it by
+# version.
+exclude = ["crates/gpui-pre"]
 resolver = "2"
 
 [workspace.package]
