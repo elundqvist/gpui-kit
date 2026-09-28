@@ -4346,7 +4346,7 @@ mod tests {
     use super::*;
     use crate::{
         AnyWindowHandle, AppContext as _, Context, InputEvent, Keystroke, MouseMoveEvent,
-        TestAppContext, canvas, util::FluentBuilder as _,
+        TestAppContext, anchored, canvas, deferred, util::FluentBuilder as _,
     };
     use std::{cell::Cell, rc::Weak};
 
@@ -5077,6 +5077,307 @@ mod tests {
             .advance_clock(DEFAULT_TOOLTIP_SHOW_DELAY);
         test_app.run_until_parked();
         assert!(active_tooltip.borrow().is_none());
+    }
+
+    #[test]
+    fn a_move_after_a_mouse_down_starts_a_new_tooltip() {
+        let (mut test_app, any_window, captured_active_tooltip) = setup_tooltip_owner_test(None);
+
+        let weak_active_tooltip = captured_active_tooltip.borrow().clone().unwrap();
+        let active_tooltip = weak_active_tooltip.upgrade().unwrap();
+
+        press(&mut test_app, any_window, point(px(10.), px(10.)));
+        assert!(active_tooltip.borrow().is_none());
+
+        move_mouse(&mut test_app, any_window, point(px(11.), px(11.)));
+        assert!(matches!(
+            active_tooltip.borrow().as_ref(),
+            Some(ActiveTooltip::WaitingForShow { .. })
+        ));
+        test_app
+            .dispatcher
+            .advance_clock(DEFAULT_TOOLTIP_SHOW_DELAY);
+        test_app.run_until_parked();
+        assert!(matches!(
+            active_tooltip.borrow().as_ref(),
+            Some(ActiveTooltip::Visible { .. })
+        ));
+    }
+
+    /// The names of the tooltips painted, in the order they were.
+    type PaintedTooltips = Rc<RefCell<Vec<&'static str>>>;
+
+    /// A tooltip that says which control it belongs to when it is painted. A tooltip's view is
+    /// rendered before the window decides whether to show it, so only its paint tells.
+    struct NamedTooltip {
+        name: &'static str,
+        painted: PaintedTooltips,
+    }
+
+    impl Render for NamedTooltip {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let (name, painted) = (self.name, self.painted.clone());
+            div().size(px(20.)).child(
+                canvas(
+                    |_, _, _| {},
+                    move |_, _, _, _| painted.borrow_mut().push(name),
+                )
+                .size_full(),
+            )
+        }
+    }
+
+    /// A 50px control at the window's top left, with a tooltip that says the control's name.
+    fn named_tooltip_control(name: &'static str, painted: &PaintedTooltips) -> Stateful<Div> {
+        let painted = painted.clone();
+        div().id(name).size(px(50.)).tooltip(move |_, cx| {
+            let painted = painted.clone();
+            cx.new(|_| NamedTooltip { name, painted }).into()
+        })
+    }
+
+    /// What is drawn over the control, at the window's top left, under the mouse.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Cover {
+        Nothing,
+        /// A backdrop that occludes the window, with a control of the dialog's own on it.
+        Dialog,
+        /// A backdrop that occludes the window, and over it a popover drawn deferred, with a
+        /// control of its own.
+        Popover,
+    }
+
+    struct CoveredTooltipOwner {
+        cover: Cover,
+        painted: PaintedTooltips,
+    }
+
+    impl Render for CoveredTooltipOwner {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let backdrop = || div().absolute().top_0().left_0().size_full().occlude();
+            div()
+                .size_full()
+                .child(named_tooltip_control("control", &self.painted))
+                .when(self.cover == Cover::Dialog, |this| {
+                    this.child(backdrop().child(named_tooltip_control("dialog", &self.painted)))
+                })
+                .when(self.cover == Cover::Popover, |this| {
+                    this.child(backdrop()).child(deferred(
+                        anchored()
+                            .position(point(px(0.), px(0.)))
+                            .child(named_tooltip_control("popover", &self.painted)),
+                    ))
+                })
+        }
+    }
+
+    /// Opens a window on `view` and moves the mouse over its top left.
+    fn setup_named_tooltip_test<V: Render>(
+        view: impl FnOnce(&mut Window, &mut Context<V>) -> V + 'static,
+    ) -> (TestAppContext, crate::WindowHandle<V>) {
+        let mut test_app = TestAppContext::single();
+        let window = test_app.add_window(view);
+        draw_window(&mut test_app, window.into());
+        move_mouse(&mut test_app, window.into(), point(px(10.), px(10.)));
+        draw_window(&mut test_app, window.into());
+        (test_app, window)
+    }
+
+    fn draw_window(test_app: &mut TestAppContext, window: AnyWindowHandle) {
+        test_app
+            .update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+    }
+
+    /// Draws the window and says which tooltips that painted.
+    fn draw_named(
+        test_app: &mut TestAppContext,
+        window: AnyWindowHandle,
+        painted: &PaintedTooltips,
+    ) -> Vec<&'static str> {
+        painted.borrow_mut().clear();
+        draw_window(test_app, window);
+        painted.take()
+    }
+
+    fn move_mouse(test_app: &mut TestAppContext, window: AnyWindowHandle, position: Point<Pixels>) {
+        test_app
+            .update_window(window, |_, window, cx| {
+                window.dispatch_event(
+                    MouseMoveEvent {
+                        position,
+                        modifiers: Default::default(),
+                        pressed_button: None,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            })
+            .unwrap();
+    }
+
+    fn press(test_app: &mut TestAppContext, window: AnyWindowHandle, position: Point<Pixels>) {
+        test_app
+            .update_window(window, |_, window, cx| {
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position,
+                        button: MouseButton::Left,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    MouseUpEvent {
+                        position,
+                        button: MouseButton::Left,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            })
+            .unwrap();
+    }
+
+    fn wait_for_tooltip(test_app: &mut TestAppContext) {
+        test_app
+            .dispatcher
+            .advance_clock(DEFAULT_TOOLTIP_SHOW_DELAY);
+        test_app.run_until_parked();
+    }
+
+    #[test]
+    fn tooltip_of_a_control_in_front_of_a_backdrop_still_shows() {
+        let painted = PaintedTooltips::default();
+        let (mut test_app, window) = setup_named_tooltip_test({
+            let painted = painted.clone();
+            move |_, _| CoveredTooltipOwner {
+                cover: Cover::Nothing,
+                painted,
+            }
+        });
+        wait_for_tooltip(&mut test_app);
+        assert_eq!(
+            draw_named(&mut test_app, window.into(), &painted),
+            ["control"]
+        );
+
+        // A dialog opens over the control, with a control of its own under the mouse: the
+        // control behind loses its tooltip,
+        window
+            .update(&mut test_app, |owner, _, cx| {
+                owner.cover = Cover::Dialog;
+                cx.notify();
+            })
+            .unwrap();
+        assert!(draw_named(&mut test_app, window.into(), &painted).is_empty());
+
+        // and the dialog's control shows its own once the mouse moves, for as long as it is drawn.
+        move_mouse(&mut test_app, window.into(), point(px(11.), px(11.)));
+        wait_for_tooltip(&mut test_app);
+        for _ in 0..3 {
+            assert_eq!(
+                draw_named(&mut test_app, window.into(), &painted),
+                ["dialog"]
+            );
+        }
+    }
+
+    #[test]
+    fn tooltip_of_a_control_in_a_deferred_draw_over_a_backdrop_still_shows() {
+        let painted = PaintedTooltips::default();
+        let (mut test_app, window) = setup_named_tooltip_test({
+            let painted = painted.clone();
+            move |_, _| CoveredTooltipOwner {
+                cover: Cover::Popover,
+                painted,
+            }
+        });
+        wait_for_tooltip(&mut test_app);
+        for _ in 0..3 {
+            assert_eq!(
+                draw_named(&mut test_app, window.into(), &painted),
+                ["popover"]
+            );
+        }
+    }
+
+    struct CachedTooltipParent {
+        child: Entity<CachedTooltipChild>,
+        backdrop: bool,
+    }
+
+    impl Render for CachedTooltipParent {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(
+                    AnyView::from(self.child.clone())
+                        .cached(StyleRefinement::default().size_full()),
+                )
+                .when(self.backdrop, |this| {
+                    this.child(div().absolute().top_0().left_0().size_full().occlude())
+                })
+        }
+    }
+
+    struct CachedTooltipChild {
+        renders: Rc<Cell<usize>>,
+        painted: PaintedTooltips,
+    }
+
+    impl Render for CachedTooltipChild {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            div()
+                .size_full()
+                .child(named_tooltip_control("cached", &self.painted))
+        }
+    }
+
+    #[test]
+    fn tooltip_of_a_cached_view_stays_until_a_backdrop_covers_it() {
+        let painted = PaintedTooltips::default();
+        let renders = Rc::new(Cell::new(0));
+        let (mut test_app, window) = setup_named_tooltip_test({
+            let (painted, renders) = (painted.clone(), renders.clone());
+            move |_, cx| CachedTooltipParent {
+                child: cx.new(|_| CachedTooltipChild { renders, painted }),
+                backdrop: false,
+            }
+        });
+        wait_for_tooltip(&mut test_app);
+        assert_eq!(
+            draw_named(&mut test_app, window.into(), &painted),
+            ["cached"]
+        );
+        let rendered = renders.get();
+
+        // The parent is drawn again and the child reused from the cache, with the hitbox of its
+        // last prepaint: the tooltip stays.
+        window
+            .update(&mut test_app, |_, _, cx| cx.notify())
+            .unwrap();
+        assert_eq!(
+            draw_named(&mut test_app, window.into(), &painted),
+            ["cached"]
+        );
+        assert_eq!(renders.get(), rendered);
+
+        // A backdrop the parent draws over the reused child hides it.
+        window
+            .update(&mut test_app, |parent, _, cx| {
+                parent.backdrop = true;
+                cx.notify();
+            })
+            .unwrap();
+        assert!(draw_named(&mut test_app, window.into(), &painted).is_empty());
+        assert_eq!(renders.get(), rendered);
     }
 
     struct MouseDownOutOwner {
