@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre 0.3.3 as published to crates.io: FORK.md at the
+// crate's root lists the changes.
 #[cfg(feature = "profiler")]
 use crate::DebugFrameOverlayMode;
 #[cfg(any(feature = "inspector", debug_assertions))]

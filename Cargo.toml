@@ -34,7 +34,9 @@ members = [
 # sit on top of it. It is a workspace of its own and builds with the lock it
 # was published with; an application takes it through `[patch.crates-io]`,
 # which also hands it to the gpui-pre-* platform crates that ask for it by
-# version.
+# version. The crates here do not: they build on the gpui-pre in Cargo.lock,
+# from crates.io, so their tests never run on its fixes. Its own tests run
+# from its directory; crates/gpui-pre/FORK.md says how, and what it changes.
 exclude = ["crates/gpui-pre"]
 resolver = "2"
 

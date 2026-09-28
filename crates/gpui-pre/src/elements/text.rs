@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre 0.3.3 as published to crates.io: FORK.md at the
+// crate's root lists the changes.
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
