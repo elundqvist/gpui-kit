@@ -38,6 +38,25 @@ use crate::input::{
 };
 use crate::{AutoScroll, StepAction};
 
+/// A value read off the UI thread for
+/// [`InputBaseState::set_prepared_value`]: the rope of a text, and its
+/// lines as an input that does not soft-wrap lays them out. Making one
+/// reads the whole text, which for a large one takes longer than a frame;
+/// handing it to the input does not.
+pub struct PreparedValue {
+    text: Rope,
+    lines: super::display_map::PreparedLines,
+}
+
+impl PreparedValue {
+    /// Read `text`, on whatever thread the caller likes.
+    pub fn new(text: &str) -> Self {
+        let text = Rope::from(text);
+        let lines = super::display_map::PreparedLines::of(&text);
+        Self { text, lines }
+    }
+}
+
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
 #[action(namespace = input, no_json)]
 pub struct Enter {
@@ -857,6 +876,44 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.reset_lsp_state();
         self.reset_scroll_to_start();
 
+        self.undo_manager.clear();
+        cx.notify();
+    }
+
+    /// Set the text as [`set_value`](Self::set_value) does, from a value
+    /// read off the UI thread ([`PreparedValue`]): nothing here reads the
+    /// whole text, so a large text takes no longer than a small one where
+    /// the input does not soft-wrap. One that wraps lays every line out
+    /// again here, as `set_value` does. The value is taken as it is, not
+    /// normalized as `set_value` normalizes a single line or a number, so
+    /// it is for a multi-line input with no mask. The text and the lines
+    /// it replaces are freed on a background thread.
+    ///
+    /// `set_value` built the rope, laid out every line and then laid them
+    /// all out again for the first frame, a pass over the whole text each:
+    /// on a 20 MB text, some half a second of the UI thread.
+    pub fn set_prepared_value(&mut self, value: PreparedValue, cx: &mut Context<Self>) {
+        let PreparedValue { text, lines } = value;
+        let replaced = self.display_map.set_prepared_text(&text, lines, cx);
+        let old_text = std::mem::replace(&mut self.text, text);
+        M::reset_annotations(self);
+        if let Some(diagnostics) = self.mode.diagnostics_mut() {
+            diagnostics.reset(&self.text)
+        }
+        // what else holds the old text lets it go here, so that the
+        // background drop below is the last and frees it
+        self.update_search(cx);
+        self.reset_highlighter(cx);
+        cx.background_spawn(async move { drop((replaced, old_text)) })
+            .detach();
+        self.ime_marked_range = None;
+        self.preferred_column = None;
+        if self.is_multi_line() {
+            self.mode.update_auto_grow(&self.display_map);
+        }
+        self.reset_selection();
+        self.reset_lsp_state();
+        self.reset_scroll_to_start();
         self.undo_manager.clear();
         cx.notify();
     }
@@ -5217,6 +5274,68 @@ mod tests {
             assert!(!state.is_single_line());
             assert!(!state.is_code_editor());
         });
+    }
+
+    /// A value read off the UI thread is set as `set_value` sets the same
+    /// text in an input that does not wrap: the text, its lines, the caret
+    /// at the start and nothing to undo, and so after the frame drawn.
+    #[gpui::test]
+    fn a_prepared_value_is_set_as_set_value_sets_it(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let view = InputView::build_editor(cx, |state| state.soft_wrap(false));
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        type Seen = (
+            String,
+            Vec<(usize, Vec<Range<usize>>)>,
+            Range<usize>,
+            bool,
+            usize,
+        );
+        let seen = |cx: &mut VisualTestContext| -> Seen {
+            input.read_with(cx, |state, _| {
+                let map = &state.display_map;
+                let lines = (0..map.buffer_line_count())
+                    .map(|row| {
+                        let line = map.line(row).unwrap();
+                        (line.len(), line.wrapped_lines.to_vec())
+                    })
+                    .collect();
+                (
+                    state.value().to_string(),
+                    lines,
+                    state.selected_range.into(),
+                    state.undo_manager.has_undos(),
+                    map.display_row_count(),
+                )
+            })
+        };
+        let draw = |cx: &mut VisualTestContext| cx.update(|window, cx| window.draw(cx).clear(cx));
+        for text in [
+            "",
+            "one",
+            "one\ntwo\n",
+            "a\r\nb\r\n\r\nc",
+            "lone\rcr\n\n",
+            "中文\nx",
+        ] {
+            cx.update(|window, cx| input.update(cx, |state, cx| state.set_value(text, window, cx)));
+            let by_value = seen(&mut cx);
+            draw(&mut cx);
+            let drawn = seen(&mut cx);
+            cx.update(|window, cx| {
+                input.update(cx, |state, cx| {
+                    state.set_value("something else\nentirely", window, cx);
+                    state.insert("typed", window, cx);
+                    state.set_prepared_value(PreparedValue::new(text), cx);
+                })
+            });
+            assert_eq!(seen(&mut cx), by_value, "{text:?}");
+            draw(&mut cx);
+            assert_eq!(seen(&mut cx), drawn, "{text:?} drawn");
+        }
+        fn is_send<T: Send>() {}
+        is_send::<PreparedValue>();
     }
 
     /// Soft wrap is on by default, for every mode that can wrap.

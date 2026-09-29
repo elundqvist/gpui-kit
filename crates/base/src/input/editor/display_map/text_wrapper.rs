@@ -52,6 +52,19 @@ impl LineItem {
     pub(crate) fn lines_len(&self) -> usize {
         self.wrapped_lines.len()
     }
+
+    /// A line of `len` bytes as a wrapper that does not wrap lays it out:
+    /// one visual line, the whole of it, as `TextWrapper::_update` makes it
+    /// when there is no wrap width.
+    fn unwrapped(len: usize) -> Self {
+        let mut wrapped_lines = SmallVec::new();
+        wrapped_lines.push(0..len);
+        Self {
+            len,
+            indent: 0,
+            wrapped_lines,
+        }
+    }
 }
 
 /// Summary of a subtree of [`LineItem`]s, maintained incrementally by the [`SumTree`].
@@ -251,7 +264,9 @@ impl TextWrapper {
         }
 
         self.wrapping_indent = wrapping_indent;
-        self.update_all(&self.text.clone(), cx);
+        if self.lines_follow_layout() {
+            self.update_all(&self.text.clone(), cx);
+        }
     }
 
     pub(crate) fn set_font(&mut self, font: Font, font_size: Pixels, cx: &mut App) {
@@ -261,7 +276,55 @@ impl TextWrapper {
 
         self.font = font;
         self.font_size = font_size;
-        self.update_all(&self.text.clone(), cx);
+        if self.lines_follow_layout() {
+            self.update_all(&self.text.clone(), cx);
+        }
+    }
+
+    /// Whether the lines depend on the font and the wrapping indent, and
+    /// are made already: without a wrap width a line is one visual line
+    /// whatever the font, and lines not made yet are made whole by
+    /// `prepare_if_need`. Laying out every line again for either took a
+    /// pass over the whole text, which on a large one is longer than a
+    /// frame, on the first frame of every input.
+    fn lines_follow_layout(&self) -> bool {
+        self.wrap_width.is_some() && self._initialized
+    }
+
+    /// The lines of `text` as a wrapper with no wrap width lays them out,
+    /// made with no [`App`], so on any thread: for a text too large to
+    /// read on the UI thread, whose lines [`Self::set_prepared`] then
+    /// takes as they are.
+    pub(crate) fn unwrapped_lines(text: &Rope) -> SumTree<LineItem> {
+        let last_row = text.offset_to_point(text.len()).row;
+        SumTree::from_iter(
+            (0..=last_row).map(|row| LineItem::unwrapped(text.slice_line(row).len())),
+            &(),
+        )
+    }
+
+    /// Take `text` in place of the wrapper's text, with `lines`, its lines
+    /// as [`Self::unwrapped_lines`] made them: as they are where the
+    /// wrapper does not wrap, and where it does, by wrapping the text
+    /// afresh, which lines made with no font cannot say. Hands back the
+    /// text and the lines it had, for the caller to free where it likes.
+    pub(crate) fn set_prepared(
+        &mut self,
+        text: &Rope,
+        lines: SumTree<LineItem>,
+        cx: &mut App,
+    ) -> (Rope, SumTree<LineItem>) {
+        let old = (
+            std::mem::replace(&mut self.text, text.clone()),
+            std::mem::replace(&mut self.lines, SumTree::new(&())),
+        );
+        self._initialized = true;
+        if self.wrap_width.is_none() {
+            self.lines = lines;
+        } else {
+            self.update_all(text, cx);
+        }
+        old
     }
 
     pub(crate) fn prepare_if_need(&mut self, text: &Rope, cx: &mut App) -> bool {
@@ -1036,6 +1099,85 @@ mod tests {
             style: FontStyle::Normal,
             features: FontFeatures::default(),
             fallbacks: None,
+        }
+    }
+
+    fn items(lines: &SumTree<LineItem>) -> Vec<(usize, u32, Vec<Range<usize>>)> {
+        lines
+            .iter()
+            .map(|l| (l.len(), l.indent, l.wrapped_lines.to_vec()))
+            .collect()
+    }
+
+    /// The lines made with no App, for a text read off the UI thread, are
+    /// the lines a wrapper with no wrap width makes of the whole text.
+    #[test]
+    fn test_unwrapped_lines_are_the_lines_a_wrapper_with_no_wrap_width_makes() {
+        for text in [
+            "",
+            "one",
+            "one\ntwo\n",
+            "a\r\nb\r\n\r\nc",
+            "a lone\rcarriage return\n\n",
+            "中文\n  indented\n\ttab",
+            "\n\n\n",
+        ] {
+            let text = Rope::from(text);
+            let mut wrapper = TextWrapper::new(test_font(), px(14.), None);
+            wrapper._update(&text, &(0..text.len()), &text, &mut |_, _| {
+                unreachable!("there is no wrap width")
+            });
+            assert_eq!(
+                items(&TextWrapper::unwrapped_lines(&text)),
+                items(&wrapper.lines),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// The text and lines prepared are taken as they are, and the wrapper
+    /// counts as made: nothing lays them out again.
+    #[gpui::test]
+    fn test_set_prepared_takes_the_lines_and_hands_back_the_old(cx: &mut gpui::TestAppContext) {
+        let mut wrapper = TextWrapper::new(test_font(), px(14.), None);
+        let old = Rope::from("old\ntext");
+        cx.update(|cx| wrapper.prepare_if_need(&old, cx));
+        let text = Rope::from("one\ntwo\r\nthree\n");
+        let (was, was_lines) =
+            cx.update(|cx| wrapper.set_prepared(&text, TextWrapper::unwrapped_lines(&text), cx));
+        assert_eq!(
+            (was.to_string(), was_lines.summary().buffer_rows),
+            ("old\ntext".into(), 2)
+        );
+        assert_eq!(wrapper.text().to_string(), text.to_string());
+        assert_eq!(
+            items(&wrapper.lines),
+            items(&TextWrapper::unwrapped_lines(&text))
+        );
+        assert!(
+            !cx.update(|cx| wrapper.prepare_if_need(&text, cx)),
+            "made already"
+        );
+    }
+
+    /// Without a wrap width a line is one visual line whatever the font or
+    /// the wrapping indent, so neither lays the lines out again: here the
+    /// wrapper's text is set under its lines by hand, and lines laid out
+    /// again would follow it. With a wrap width they do.
+    #[gpui::test]
+    fn test_a_font_lays_out_again_only_lines_that_wrap(cx: &mut gpui::TestAppContext) {
+        let other_font = gpui::Font {
+            family: "Courier".into(),
+            ..test_font()
+        };
+        for wrap_width in [None, Some(px(1000.))] {
+            let mut wrapper = TextWrapper::new(test_font(), px(14.), wrap_width);
+            cx.update(|cx| wrapper.prepare_if_need(&Rope::from("one line"), cx));
+            wrapper.text = Rope::from("three\nlines\nnow");
+            cx.update(|cx| wrapper.set_font(other_font.clone(), px(20.), cx));
+            cx.update(|cx| wrapper.set_wrapping_indent(WrappingIndent::None, cx));
+            let expected = if wrap_width.is_some() { 3 } else { 1 };
+            assert_eq!(wrapper.lines_count(), expected, "{wrap_width:?}");
         }
     }
 

@@ -8,16 +8,35 @@ use std::ops::Range;
 
 use gpui::{App, Font, Pixels};
 use ropey::Rope;
+use sum_tree::SumTree;
 
 use super::fold_map::FoldMap;
 use super::folding::FoldRange;
 pub use super::text_wrapper::WrappingIndent;
-use super::text_wrapper::{LineItem, WrapDisplayPoint};
+use super::text_wrapper::{LineItem, TextWrapper, WrapDisplayPoint};
 use super::wrap_map::WrapMap;
 use super::{BufferPoint, DisplayPoint};
 use crate::input::Point as TreeSitterPoint;
 use crate::input::display_map::WrapPoint;
 use crate::input::rope_ext::RopeExt as _;
+
+/// The lines of a whole text as a display map that does not wrap lays
+/// them out, made with no [`App`], so on any thread, for
+/// [`DisplayMap::set_prepared_text`].
+pub(crate) struct PreparedLines(SumTree<LineItem>);
+
+impl PreparedLines {
+    pub(crate) fn of(text: &Rope) -> Self {
+        Self(TextWrapper::unwrapped_lines(text))
+    }
+}
+
+/// What a display map had before [`DisplayMap::set_prepared_text`], to be
+/// freed off the UI thread: for a large text, dropping it takes a while.
+pub(crate) struct Replaced(
+    #[allow(dead_code)] Rope,
+    #[allow(dead_code)] SumTree<LineItem>,
+);
 
 /// DisplayMap is the main interface for Editor/Input coordinate mapping.
 ///
@@ -249,6 +268,23 @@ impl DisplayMap {
         if did_initialize {
             self.rebuild_fold_projection();
         }
+    }
+
+    /// Take a whole new text with its lines, made off the UI thread
+    /// ([`crate::input::PreparedValue`]): its folds and fold candidates go,
+    /// as a replacement of the whole text takes them. Hands back the text
+    /// and the lines it had, for the caller to free off the UI thread.
+    pub(crate) fn set_prepared_text(
+        &mut self,
+        text: &Rope,
+        lines: PreparedLines,
+        cx: &mut App,
+    ) -> Replaced {
+        self.fold_map.clear_folds();
+        self.fold_map.set_candidates(Vec::new());
+        let (old_text, old_lines) = self.wrap_map.set_prepared(text, lines.0, cx);
+        self.rebuild_fold_projection();
+        Replaced(old_text, old_lines)
     }
 
     /// Initialize with text

@@ -8,6 +8,7 @@ use std::ops::Range;
 
 use gpui::{App, Font, Pixels};
 use ropey::Rope;
+use sum_tree::SumTree;
 
 use super::fold_map::FoldMap;
 use super::text_wrapper::{LineItem, TextWrapper, WrapDisplayPoint, WrappingIndent};
@@ -128,6 +129,17 @@ impl WrapMap {
     /// Ensure text is prepared (initializes wrapper if needed)
     pub(super) fn ensure_text_prepared(&mut self, text: &Rope, cx: &mut App) -> bool {
         self.wrapper.prepare_if_need(text, cx)
+    }
+
+    /// Take `text` and its lines made off the UI thread
+    /// (`TextWrapper::set_prepared`), handing back the text and lines it had.
+    pub(super) fn set_prepared(
+        &mut self,
+        text: &Rope,
+        lines: SumTree<LineItem>,
+        cx: &mut App,
+    ) -> (Rope, SumTree<LineItem>) {
+        self.wrapper.set_prepared(text, lines, cx)
     }
 
     /// Initialize with text

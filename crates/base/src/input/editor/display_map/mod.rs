@@ -14,6 +14,7 @@ mod text_wrapper;
 mod wrap_map;
 
 // Re-export public API
+pub(crate) use self::display_map::PreparedLines;
 pub use self::display_map::{DisplayMap, WrappingIndent};
 pub(crate) use self::text_wrapper::LineLayout;
 
