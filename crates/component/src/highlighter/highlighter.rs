@@ -73,6 +73,20 @@ pub struct SyntaxHighlighter {
     edited: Vec<Range<usize>>,
 }
 
+/// The trees a highlighter's parse left, taken out of it to be freed
+/// elsewhere ([`SyntaxHighlighter::take_parse`]).
+pub(crate) struct Parse {
+    tree: Option<Tree>,
+    injection_layers: Vec<InjectionLayer>,
+}
+
+impl Parse {
+    /// Whether it holds any tree at all.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.tree.is_none() && self.injection_layers.is_empty()
+    }
+}
+
 /// A parsed injection layer.
 /// Stores the parsed tree and the ranges it covers.
 pub(crate) struct InjectionLayer {
@@ -693,6 +707,18 @@ impl SyntaxHighlighter {
     /// Returns a reference to the current text.
     pub fn text(&self) -> &Rope {
         &self.text
+    }
+
+    /// Take the trees of the last parse out, with the size of the text
+    /// they are of: freeing the trees of a large text takes a while, some
+    /// 80 ms for 20 MB of HTML, which the UI thread stood still for when an
+    /// editor's text or language was replaced.
+    pub(crate) fn take_parse(&mut self) -> (Parse, usize) {
+        let parse = Parse {
+            tree: self.tree.take(),
+            injection_layers: std::mem::take(&mut self.injection_layers),
+        };
+        (parse, self.text.len())
     }
 
     /// Highlight the given text, returning a map from byte ranges to highlight captures.
@@ -1709,6 +1735,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_take_parse_takes_every_tree() {
+        let html = "<style>\n.card { color: #336699; }\n</style>\n<p>hi</p>\n";
+        let rope = Rope::from_str(html);
+        let mut highlighter = SyntaxHighlighter::new("html");
+        assert!(highlighter.update(None, &rope, None));
+        assert!(highlighter.tree().is_some());
+        let (parse, bytes) = highlighter.take_parse();
+        assert_eq!(bytes, html.len());
+        assert!(parse.tree.is_some());
+        assert_eq!(parse.injection_layers.len(), 1, "the style's CSS");
+        assert!(highlighter.tree().is_none());
+        assert!(
+            highlighter.take_parse().0.is_empty(),
+            "nothing left to take"
+        );
+        fn is_send<T: Send>(_: &T) {}
+        is_send(&parse);
     }
 
     #[test]

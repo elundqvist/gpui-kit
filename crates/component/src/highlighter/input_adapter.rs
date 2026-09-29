@@ -33,6 +33,22 @@ struct TreeSitterInputHighlighter {
     parse_task: Rc<RefCell<Option<Task<()>>>>,
 }
 
+/// A text above this size has its trees freed on a thread of their own
+/// when its highlighter goes; a smaller one's take no time to free.
+const FREE_ELSEWHERE_BYTES: usize = 256 * 1024;
+
+impl Drop for TreeSitterInputHighlighter {
+    fn drop(&mut self) {
+        let Ok(mut inner) = self.inner.try_borrow_mut() else {
+            return;
+        };
+        let (parse, bytes) = inner.take_parse();
+        if bytes > FREE_ELSEWHERE_BYTES && !parse.is_empty() {
+            std::thread::spawn(move || drop(parse));
+        }
+    }
+}
+
 impl TreeSitterInputHighlighter {
     fn new(language: &str) -> Self {
         Self {
