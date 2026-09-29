@@ -280,6 +280,18 @@ fn clamp_auto_grow_vertical_scroll_offset(
     }
 }
 
+/// Where the room kept with `gutter_extra` starts, from the input's left
+/// edge: after the line numbers, before the fold icons and the margin that
+/// end the gutter at the text.
+pub(super) fn gutter_extra_left(line_number_width: Pixels, extra: Pixels, folding: bool) -> Pixels {
+    let fold = if folding {
+        FOLD_ICON_HITBOX_WIDTH
+    } else {
+        px(0.)
+    };
+    line_number_width - LINE_NUMBER_RIGHT_MARGIN - fold - extra
+}
+
 fn editor_gutter_bounds(
     input_bounds: Bounds<Pixels>,
     line_number_width: Pixels,
@@ -971,6 +983,13 @@ impl<M: InputModeKind> TextElement<M> {
         if state.mode.is_folding() {
             // Add extra space for fold icons
             line_number_width += FOLD_ICON_HITBOX_WIDTH
+        }
+
+        // The room a caller keeps for itself, between the line numbers and
+        // the fold icons: the fold icons are placed from the gutter's right
+        // edge, so they move out of its way.
+        if state.is_code_editor() {
+            line_number_width += state.gutter_extra;
         }
 
         (line_number_width, line_number_len)
@@ -2744,6 +2763,15 @@ mod tests {
             Bounds::new(point(px(10.), px(18.)), size(px(303.), px(87.)))
         );
         assert_eq!(layout_without_gutter.scroll_size, size(px(513.), px(120.)));
+    }
+
+    #[test]
+    fn test_gutter_extra_sits_between_the_line_numbers_and_the_fold_icons() {
+        // numbers 30 px, then 12 px kept, then the fold icons and the margin
+        let width = px(30.) + px(12.) + FOLD_ICON_HITBOX_WIDTH + LINE_NUMBER_RIGHT_MARGIN;
+        assert_eq!(gutter_extra_left(width, px(12.), true), px(30.));
+        let width = px(30.) + px(12.) + LINE_NUMBER_RIGHT_MARGIN;
+        assert_eq!(gutter_extra_left(width, px(12.), false), px(30.));
     }
 
     #[test]

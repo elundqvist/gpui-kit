@@ -366,6 +366,9 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(crate) scroll_size: gpui::Size<Pixels>,
     pub(super) editor_scrollbar_snapshot: Cell<Option<EditorScrollbarSnapshot>>,
     pub(super) editor_paddings: Edges<Pixels>,
+    /// Room in a code editor's gutter the caller paints in itself, between
+    /// the line numbers and the fold icons. See [`Self::gutter_extra`].
+    pub(super) gutter_extra: Pixels,
     /// The style this state paints with: what was projected onto it, with
     /// every colour left unset resolved from the palette that is current. It
     /// is rebuilt at the top of every render, which is what keeps it current
@@ -680,6 +683,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             scroll_size: gpui::size(px(0.), px(0.)),
             editor_scrollbar_snapshot: Cell::new(None),
             editor_paddings: Edges::default(),
+            gutter_extra: px(0.),
             deferred_scroll_offset: None,
             preferred_column: None,
             placeholder: SharedString::default(),
@@ -5338,6 +5342,44 @@ mod tests {
         is_send::<PreparedValue>();
     }
 
+    /// The room `gutter_extra` keeps is laid out between the line numbers and
+    /// the fold icons, the text moved right by as much, and it is said where
+    /// it is once drawn; without it there is none.
+    #[gpui::test]
+    fn gutter_extra_keeps_room_between_the_line_numbers_and_the_fold_icons(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::init);
+        let drawn = |view: &InputView<EditorMode>, cx: &mut TestAppContext| {
+            let mut vcx = VisualTestContext::from_window(view.window_handle.into(), cx);
+            vcx.update(|window, cx| {
+                view.input.update(cx, |state, cx| {
+                    state.set_value("fn main() {}\n", window, cx)
+                })
+            });
+            vcx.update(|window, cx| window.draw(cx).clear(cx));
+            view.input.read_with(&mut vcx, |state, _| {
+                let origin = state.input_bounds().origin.x;
+                let text = state.range_to_bounds(&(0..0)).unwrap().origin.x - origin;
+                let room = state
+                    .gutter_extra_bounds()
+                    .map(|b| (b.left() - origin, b.right() - origin, b.size.height));
+                (text, room)
+            })
+        };
+        let plain = InputView::build_editor(cx, |state| state);
+        let roomy = InputView::build_editor(cx, |state| state.gutter_extra(px(16.)));
+        let (plain_text, none) = drawn(&plain, cx);
+        let (roomy_text, room) = drawn(&roomy, cx);
+        assert_eq!(none, None);
+        assert_eq!(roomy_text - plain_text, px(16.));
+        let (left, right, height) = room.expect("the room is laid out");
+        assert_eq!(right - left, px(16.));
+        assert!(left > px(0.) && height > px(0.), "{left:?} {height:?}");
+        // the fold icons' 18 px and the 10 px margin lie between it and the text
+        assert_eq!(roomy_text - right, px(18.) + px(10.));
+    }
+
     /// Soft wrap is on by default, for every mode that can wrap.
     ///
     /// The default lives in the shared constructor, where a mode-specific
@@ -5617,6 +5659,49 @@ impl InputBaseState<crate::input::TextareaMode> {
 
 /// Methods that only a source-code editor offers.
 impl InputBaseState<crate::input::EditorMode> {
+    /// Keep `width` of room in the gutter, between the line numbers and the
+    /// fold icons, for the caller to paint in: a run button or a breakpoint
+    /// beside a line, which the editor itself knows nothing of. The text
+    /// moves right by as much. [`Self::gutter_extra_bounds`] says where the
+    /// room is once the editor has been laid out.
+    pub fn gutter_extra(mut self, width: Pixels) -> Self {
+        self.gutter_extra = width.max(px(0.));
+        self
+    }
+
+    /// Change the room [`Self::gutter_extra`] keeps.
+    pub fn set_gutter_extra(&mut self, width: Pixels, cx: &mut Context<Self>) {
+        let width = width.max(px(0.));
+        if width != self.gutter_extra {
+            self.gutter_extra = width;
+            cx.notify();
+        }
+    }
+
+    /// Where the room [`Self::gutter_extra`] keeps was laid out in the last
+    /// frame, in window coordinates, as tall as the input: `None` before the
+    /// first layout, or with no room kept. It does not move when the text
+    /// scrolls sideways, as the line numbers do not; a row's place in it is
+    /// the row's own, which [`Self::range_to_bounds`] answers.
+    pub fn gutter_extra_bounds(&self) -> Option<Bounds<Pixels>> {
+        if self.gutter_extra <= px(0.) {
+            return None;
+        }
+        let layout = self.last_layout.as_ref()?;
+        let left = super::element::gutter_extra_left(
+            layout.line_number_width,
+            self.gutter_extra,
+            self.mode.is_folding(),
+        );
+        Some(Bounds::new(
+            point(
+                self.input_bounds.origin.x + left,
+                self.input_bounds.origin.y,
+            ),
+            gpui::size(self.gutter_extra, self.input_bounds.size.height),
+        ))
+    }
+
     /// Create a source-code editor state.
     ///
     /// Default options: line numbers on, tab size 2 with soft tabs, indent
