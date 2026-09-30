@@ -102,6 +102,29 @@ pub trait CompletionProvider {
     ///
     /// This is called on the main thread.
     fn is_completion_trigger(&self, offset: usize, new_text: &str, cx: &mut App) -> bool;
+
+    /// An item of the completion menu was accepted, by Enter or a click.
+    ///
+    /// Return `true` when the provider puts the item in itself, and the
+    /// editor then inserts nothing. That is where a provider resolves the
+    /// item first (`completionItem/resolve`), applies its
+    /// `additionalTextEdits` in the same undo step as the item, or places
+    /// the cursor at a snippet's tab stop, none of which
+    /// [`InputBaseState::insert_completion`] does. The default returns
+    /// `false`, and the editor inserts the item with `insert_completion`.
+    ///
+    /// Called once the menu has closed, with no entity borrowed, so the
+    /// provider may read and update the editor from here. The item is the
+    /// one the menu was handed, `data` and all, which is how a provider
+    /// knows it again.
+    fn accept_completion(
+        &self,
+        _item: &CompletionItem,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> bool {
+        false
+    }
 }
 
 pub(crate) struct InlineCompletion {

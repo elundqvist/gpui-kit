@@ -313,7 +313,16 @@ impl CompletionMenu {
 
         let editor = self.editor.clone();
 
+        // The provider is offered the item first, with nothing borrowed, and
+        // the editor inserts it only if the provider does not.
         cx.spawn_in(window, async move |_, cx| {
+            let provider =
+                editor.read_with(cx, |editor, _| editor.lsp().completion_provider.clone())?;
+            if let Some(provider) = provider
+                && cx.update(|window, cx| provider.accept_completion(&item, window, cx))?
+            {
+                return Ok(());
+            }
             editor.update_in(cx, |editor, window, cx| {
                 editor.insert_completion(&item, range, window, cx);
             })
@@ -880,6 +889,86 @@ mod tests {
             window.simulate_next_frame(cx);
         });
         assert!(list_left(cx) > before.left(), "under the cursor again");
+    }
+
+    /// A provider that records the items it is offered on accept, and takes
+    /// them or leaves them to the editor.
+    struct Accepting {
+        offered: Rc<std::cell::RefCell<Vec<CompletionItem>>>,
+        takes: bool,
+    }
+
+    impl input::CompletionProvider for Accepting {
+        fn completions(
+            &self,
+            _: &ropey::Rope,
+            _: usize,
+            _: lsp_types::CompletionContext,
+            _: &mut Window,
+            _: &mut App,
+        ) -> gpui::Task<anyhow::Result<lsp_types::CompletionResponse>> {
+            gpui::Task::ready(Ok(lsp_types::CompletionResponse::Array(vec![])))
+        }
+
+        fn is_completion_trigger(&self, _: usize, _: &str, _: &mut App) -> bool {
+            false
+        }
+
+        fn accept_completion(&self, item: &CompletionItem, _: &mut Window, _: &mut App) -> bool {
+            self.offered.borrow_mut().push(item.clone());
+            self.takes
+        }
+    }
+
+    /// Enter on a row offers the item to the provider first: one that takes
+    /// it gets the item as it was handed to the menu, `data` and all, and
+    /// the editor inserts nothing; one that leaves it has the editor insert
+    /// it, as before the hook.
+    #[gpui::test]
+    fn an_accepted_item_is_the_providers_to_take(cx: &mut TestAppContext) {
+        let (probe, cx) = probe(cx);
+        let (state, menu) =
+            probe.read_with(cx, |probe, _| (probe.state.clone(), probe.menu.clone()));
+        let offered = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let accept = |takes: bool, cx: &mut VisualTestContext| {
+            let provider = Rc::new(Accepting {
+                offered: offered.clone(),
+                takes,
+            });
+            cx.update(|_, cx| {
+                state.update(cx, |state, _| {
+                    state.lsp_mut().completion_provider = Some(provider)
+                })
+            });
+            let greet = CompletionItem {
+                data: Some(serde_json::json!({ "row": 7 })),
+                ..item("greet", Some("fn(&str)"))
+            };
+            show(&probe, vec![greet], cx);
+            cx.update(|window, cx| menu.update(cx, |menu, cx| menu.on_action_enter(window, cx)));
+            cx.run_until_parked();
+            cx.read(|cx| state.read(cx).value().to_string())
+        };
+
+        assert_eq!(
+            accept(true, cx),
+            "",
+            "the provider took it: nothing inserted"
+        );
+        assert_eq!(offered.borrow().len(), 1);
+        assert_eq!(offered.borrow()[0].label, "greet");
+        assert_eq!(
+            offered.borrow()[0].data,
+            Some(serde_json::json!({ "row": 7 }))
+        );
+        assert!(!cx.read(|cx| menu.read(cx).open), "the menu closed");
+
+        assert_eq!(
+            accept(false, cx),
+            "greet",
+            "left to the editor, which inserts it"
+        );
+        assert_eq!(offered.borrow().len(), 2);
     }
 
     /// The scrollbar is drawn over the rows' ends, so a list that scrolls is
