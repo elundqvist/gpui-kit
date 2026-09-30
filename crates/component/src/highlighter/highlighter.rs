@@ -1284,11 +1284,17 @@ impl SyntaxHighlighter {
             }
         }
 
-        let query_nodes = collect_query_nodes(root_node, &range);
+        let (query_nodes, gone_into) = collect_query_nodes(root_node, &range);
 
-        for query_node in &query_nodes {
+        // What matches on a node gone into, at that node alone, first: it
+        // is the outer, and a string or a function far larger than the view
+        // keeps its colour. Then the nodes in view, whole.
+        let gone_into = gone_into.iter().map(|node| (node, Some(0)));
+        for (query_node, max_start_depth) in gone_into.chain(query_nodes.iter().map(|n| (n, None)))
+        {
             let mut query_cursor = QueryCursor::new();
             query_cursor.set_byte_range(range.clone());
+            query_cursor.set_max_start_depth(max_start_depth);
 
             let mut matches = query_cursor.matches(&query, *query_node, TextProvider(&source));
 
@@ -1522,22 +1528,31 @@ pub(crate) fn unique_styles(
 /// that fall entirely outside the byte range. Nodes much larger than the
 /// query range are recursed into so that `QueryCursor` only visits the
 /// relevant portion of the tree.
+///
+/// Returns the nodes to query whole, and the nodes gone into, outermost
+/// first. A pattern on one of those, `(string_literal) @string` on a string
+/// longer than the view or `(function_item (identifier) @function)` on a
+/// long function, is found by no query of its children, and they are to be
+/// queried at themselves alone.
 fn collect_query_nodes<'a>(
     root: tree_sitter::Node<'a>,
     range: &Range<usize>,
-) -> Vec<tree_sitter::Node<'a>> {
+) -> (Vec<tree_sitter::Node<'a>>, Vec<tree_sitter::Node<'a>>) {
     let mut nodes = Vec::new();
-    collect_query_nodes_inner(root, range, &mut nodes);
+    let mut gone_into = Vec::new();
+    collect_query_nodes_inner(root, range, &mut nodes, &mut gone_into);
     if nodes.is_empty() {
-        nodes.push(root);
+        // the root, whole, has every pattern the nodes gone into have
+        return (vec![root], Vec::new());
     }
-    nodes
+    (nodes, gone_into)
 }
 
 fn collect_query_nodes_inner<'a>(
     node: tree_sitter::Node<'a>,
     range: &Range<usize>,
     out: &mut Vec<tree_sitter::Node<'a>>,
+    gone_into: &mut Vec<tree_sitter::Node<'a>>,
 ) {
     // Skip nodes entirely outside the range.
     if node.end_byte() <= range.start || node.start_byte() >= range.end {
@@ -1550,6 +1565,7 @@ fn collect_query_nodes_inner<'a>(
     // Use `goto_first_child_for_byte` to seek directly to the first
     // overlapping child instead of iterating all children from the start.
     if node_span > range_span + LARGE_NODE_THRESHOLD && node.child_count() > 0 {
+        gone_into.push(node);
         let mut cursor = node.walk();
         if cursor.goto_first_child_for_byte(range.start).is_some() {
             loop {
@@ -1557,7 +1573,7 @@ fn collect_query_nodes_inner<'a>(
                 if child.start_byte() >= range.end {
                     break;
                 }
-                collect_query_nodes_inner(child, range, out);
+                collect_query_nodes_inner(child, range, out, gone_into);
                 if !cursor.goto_next_sibling() {
                     break;
                 }
@@ -2849,6 +2865,62 @@ $x = 1;
                     && item.range.end >= delimiter_end
             }),
             "overlap-enabled captures should not hide nested delimiter highlights"
+        );
+    }
+
+    /// A node far larger than the range in view keeps its own colour. The
+    /// query goes into such a node's children, to leave what is out of view
+    /// alone, and had lost what matched on the node itself: a string of
+    /// 4,000 lines pasted into, with no quote in it, was plain for good,
+    /// where #45 has it plain only until parsed; and so was the name of a
+    /// function far longer than the view, a pattern on the function.
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_a_node_larger_than_the_view_keeps_its_own_colour() {
+        let words = "word ".repeat(4_000);
+        let source = format!("fn main() {{\n    let s = \"{words}\";\n}}\nfn after() {{}}\n");
+        let highlighter = fresh_highlighter("rust", &source);
+        let middle = source.find(&words).unwrap() + words.len() / 2;
+        let view = middle..middle + 200;
+        let theme = HighlightTheme::default_dark();
+        assert_eq!(
+            highlighter.styles(&view, theme.as_ref()),
+            vec![(view.clone(), theme.style("string").unwrap())],
+            "the middle of the string is the string's colour"
+        );
+        // the string's end in view, and what comes after it
+        let end = source.find("\";\n}").unwrap();
+        let highlights = highlighter.match_styles(end - 100..source.len());
+        assert!(has_highlight_covering(
+            &highlights,
+            &source,
+            "word \"",
+            "string"
+        ));
+        assert!(has_highlight_at(&highlights, &source, "after", "function"));
+
+        let body = statements(0..2_000);
+        assert!(body.len() > 2 * LARGE_NODE_THRESHOLD);
+        let source = format!("fn big() {{\n{body}}}\n");
+        let highlighter = fresh_highlighter("rust", &source);
+        let highlights = highlighter.match_styles(0..200);
+        assert!(
+            has_highlight_at(&highlights, &source, "big", "function"),
+            "{highlights:?}"
+        );
+        assert!(has_highlight_at(&highlights, &source, "let n0", "keyword"));
+
+        // a stale string an edit reached is still plain until it is parsed
+        let before = "fn main() { let s = \"x\"; }\n";
+        let mut highlighter = fresh_highlighter("rust", before);
+        let at = before.find("x\"").unwrap() + 1;
+        let (edit, source) = replace(before, at..at, &words);
+        highlighter.edit_tree(Some(edit), &Rope::from_str(&source));
+        let middle = at + words.len() / 2;
+        let highlights = highlighter.match_styles(middle..middle + 200);
+        assert!(
+            !highlights.iter().any(|h| h.name.as_ref() == "string"),
+            "{highlights:?}"
         );
     }
 
