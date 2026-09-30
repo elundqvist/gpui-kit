@@ -9,7 +9,10 @@ use gpui::{
 
 use crate::{
     StyledExt, ThemeStyled as _,
-    input::{EditorState, popovers::render_markdown},
+    input::{
+        EditorState,
+        popovers::{plain_text_as_markdown, render_markdown},
+    },
 };
 
 pub struct HoverPopover {
@@ -38,21 +41,7 @@ impl HoverPopover {
 
 impl Render for HoverPopover {
     fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
-        let contents = match self.hover.contents.clone() {
-            lsp_types::HoverContents::Scalar(scalar) => match scalar {
-                lsp_types::MarkedString::String(s) => s,
-                lsp_types::MarkedString::LanguageString(ls) => ls.value,
-            },
-            lsp_types::HoverContents::Array(arr) => arr
-                .into_iter()
-                .map(|item| match item {
-                    lsp_types::MarkedString::String(s) => s,
-                    lsp_types::MarkedString::LanguageString(ls) => ls.value,
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-            lsp_types::HoverContents::Markup(markup) => markup.value,
-        };
+        let contents = hover_markdown(self.hover.contents.clone());
 
         Popover::new(
             "hover-popover",
@@ -61,6 +50,37 @@ impl Render for HoverPopover {
             move |window, cx| render_markdown("message", contents.clone(), window, cx),
         )
         .into_any_element()
+    }
+}
+
+/// A hover's contents as the Markdown the popover draws. A language string
+/// is code, drawn as a fence so that its lines stay lines, and plain text is
+/// drawn as it is (`plain_text_as_markdown`): Markdown draws a line ending
+/// inside a paragraph as a space.
+pub(super) fn hover_markdown(contents: lsp_types::HoverContents) -> String {
+    let marked = |item: lsp_types::MarkedString| match item {
+        lsp_types::MarkedString::String(s) => s,
+        lsp_types::MarkedString::LanguageString(ls) => {
+            // longer than any run of backticks in the code, which would
+            // otherwise close it
+            let mut run = 0;
+            let longest = ls.value.chars().fold(0, |longest, c| {
+                run = if c == '`' { run + 1 } else { 0 };
+                longest.max(run)
+            });
+            let fence = "`".repeat(longest.max(2) + 1);
+            format!("{fence}{}\n{}\n{fence}", ls.language, ls.value)
+        }
+    };
+    match contents {
+        lsp_types::HoverContents::Scalar(scalar) => marked(scalar),
+        lsp_types::HoverContents::Array(arr) => {
+            arr.into_iter().map(marked).collect::<Vec<_>>().join("\n\n")
+        }
+        lsp_types::HoverContents::Markup(markup) => match markup.kind {
+            lsp_types::MarkupKind::Markdown => markup.value,
+            lsp_types::MarkupKind::PlainText => plain_text_as_markdown(&markup.value),
+        },
     }
 }
 

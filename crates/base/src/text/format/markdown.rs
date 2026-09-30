@@ -154,6 +154,29 @@ fn append_inline_html_blocks(paragraph: &mut Paragraph, blocks: Vec<BlockNode>) 
     Some(text)
 }
 
+/// A text's line endings drawn as CommonMark draws a soft break, one space,
+/// with the spaces and tabs around each ending gone. A paragraph wrapped at
+/// 80 columns, as jdtls hands Javadoc, reads as one paragraph rather than as
+/// ragged short lines; a line break of its own is a [`Node::Break`].
+fn soft_breaks_as_spaces(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(at) = rest.find(['\n', '\r']) {
+        out.push_str(rest[..at].trim_end_matches([' ', '\t']));
+        out.push(' ');
+        let ending = if rest[at..].starts_with("\r\n") { 2 } else { 1 };
+        rest = rest[at + ending..].trim_start_matches([' ', '\t']);
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A code span's line endings as CommonMark has them, each one space, with
+/// the spaces around it kept: they are the span's.
+fn line_endings_as_spaces(value: &str) -> String {
+    value.replace("\r\n", " ").replace(['\n', '\r'], " ")
+}
+
 fn parse_paragraph(paragraph: &mut Paragraph, node: &mdast::Node, cx: &mut NodeContext) -> String {
     let span = node.position().map(|pos| Span {
         start: cx.offset + pos.start.offset,
@@ -172,8 +195,13 @@ fn parse_paragraph(paragraph: &mut Paragraph, node: &mdast::Node, cx: &mut NodeC
             });
         }
         Node::Text(val) => {
-            text = val.value.clone();
-            paragraph.push_str(&val.value)
+            text = soft_breaks_as_spaces(&val.value);
+            paragraph.push_str(&text)
+        }
+        // A hard break: two spaces or a backslash at a line's end.
+        Node::Break(_) => {
+            text.push('\n');
+            paragraph.push(InlineNode::new("\n"));
         }
         Node::Emphasis(val) => {
             text = merge_children_with_mark(
@@ -195,8 +223,11 @@ fn parse_paragraph(paragraph: &mut Paragraph, node: &mdast::Node, cx: &mut NodeC
                 cx,
             );
         }
+        // markdown-rs keeps a line ending inside a code span in its value,
+        // where CommonMark has a space: a span Javadoc wrapped would break
+        // its line.
         Node::InlineCode(val) => {
-            text = val.value.clone();
+            text = line_endings_as_spaces(&val.value);
             paragraph.push(
                 InlineNode::new(&text).marks(vec![(0..text.len(), TextMark::default().code())]),
             );
@@ -227,7 +258,7 @@ fn parse_paragraph(paragraph: &mut Paragraph, node: &mdast::Node, cx: &mut NodeC
             });
         }
         Node::InlineMath(raw) => {
-            text = raw.value.clone();
+            text = line_endings_as_spaces(&raw.value);
             paragraph.push(
                 InlineNode::new(&text).marks(vec![(0..text.len(), TextMark::default().code())]),
             );
@@ -513,6 +544,57 @@ mod tests {
     use gpui::ParentElement;
 
     use crate::text::{MarkdownExtensions, MarkdownNode, MarkdownPlugin};
+
+    /// The text each paragraph of `source` draws.
+    fn paragraph_texts(source: &str) -> Vec<String> {
+        let mut cx = NodeContext::default();
+        let document = parse(source, &mut cx).unwrap();
+        document
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                BlockNode::Paragraph(paragraph) => Some(paragraph.text()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A line ending inside a paragraph is a soft break, which CommonMark
+    /// draws as a space, and a hard break, two spaces or a backslash at a
+    /// line's end, is the only line break a paragraph draws. jdtls wraps
+    /// Javadoc at about 80 columns: this is its documentation of
+    /// `String.charAt`'s second paragraph as it sends it, which drew as
+    /// ragged short lines, with the hard break before **Specified by:**
+    /// dropped and its words run into the sentence before it.
+    #[test]
+    fn a_soft_break_is_a_space_and_a_hard_break_ends_the_line() {
+        let doc = "If the `char` value specified by the index is a\n\
+                   [surrogate](Character.html#unicode), the surrogate\n\
+                   value is returned.  \n\
+                   **Specified by:** charAt(...) in CharSequence";
+        assert_eq!(
+            paragraph_texts(doc),
+            vec![
+                "If the char value specified by the index is a surrogate, the surrogate \
+                 value is returned.\nSpecified by: charAt(...) in CharSequence"
+            ]
+        );
+
+        // a backslash is a hard break too, and CRLF or spaces around a soft
+        // break make one space
+        assert_eq!(
+            paragraph_texts("one\\\ntwo \r\n   three\n*four*\nfive"),
+            vec!["one\ntwo three four five"]
+        );
+        // a blank line is still a paragraph's end
+        assert_eq!(paragraph_texts("one\n\ntwo"), vec!["one", "two"]);
+        // a code span wrapped across lines has a space for the line ending,
+        // as CommonMark has it
+        assert_eq!(
+            paragraph_texts("the `String.valueOf(\nx)` call and `a\r\nb`"),
+            vec!["the String.valueOf( x) call and a b"]
+        );
+    }
 
     #[test]
     fn test_nested_emphasis_merges_text_marks() {

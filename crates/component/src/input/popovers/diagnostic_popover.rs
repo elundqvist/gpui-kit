@@ -1,14 +1,15 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, AppContext as _, Context, Empty, Entity, IntoElement, Render, Styled, WeakEntity, Window,
+    App, AppContext as _, Context, Empty, Entity, IntoElement, Render, SharedString, Styled,
+    WeakEntity, Window,
 };
 
 use crate::{
     highlighter::DiagnosticEntry,
     input::{
         EditorState,
-        popovers::{Popover, render_markdown},
+        popovers::{Popover, plain_text_as_markdown, render_markdown},
     },
 };
 
@@ -37,7 +38,7 @@ impl Render for DiagnosticPopover {
         let Some(state) = self.state.upgrade() else {
             return Empty.into_any_element();
         };
-        let message = self.diagnostic.message.clone();
+        let message: SharedString = plain_text_as_markdown(&self.diagnostic.message).into();
 
         let (border, bg, fg) = (
             crate::highlighter::diagnostic_border(self.diagnostic.severity, cx),
