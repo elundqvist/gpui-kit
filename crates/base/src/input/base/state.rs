@@ -2900,6 +2900,20 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         let new_text = self.normalize_input(new_text);
         let new_text: &str = &new_text;
 
+        // Text typed over a selection comes from the platform with no range
+        // and no composition, and is typing: one step of undo with what is
+        // typed after it, as VS Code and IntelliJ have it, where it had been
+        // a step of its own. A paste, a newline or a delete asks for its own
+        // intent, or is none of this.
+        let requested_intent = requested_intent.or_else(|| {
+            let typed_over_selection = range_utf16.is_none()
+                && self.ime_marked_range.is_none()
+                && !self.selected_range.is_empty()
+                && !new_text.is_empty()
+                && !new_text.contains(['\n', '\r']);
+            typed_over_selection.then_some(EditIntent::Typing)
+        });
+
         let range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
@@ -4382,22 +4396,46 @@ mod tests {
         });
     }
 
+    /// Typing over a selection is one step of undo with what is typed after
+    /// it, as VS Code and IntelliJ have it, and apart from what was typed
+    /// before the selection was made. The character that replaced the
+    /// selection was a step of its own: typing `"a"` over a snippet's
+    /// placeholder or a word double-clicked, the first undo left the one
+    /// quote where the selection had been (elundqvist/kvist#190). The undo
+    /// selects what was replaced again, and a redo puts the typing back.
     #[gpui::test]
-    fn test_undo_manager_selected_replacement_is_atomic(cx: &mut TestAppContext) {
+    fn test_undo_manager_typing_over_a_selection_is_one_step_with_what_follows(
+        cx: &mut TestAppContext,
+    ) {
         let input_view = InputView::build(cx, |state| state);
         let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
         let input = input_view.input;
 
         cx.update(|window, cx| {
             input.update(cx, |state, cx| {
+                state.replace_text_in_range(None, "let total = 0;", window, cx);
+                state.set_selected_range(4..9, cx);
+                for typed in ["\"", "a", "\""] {
+                    state.replace_text_in_range(None, typed, window, cx);
+                }
+                assert_eq!(state.value(), "let \"a\" = 0;");
+
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "let total = 0;");
+                assert_eq!(state.selected_range(), 4..9, "what was replaced, selected");
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "let \"a\" = 0;");
+                state.undo(&Undo, window, cx);
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "");
+
+                // typed over a selection just after other typing: two steps
                 state.replace_text_in_range(None, "abc", window, cx);
                 state.set_selected_range(1..2, cx);
                 state.replace_text_in_range(None, "X", window, cx);
                 state.replace_text_in_range(None, "z", window, cx);
                 assert_eq!(state.value(), "aXzc");
 
-                state.undo(&Undo, window, cx);
-                assert_eq!(state.value(), "aXc");
                 state.undo(&Undo, window, cx);
                 assert_eq!(state.value(), "abc");
                 state.undo(&Undo, window, cx);

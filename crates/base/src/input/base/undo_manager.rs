@@ -173,9 +173,10 @@ impl UndoManager {
 
 fn is_adjacent(intent: EditIntent, previous: &Change, current: &Change) -> bool {
     match intent {
+        // What typing replaced, a selection, goes with the typing after it;
+        // a replacement never joins the typing before it.
         EditIntent::Typing => {
-            previous.old_range.is_empty()
-                && current.old_range.is_empty()
+            current.old_range.is_empty()
                 && !previous.new_text.contains(['\n', '\r'])
                 && !current.new_text.contains(['\n', '\r'])
                 && previous.new_range.end == current.old_range.start
