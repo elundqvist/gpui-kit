@@ -5,10 +5,13 @@ use gpui::{
     DispatchPhase, Element, ElementId, Empty, Entity, EventEmitter, FontId, FontWeight,
     GlobalElementId, Half as _, HighlightStyle, Hsla, InspectorElementId, InteractiveElement as _,
     IntoElement, LayoutId, MouseDownEvent, ParentElement, Pixels, Rems, Render, RenderOnce,
-    ScrollStrategy, SharedString, Style, Styled, StyledText, Subscription, WeakEntity, Window,
-    WindowTextSystem, deferred, div, point, prelude::FluentBuilder, px, relative, rems, size,
+    ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement as _, Style, Styled,
+    StyledText, Subscription, WeakEntity, Window, WindowTextSystem, deferred, div, point,
+    prelude::FluentBuilder, px, relative, rems, size,
 };
-use lsp_types::{CompletionItem, CompletionItemKind, Documentation, MarkupKind};
+use lsp_types::{
+    CompletionItem, CompletionItemKind, CompletionTextEdit, Documentation, MarkupKind,
+};
 
 const MAX_MENU_HEIGHT: Pixels = px(240.);
 const MIN_MENU_WIDTH: Pixels = px(120.);
@@ -26,8 +29,19 @@ const MAX_DOCS_HEIGHT: Pixels = px(320.);
 /// less room than this on either side it goes above or below the list.
 const MIN_DOCS_WIDTH: Pixels = px(240.);
 /// The least room the documentation panel takes past the list, away from
-/// the caret, before it goes to the caret's other side instead.
+/// the caret, before it goes to the caret's other side instead; and the
+/// least of the editor's height it is kept inside, else the window's.
 const MIN_DOCS_HEIGHT: Pixels = px(80.);
+/// The room right of the list that the documentation panel takes before
+/// the left is tried, as IntelliJ and VS Code put it on the right: in a
+/// window where it does not fit whole on either side, the left is mostly a
+/// file tree.
+const PREFERRED_DOCS_WIDTH: Pixels = px(320.);
+/// The least room for the list inside the editor on the side of the
+/// caret's line with more of it: a list taller than both sides is shrunk to
+/// that, and scrolls, rather than run past the editor. With less, it goes
+/// where the window has room.
+const MIN_LIST_HEIGHT: Pixels = px(60.);
 /// How many rows are laid out to find the widest: those [`RowWidths`] ranks
 /// widest, so that a long list costs this many layouts and not one per row.
 const MEASURED_ROWS: usize = 32;
@@ -95,6 +109,22 @@ fn right_column(item: &CompletionItem) -> Option<&str> {
         None => item.detail.as_deref(),
     }
     .filter(|d| !d.is_empty())
+}
+
+/// Whether `a` and `b` are the same row, of a list and of one handed after
+/// it: the same name, signature, type and kind, putting in the same text.
+/// What resolving adds, the documentation and the detail, and what a
+/// provider keeps in `data` to know an item by, may differ.
+fn same_row(a: &CompletionItem, b: &CompletionItem) -> bool {
+    let text = |item: &CompletionItem| match &item.text_edit {
+        Some(CompletionTextEdit::Edit(edit)) => Some(edit.new_text.clone()),
+        Some(CompletionTextEdit::InsertAndReplace(edit)) => Some(edit.new_text.clone()),
+        None => item.insert_text.clone(),
+    };
+    a.label == b.label
+        && a.label_details == b.label_details
+        && a.kind == b.kind
+        && text(a) == text(b)
 }
 
 /// The letter an item's kind is drawn as in the kind column, and which of
@@ -390,6 +420,7 @@ fn kind_badge(kind: Option<CompletionItemKind>, cx: &App) -> impl IntoElement {
     div()
         .flex_none()
         .size(KIND_SIZE)
+        .mr(ROW_GAP)
         .flex()
         .items_center()
         .justify_center()
@@ -419,20 +450,26 @@ impl RenderOnce for CompletionMenuItem {
             .into_iter()
             .map(|range| (range, matched))
             .collect::<Vec<_>>();
+        // The name is whole: it gives way to nothing but the row's own end,
+        // when it alone is wider than the row. A deprecated item's name is
+        // struck through, and nothing else of its row, as IntelliJ and VS
+        // Code do.
         let label = div()
             .flex_none()
+            .whitespace_nowrap()
+            .when(deprecated, |this| this.line_through())
+            .debug_selector(|| "completion-label".to_string())
             .child(StyledText::new(item.label.clone()).with_highlights(highlights));
         let muted = cx.theme().muted_foreground;
 
         h_flex()
             .id(self.ix)
-            .gap(ROW_GAP)
             .p_1()
             .mr(self.gutter)
+            .overflow_hidden()
             .text_size(ROW_TEXT_SIZE)
             .line_height(relative(ROW_LINE_HEIGHT))
             .rounded(cx.theme().radius.half())
-            .when(deprecated, |this| this.line_through())
             .hover(|this| this.bg(cx.theme().accent.opacity(0.8)))
             .when(self.selected, |this| {
                 this.bg(cx.theme().tokens.accent)
@@ -441,10 +478,15 @@ impl RenderOnce for CompletionMenuItem {
             .when(self.show_kinds, |this| {
                 this.child(kind_badge(item.kind, cx))
             })
+            .child(label)
             .map(|this| match &item.label_details {
-                // the signature straight after the name and the type at the
-                // right, as IntelliJ and VS Code lay them out; a row wider
-                // than the menu cuts its signature short, not its type
+                // The signature straight after the name and the type at the
+                // right, as IntelliJ and VS Code lay them out. In a row too
+                // wide for the menu the signature is cut first, and the type
+                // only once the signature is gone and the type alone is
+                // wider than what the name leaves: the type's box is at
+                // most as wide as that and never shrinks, and the signature
+                // takes what is left of it.
                 Some(details) => {
                     let signature = details.detail.as_deref().filter(|s| !s.is_empty());
                     let right = right_column(&item);
@@ -453,26 +495,41 @@ impl RenderOnce for CompletionMenuItem {
                             .flex_grow(1.)
                             .min_w(px(0.))
                             .overflow_hidden()
-                            .child(label)
                             .when_some(signature, |this, signature| {
                                 this.child(
                                     div()
                                         .min_w(px(0.))
                                         .truncate()
                                         .text_color(muted)
+                                        .debug_selector(|| "completion-signature".to_string())
                                         .child(signature.to_string()),
+                                )
+                            })
+                            .when_some(right, |this, right| {
+                                this.child(
+                                    h_flex()
+                                        .flex_grow(1.)
+                                        .flex_shrink_0()
+                                        .max_w_full()
+                                        .pl(ROW_GAP)
+                                        .justify_end()
+                                        .child(
+                                            div()
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .text_color(muted)
+                                                .debug_selector(|| "completion-type".to_string())
+                                                .child(right.to_string()),
+                                        ),
                                 )
                             }),
                     )
-                    .when_some(right, |this, right| {
-                        this.child(div().flex_none().text_color(muted).child(right.to_string()))
-                    })
                 }
-                None => this.child(label).when(item.detail.is_some(), |this| {
+                None => this.when(item.detail.is_some(), |this| {
                     this.child(
                         Label::new(item.detail.as_deref().unwrap_or("").to_string())
+                            .ml(ROW_GAP)
                             .text_color(muted)
-                            .when(deprecated, |this| this.line_through())
                             .italic(),
                     )
                 }),
@@ -541,17 +598,23 @@ pub struct CompletionMenu {
     pub(crate) trigger_start_offset: Option<usize>,
     query: SharedString,
     /// How wide the list is drawn: its widest row, measured on the first
-    /// render after the items change. `None` until then.
-    width: Option<Pixels>,
-    /// The revision of the editor's completion state this menu last showed
-    /// or hid, which a close of the menu's own is for.
-    pub(crate) revision: u64,
-    /// How many lists have been shown, which keys the documentation panel's
-    /// scroll: a new row's documentation is shown from its top.
-    shown: u64,
+    /// render after the items change, and the list's height it was
+    /// measured for, which says whether the rows scroll. `None` until then.
+    width: Option<(Pixels, Pixels)>,
+    /// Bumped as the row highlighted becomes another item: a new list's
+    /// first, or one the keyboard moves to. It keys the documentation
+    /// panel's scroll, so a new row's documentation is shown from its top.
+    highlight: u64,
+    /// The keyboard moved the highlight since the list was shown: a list
+    /// handed again for the same caret keeps it on the same item.
+    moved: bool,
     /// The row the provider was last told is highlighted, and which item
     /// it was (`CompletionProvider::completion_selected`).
     announced: Option<(usize, *const CompletionItem)>,
+    /// Where the documentation panel is scrolled to, and the highlight it
+    /// is for. The panel is built as it is placed, every frame, so its
+    /// scroll is kept here.
+    docs_scroll: (ScrollHandle, u64),
     placed: Rc<Cell<Option<Placed>>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -600,9 +663,10 @@ impl CompletionMenu {
                 trigger_start_offset: None,
                 query: SharedString::default(),
                 width: None,
-                revision: 0,
-                shown: 0,
+                highlight: 0,
+                moved: false,
                 announced: None,
+                docs_scroll: (ScrollHandle::new(), 0),
                 placed: Rc::default(),
                 _subscriptions,
             }
@@ -672,21 +736,40 @@ impl CompletionMenu {
     }
 
     fn on_action_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.list.update(cx, |this, cx| {
-            this.on_action_select_prev(&actions::SelectUp, window, cx)
+        self.move_highlight(window, cx, |list, window, cx| {
+            list.on_action_select_prev(&actions::SelectUp, window, cx)
         });
-        self.announce_selection(window, cx);
     }
 
     fn on_action_down(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.list.update(cx, |this, cx| {
-            this.on_action_select_next(&actions::SelectDown, window, cx)
+        self.move_highlight(window, cx, |list, window, cx| {
+            list.on_action_select_next(&actions::SelectDown, window, cx)
         });
+    }
+
+    fn move_highlight(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        by: impl FnOnce(
+            &mut ListState<ContextMenuDelegate>,
+            &mut Window,
+            &mut Context<ListState<ContextMenuDelegate>>,
+        ),
+    ) {
+        let before = self.list.read(cx).delegate().selected_ix;
+        self.list.update(cx, |list, cx| by(list, window, cx));
+        self.moved = true;
+        if self.list.read(cx).delegate().selected_ix != before {
+            self.highlight += 1;
+        }
         self.announce_selection(window, cx);
     }
 
     /// Tell the provider which row is highlighted, if that is news: once
-    /// nothing is borrowed, and only if the menu is still open on it then.
+    /// nothing is borrowed, and only if the menu is still open on it then,
+    /// so that of the rows the keyboard passes over in one go, only the one
+    /// it comes to is told of.
     fn announce_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (ix, item) = {
             let delegate = self.list.read(cx).delegate();
@@ -703,14 +786,13 @@ impl CompletionMenu {
         let editor = self.editor.clone();
         cx.spawn_in(window, async move |menu, cx| {
             let still = menu.read_with(cx, |menu, cx| {
+                let delegate = menu.list.read(cx).delegate();
                 menu.open
-                    && menu
-                        .list
-                        .read(cx)
-                        .delegate()
+                    && delegate.selected_ix == ix
+                    && delegate
                         .items
                         .get(ix)
-                        .is_some_and(|now| Rc::ptr_eq(now, &item))
+                        .is_some_and(|now| Rc::ptr_eq(now, &item) || same_row(now, &item))
             })?;
             let provider =
                 editor.read_with(cx, |editor, _| editor.lsp().completion_provider.clone())?;
@@ -722,23 +804,26 @@ impl CompletionMenu {
         .detach();
     }
 
-    /// Hide the completion menu and reset the trigger start offset. The
-    /// editor is told once nothing is borrowed, and only if its completion
-    /// state has not moved on: a list presented meanwhile is not this
-    /// close's to close.
+    /// The user closed the menu: Escape, a row taken, a click away, or its
+    /// caret scrolled out of sight. The editor is told once nothing is
+    /// borrowed, whatever list it holds by then: a list presented since the
+    /// last frame is the one the user closed.
     pub(crate) fn hide(&mut self, cx: &mut Context<Self>) {
+        self.close(cx);
+        let editor = self.editor.clone();
+        cx.spawn(async move |_, cx| {
+            let _ = editor.update(cx, |editor, cx| editor.dismiss_completion_overlay(cx));
+        })
+        .detach();
+    }
+
+    /// The editor's completion state closed, and the menu follows it. It
+    /// tells the editor nothing: a close it told it of a moment later closed
+    /// a list presented in that moment, and a host had to present it again.
+    pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
         self.open = false;
         self.trigger_start_offset = None;
         self.announced = None;
-        let (editor, revision) = (self.editor.clone(), self.revision);
-        cx.spawn(async move |_, cx| {
-            let _ = editor.update(cx, |editor, cx| {
-                if editor.completion_menu_state().revision() == revision {
-                    editor.dismiss_completion_overlay(cx);
-                }
-            });
-        })
-        .detach();
         cx.notify();
     }
 
@@ -782,12 +867,25 @@ impl CompletionMenu {
         cx: &mut Context<Self>,
     ) {
         let items = items.into();
+        // A list for the caret where it was, handed after the keyboard moved
+        // the highlight, a late answer or one asked for again with no key
+        // typed since, keeps the highlight on the same item where the new
+        // list has it: an Enter pressed as the list lands takes the row the
+        // user moved to, not the new list's first.
+        let kept = (self.open && self.moved && offset == self.offset)
+            .then(|| self.list.read(cx).delegate().selected_item().cloned())
+            .flatten()
+            .and_then(|was| items.iter().position(|item| same_row(item, &was)));
         let matches = self.label_matches(&items, cx);
         let show_kinds = self.show_kinds(cx);
         self.offset = offset;
         self.open = true;
         self.width = None;
-        self.shown += 1;
+        if kept.is_none() {
+            self.moved = false;
+            self.highlight += 1;
+        }
+        let row = IndexPath::new(kept.unwrap_or(0));
         self.list.update(cx, |this, cx| {
             let longest_ix = items
                 .iter()
@@ -799,10 +897,11 @@ impl CompletionMenu {
             this.delegate_mut().query = self.query.clone();
             this.delegate_mut().show_kinds = show_kinds;
             this.delegate_mut().set_items(items, matches);
-            this.set_selected_index(Some(IndexPath::new(0)), window, cx);
-            // The first row is selected, so it is shown: a list that had
-            // been scrolled would otherwise keep its offset into the new one.
-            this.scroll_to_item(IndexPath::new(0), ScrollStrategy::Top, window, cx);
+            this.set_selected_index(Some(row), window, cx);
+            // The row selected is shown, the first of a new list: a list
+            // that had been scrolled would otherwise keep its offset into
+            // the new one.
+            this.scroll_to_item(row, ScrollStrategy::Top, window, cx);
             this.set_item_to_measure_index(IndexPath::new(longest_ix), window, cx);
         });
         self.announce_selection(window, cx);
@@ -828,6 +927,18 @@ impl CompletionMenu {
             this.delegate_mut().replace_items(items, matches);
             cx.notify();
         });
+        // The row told of is the same row, its item handed back: not news.
+        // Told again, a provider that resolves each row it is told of would
+        // resolve it, hand it back and be told of it without end.
+        if let Some((ix, _)) = self.announced {
+            let delegate = self.list.read(cx).delegate();
+            let same = (delegate.selected_ix == ix)
+                .then(|| delegate.items.get(ix).map(Rc::as_ptr))
+                .flatten();
+            if let Some(item) = same {
+                self.announced = Some((ix, item));
+            }
+        }
         self.announce_selection(window, cx);
         cx.notify();
     }
@@ -845,7 +956,12 @@ impl CompletionMenu {
     /// In a list longer than [`MEASURED_ROWS`], only the rows [`RowWidths`]
     /// ranks widest are laid out. Layout asserts it runs inside a draw, so
     /// this is called from `render`.
-    fn measure_width(&self, window: &mut Window, cx: &mut App) -> (Pixels, Pixels) {
+    fn measure_width(
+        &self,
+        list_max: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (Pixels, Pixels) {
         let (row_count, candidates) = {
             let delegate = self.list.read(cx).delegate();
             let items = &delegate.items;
@@ -880,7 +996,7 @@ impl CompletionMenu {
         }
 
         let mut gutter = px(0.);
-        if row_height * row_count as f32 > MAX_MENU_HEIGHT {
+        if row_height * row_count as f32 > list_max {
             gutter = cx
                 .try_global::<gpui_base::Theme>()
                 .map(|theme| theme.scrollbar.styles().track_width())
@@ -910,11 +1026,26 @@ impl Render for CompletionMenu {
         let Some(editor) = self.editor.upgrade() else {
             return Empty.into_any_element();
         };
+        // How tall the list may be, from where the caret's line was drawn
+        // last; the placement checks it against the line as drawn in this
+        // frame, and draws the menu again when that has moved.
+        let padding = MENU_PADDING.to_pixels(window.rem_size());
+        let window_area = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
+        let list_max = editor
+            .read(cx)
+            .painted_caret()
+            .map_or(MAX_MENU_HEIGHT, |caret| {
+                list_height(
+                    caret.line(),
+                    caret.input_bounds.intersect(&window_area),
+                    padding,
+                )
+            });
         let width = match self.width {
-            Some(width) => width,
-            None => {
-                let (width, gutter) = self.measure_width(window, cx);
-                self.width = Some(width);
+            Some((width, measured_for)) if measured_for == list_max => width,
+            _ => {
+                let (width, gutter) = self.measure_width(list_max, window, cx);
+                self.width = Some((width, list_max));
                 self.list
                     .update(cx, |list, _| list.delegate_mut().gutter = gutter);
                 width
@@ -924,20 +1055,23 @@ impl Render for CompletionMenu {
         let window_width = window.viewport_size().width;
         // The popover is the list and its padding, between its floor and its
         // ceiling, and never wider than the window.
-        let popover_width = (width + MENU_PADDING.to_pixels(window.rem_size()) * 2.)
+        let popover_width = (width + padding * 2.)
             .min(configured_max)
             .max(MIN_MENU_WIDTH)
             .min(window_width);
 
+        if self.docs_scroll.1 != self.highlight {
+            self.docs_scroll = (ScrollHandle::new(), self.highlight);
+        }
         let docs = {
             let delegate = self.list.read(cx).delegate();
             delegate
                 .selected_item()
                 .and_then(|item| docs_of(item))
                 .map(|(header, body)| DocsSpec {
-                    key: (self.shown << 20) ^ delegate.selected_ix as u64,
                     header,
                     body,
+                    scroll: self.docs_scroll.0.clone(),
                 })
         };
 
@@ -951,7 +1085,7 @@ impl Render for CompletionMenu {
                     .w(width)
                     .min_w_full()
                     .max_w_full()
-                    .max_h(MAX_MENU_HEIGHT),
+                    .max_h(list_max),
             )
             .into_any_element();
 
@@ -959,6 +1093,7 @@ impl Render for CompletionMenu {
             editor,
             menu: cx.weak_entity(),
             list,
+            list_max,
             docs,
             docs_width: configured_max,
             docs_element: None,
@@ -968,16 +1103,17 @@ impl Render for CompletionMenu {
     }
 }
 
-/// What the documentation panel is to show, and what keys its scroll.
+/// What the documentation panel is to show, and where it is scrolled to.
 struct DocsSpec {
-    key: u64,
     header: Option<SharedString>,
     body: Option<DocsBody>,
+    scroll: ScrollHandle,
 }
 
 impl DocsSpec {
     /// The panel, `width` wide and at most `max_height` tall: longer
-    /// documentation scrolls in it.
+    /// documentation scrolls in it. The panel is built every frame, as it is
+    /// placed, and scrolls by a handle the menu keeps.
     fn element(
         &self,
         width: Pixels,
@@ -986,10 +1122,19 @@ impl DocsSpec {
         cx: &mut App,
     ) -> AnyElement {
         let body = self.body.as_ref().map(|body| match body {
-            DocsBody::Markdown(text) => {
-                render_markdown("completion-doc", text.clone(), window, cx).into_any_element()
-            }
+            DocsBody::Markdown(text) => render_markdown("completion-doc", text.clone(), window, cx)
+                .selectable(false)
+                .into_any_element(),
             DocsBody::Plain(text) => div().py_1().child(text.clone()).into_any_element(),
+        });
+        let has_body = body.is_some();
+        let header = self.header.clone().map(|header| {
+            div()
+                .py_1()
+                .when(has_body, |this| {
+                    this.border_b_1().border_color(cx.theme().border)
+                })
+                .child(header)
         });
         // prose in the interface's font, as the header's code is in the
         // editor's
@@ -997,25 +1142,31 @@ impl DocsSpec {
             div()
                 .font_family(cx.theme().font_family.clone())
                 .child(body)
-                .into_any_element()
         });
-        let has_body = body.is_some();
-        editor_popover(("completion-docs", self.key), cx)
+        // the popover's own padding, `editor_popover`'s, around what scrolls
+        let padding = MENU_PADDING.to_pixels(window.rem_size());
+        editor_popover("completion-docs", cx)
+            .relative()
             .w(width)
-            .max_h(max_height)
-            .px_2()
-            .when_some(self.header.clone(), |this, header| {
-                this.child(
-                    div()
-                        .py_1()
-                        .when(has_body, |this| {
-                            this.border_b_1().border_color(cx.theme().border)
-                        })
-                        .child(header),
-                )
-            })
-            .children(body)
-            .overflow_y_scrollbar()
+            // A click in the panel, on its text, a link or its scrollbar,
+            // leaves the keyboard with the editor: the text took it, and the
+            // keys typed after went nowhere while the list stayed open.
+            .capture_any_mouse_down(|_, window, _| window.prevent_default())
+            .child(
+                div()
+                    .id("completion-docs-scroll")
+                    .max_h((max_height - padding * 2.).max(px(0.)))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .px_2()
+                    .child(
+                        div()
+                            .debug_selector(|| "completion-docs-content".to_string())
+                            .children(header)
+                            .children(body),
+                    ),
+            )
+            .vertical_scrollbar(&self.scroll)
             .into_any_element()
     }
 }
@@ -1024,14 +1175,18 @@ impl DocsSpec {
 /// after the editor has laid out its text for the frame, so from where the
 /// caret is drawn in it ([`EditorState::painted_caret`]), not a frame
 /// behind. Below the caret's line when the list fits there inside the
-/// editor, else above it when it fits there; failing both, the same inside
-/// the window, else on the side with more room ([`goes_below`]). The
-/// documentation goes beside the list, right or left, else past it, away
-/// from the caret, else on the caret's other side ([`docs_side`]).
+/// editor, else above it when it fits there; a list that fits on neither
+/// side is as tall as the side with more room lets it be ([`list_height`]),
+/// else it goes by the window ([`goes_below`]). The documentation goes
+/// beside the list, right or left, else past it, away from the caret, else
+/// on the caret's other side ([`docs_side`]), inside the editor. A caret
+/// out of the editor's sight closes the menu.
 struct Placement {
     editor: Entity<EditorState>,
     menu: WeakEntity<CompletionMenu>,
     list: AnyElement,
+    /// How tall the list was let be, as the menu rendered it.
+    list_max: Pixels,
     docs: Option<DocsSpec>,
     /// The documentation panel's width, when there is room for it.
     docs_width: Pixels,
@@ -1059,13 +1214,16 @@ enum DocsSide {
 }
 
 /// The documentation panel's side and width, beside a list at `list` in a
-/// window `window_width` wide, the panel at most `full` wide.
+/// window `window_width` wide, the panel at most `full` wide: the right when
+/// [`PREFERRED_DOCS_WIDTH`] of it fits there, else the left when all of it
+/// does, else the wider side when [`MIN_DOCS_WIDTH`] fits, else past the
+/// list.
 fn docs_side(list: Bounds<Pixels>, window_width: Pixels, full: Pixels) -> (DocsSide, Pixels) {
     let full = full.min(window_width - WINDOW_MARGIN * 2.);
     let right = window_width - WINDOW_MARGIN - (list.right() + POPOVER_GAP);
     let left = list.left() - POPOVER_GAP - WINDOW_MARGIN;
-    if right >= full {
-        (DocsSide::Right, full)
+    if right >= full.min(PREFERRED_DOCS_WIDTH) {
+        (DocsSide::Right, right.min(full))
     } else if left >= full {
         (DocsSide::Left, full)
     } else if right.max(left) >= MIN_DOCS_WIDTH {
@@ -1077,6 +1235,31 @@ fn docs_side(list: Bounds<Pixels>, window_width: Pixels, full: Pixels) -> (DocsS
     } else {
         (DocsSide::Beyond, full)
     }
+}
+
+/// How tall the list may be beside the caret's `line` in the editor's
+/// `area`: [`MAX_MENU_HEIGHT`], or, when it fits on neither side of the
+/// line there, what the side with more room holds, less the popover's
+/// `padding`. It then scrolls, rather than run past the editor over what is
+/// under it, a status bar, where a click took its last row. With less than
+/// [`MIN_LIST_HEIGHT`] of room either side it is not shrunk, and goes where
+/// the window has room.
+fn list_height(line: Bounds<Pixels>, area: Bounds<Pixels>, padding: Pixels) -> Pixels {
+    let below = area.bottom() - (line.bottom() + POPOVER_GAP);
+    let above = line.top() - POPOVER_GAP - area.top();
+    let room = below.max(above) - padding * 2.;
+    if room >= MIN_LIST_HEIGHT {
+        room.min(MAX_MENU_HEIGHT)
+    } else {
+        MAX_MENU_HEIGHT
+    }
+}
+
+/// Whether the caret's `line` is in sight in the editor's `area`, any of
+/// it. Across, the caret is kept in sight as it moves, and an editor
+/// narrower than its gutter draws it past its text's bounds.
+fn in_sight(line: Bounds<Pixels>, area: Bounds<Pixels>) -> bool {
+    line.bottom() > area.top() && line.top() < area.bottom()
 }
 
 /// Whether a list `height` tall goes below the caret's `line`: below when
@@ -1133,24 +1316,42 @@ impl Element for Placement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let Some(caret) = self.editor.read(cx).painted_caret() else {
-            self.placed.set(None);
-            return None;
-        };
         let viewport = window.viewport_size();
         let window_area = Bounds::new(point(px(0.), px(0.)), viewport);
         // as much of the editor as is in the window: a list inside it is
         // over nothing of the screen around it, a status bar under it
-        let area = caret.input_bounds.intersect(&window_area);
+        let caret = self
+            .editor
+            .read(cx)
+            .painted_caret()
+            .map(|caret| (caret, caret.input_bounds.intersect(&window_area)))
+            .filter(|(caret, area)| in_sight(caret.line(), *area));
+        let Some((caret, area)) = caret else {
+            // The caret scrolled out of the editor's sight: the list is
+            // shown nowhere, and an Enter would take a row nobody sees. The
+            // menu closes, as for a click away.
+            self.placed.set(None);
+            let menu = self.menu.clone();
+            cx.defer(move |cx| {
+                let _ = menu.update(cx, |menu, cx| menu.hide(cx));
+            });
+            return None;
+        };
         let line = caret.line();
+        let padding = MENU_PADDING.to_pixels(window.rem_size());
+        // the room the list was given, from the line as drawn a frame
+        // before: the menu draws again with the room it has now
+        if list_height(line, area, padding) != self.list_max {
+            let _ = self.menu.update(cx, |_, cx| cx.notify());
+        }
 
         // each popover is as big as its content, its width set
         let available = AvailableSpace::min_size();
         let list_size = self.list.layout_as_root(available, window, cx);
-        // under the caret, moved left until it ends inside the window, but
-        // never past its left edge
+        // under the caret, moved left until it ends inside the window's
+        // margin, but never past its left edge
         let x = (caret.bounds.left() - px(4.))
-            .min(viewport.width - list_size.width)
+            .min(viewport.width - WINDOW_MARGIN - list_size.width)
             .max(px(0.));
         let below = goes_below(line, area, window_area, list_size.height);
         let y = if below {
@@ -1161,9 +1362,19 @@ impl Element for Placement {
         let list = Bounds::new(point(x, y), list_size);
         self.list.prepaint_at(list.origin, window, cx);
 
+        // The documentation is kept inside the editor too, top to bottom,
+        // unless the editor is too short for it.
+        let docs_area = if area.size.height >= MIN_DOCS_HEIGHT {
+            area
+        } else {
+            window_area
+        };
+        let (top, bottom) = (
+            docs_area.top() + WINDOW_MARGIN,
+            docs_area.bottom() - WINDOW_MARGIN,
+        );
         let docs = self.docs.as_ref().map(|spec| {
             let (side, width) = docs_side(list, viewport.width, self.docs_width);
-            let bottom = viewport.height - WINDOW_MARGIN;
             // where the panel starts, whether it grows down from there or
             // up, and the room it has
             let (x, from, down, room) = match side {
@@ -1173,10 +1384,14 @@ impl Element for Placement {
                     } else {
                         list.left() - POPOVER_GAP - width
                     };
+                    // level with the list's top below the caret, with its
+                    // bottom above it, moved up or down as far as it must
+                    // to stay in the editor: beside the list it is over
+                    // neither the caret nor its list
                     if below {
-                        (x, list.top(), true, bottom - list.top())
+                        (x, list.top(), true, bottom - top)
                     } else {
-                        (x, list.bottom(), false, list.bottom() - WINDOW_MARGIN)
+                        (x, list.bottom(), false, bottom - top)
                     }
                 }
                 DocsSide::Beyond => {
@@ -1189,13 +1404,13 @@ impl Element for Placement {
                         let opposite = line.top() - POPOVER_GAP;
                         (
                             (beyond, true, bottom - beyond),
-                            (opposite, false, opposite - WINDOW_MARGIN),
+                            (opposite, false, opposite - top),
                         )
                     } else {
                         let beyond = list.top() - POPOVER_GAP;
                         let opposite = line.bottom() + POPOVER_GAP;
                         (
-                            (beyond, false, beyond - WINDOW_MARGIN),
+                            (beyond, false, beyond - top),
                             (opposite, true, bottom - opposite),
                         )
                     };
@@ -1211,7 +1426,10 @@ impl Element for Placement {
             let mut element =
                 spec.element(width, MAX_DOCS_HEIGHT.min(room.max(px(0.))), window, cx);
             let docs_size = element.layout_as_root(available, window, cx);
-            let y = if down { from } else { from - docs_size.height };
+            let mut y = if down { from } else { from - docs_size.height };
+            if side != DocsSide::Beyond {
+                y = y.min(bottom - docs_size.height).max(top);
+            }
             let bounds = Bounds::new(point(x, y), docs_size);
             element.prepaint_at(bounds.origin, window, cx);
             (element, bounds)
@@ -1277,6 +1495,9 @@ mod tests {
         indent: Pixels,
         /// Room above the editor, to put the cursor near the window's bottom.
         top: Pixels,
+        /// How tall the editor is; what is under it, to the window's
+        /// bottom, stands for a status bar.
+        height: Pixels,
     }
 
     impl Render for MenuProbe {
@@ -1286,7 +1507,7 @@ mod tests {
             div().size_full().pl(self.indent).pt(self.top).child(
                 div()
                     .relative()
-                    .child(Editor::new(&self.state).h(px(200.)))
+                    .child(Editor::new(&self.state).h(self.height))
                     .child(self.menu.clone()),
             )
         }
@@ -1302,6 +1523,7 @@ mod tests {
                 menu,
                 indent: px(0.),
                 top: px(0.),
+                height: px(200.),
             }
         });
         // the menu sits under the cursor, which is known once the editor
@@ -1333,7 +1555,7 @@ mod tests {
         cx.read(|cx| {
             let menu = menu.read(cx);
             let bounds = menu.list.read(cx).scroll_handle().bounds();
-            (menu.width.expect("the menu measured its rows"), bounds)
+            (menu.width.expect("the menu measured its rows").0, bounds)
         })
     }
 
@@ -1480,7 +1702,7 @@ mod tests {
         // popover that must end inside the window
         for (at_edge, away) in [(wide_at_edge, away), (narrow_at_edge, floor)] {
             assert!(
-                at_edge.right() + padding <= window_width,
+                at_edge.right() + padding + WINDOW_MARGIN <= window_width,
                 "{at_edge:?} in a window {window_width:?} wide"
             );
             assert_eq!(at_edge.size.width, away.size.width, "the rows are whole");
@@ -1579,6 +1801,8 @@ mod tests {
     fn a_list_near_the_bottom_opens_above_the_caret(cx: &mut TestAppContext) {
         let (probe, cx) = probe(cx);
         let height = cx.update(|window, _| window.viewport_size().height);
+        // an editor with room for the list under its first line
+        redraw(&probe, cx, |probe| probe.height = px(600.));
         let rows = |n| {
             (0..n)
                 .map(|i| item(&format!("row_{i}"), None))
@@ -1645,6 +1869,16 @@ mod tests {
         let (side, width) = docs_side(list(400.), px(1100.), px(520.));
         assert_eq!(side, DocsSide::Right);
         assert_eq!(width, px(1100.) - WINDOW_MARGIN - px(704.));
+        // more room on the left, and enough on the right: the right, as
+        // IntelliJ and VS Code have it, where the left went over the tree
+        let (side, width) = docs_side(list(486.), px(1221.), px(520.));
+        assert_eq!(side, DocsSide::Right);
+        assert_eq!(width, px(1221.) - WINDOW_MARGIN - px(790.));
+        // too little on the right for the panel to read: all of it left
+        assert_eq!(
+            docs_side(list(900.), px(1500.), px(520.)),
+            (DocsSide::Left, px(520.))
+        );
         assert_eq!(
             docs_side(list(200.), px(700.), px(520.)).0,
             DocsSide::Beyond
@@ -1658,6 +1892,8 @@ mod tests {
     #[gpui::test]
     fn long_documentation_scrolls_in_a_panel_of_its_own_height(cx: &mut TestAppContext) {
         let (probe, cx) = probe(cx);
+        // an editor taller than the panel, which is kept inside it
+        redraw(&probe, cx, |probe| probe.height = px(600.));
         let long = (0..80)
             .map(|i| format!("Paragraph {i} of the documentation."))
             .collect::<Vec<_>>()
@@ -1923,10 +2159,9 @@ mod tests {
             })
         });
         draw(cx);
-        assert_eq!(
-            provider.selected.borrow().last(),
-            Some(&(20, "row_20".to_string()))
-        );
+        // the row it came to, not each it passed on the way
+        let told = [(0, "row_00".to_string()), (20, "row_20".to_string())];
+        assert_eq!(provider.selected.borrow().as_slice(), told);
         let (selected, scroll) = cx.read(|cx| {
             let list = menu.read(cx).list.read(cx);
             (
@@ -1961,6 +2196,9 @@ mod tests {
         assert_eq!(selected, 20, "the row stays highlighted");
         assert_eq!(scroll_after, scroll, "and the list where it was");
         assert_eq!(docs, resolved.documentation);
+        // the row handed back is not news: told again, a provider that
+        // resolves each row it is told of would ask for it without end
+        assert_eq!(provider.selected.borrow().as_slice(), told);
         assert!(
             cx.read(|cx| menu.read(cx).placed())
                 .and_then(|p| p.docs)
@@ -2022,15 +2260,15 @@ mod tests {
         assert!(with > bare + px(40.));
     }
 
-    /// The menu hides itself a moment before the editor hears of it, by a
-    /// task of its own: a list presented in that moment is not that close's
-    /// to close.
+    /// The menu follows its editor's state as it closes, and tells it
+    /// nothing: a close it told the editor of a moment later, by a task of
+    /// its own, closed a list presented in that moment.
     #[gpui::test]
-    fn a_list_presented_as_the_menu_hides_stays_open(cx: &mut TestAppContext) {
+    fn a_list_presented_as_the_menu_follows_a_close_stays_open(cx: &mut TestAppContext) {
         let (probe, cx) = probe(cx);
         let state = probe.read_with(cx, |probe, _| probe.state.clone());
-        let present = |label: &str, cx: &mut VisualTestContext| {
-            let items = vec![item(label, None)];
+        let present = |labels: &[&str], cx: &mut VisualTestContext| {
+            let items = labels.iter().map(|l| item(l, None)).collect();
             cx.update(|window, cx| {
                 state.update(cx, |state, cx| {
                     state.present_completion_items(0, "", items, cx)
@@ -2038,25 +2276,28 @@ mod tests {
                 window.draw(cx).clear(cx);
             });
         };
-        present("first", cx);
+        // a problem's popover keeps the menu drawn with the state closed
+        cx.update(|_, cx| {
+            state.update(cx, |state, cx| {
+                state.present_diagnostic(gpui_base::input::DiagnosticEntry::default(), cx)
+            })
+        });
+        present(&["first"], cx);
         let menu = own_menu(&state, cx);
         assert!(cx.read(|cx| menu.read(cx).open));
 
-        // the menu closes itself, and a list comes before the editor is told
-        cx.update(|_, cx| menu.update(cx, |menu, cx| menu.hide(cx)));
-        present("second", cx);
+        // an empty list closes the state, the menu follows it, and a list
+        // comes before anything the menu did is done
+        present(&[], cx);
+        assert!(!cx.read(|cx| menu.read(cx).open));
+        present(&["second"], cx);
         cx.run_until_parked();
         assert!(
             cx.read(|cx| state.read(cx).completion_menu_state().open),
             "still open"
         );
-        cx.update(|window, cx| window.draw(cx).clear(cx));
+        draw(cx);
         assert!(cx.read(|cx| menu.read(cx).open));
-
-        // with nothing presented meanwhile, the close goes through
-        cx.update(|_, cx| menu.update(cx, |menu, cx| menu.hide(cx)));
-        cx.run_until_parked();
-        assert!(!cx.read(|cx| state.read(cx).completion_menu_state().open));
     }
 
     /// A provider's answer that is ready at once is shown in the update of
@@ -2101,5 +2342,322 @@ mod tests {
         });
         assert!(track > px(0.));
         assert_eq!(long, short + track);
+    }
+
+    fn laid_out(label: &str, signature: &str, description: &str) -> CompletionItem {
+        CompletionItem {
+            label_details: Some(CompletionItemLabelDetails {
+                detail: Some(signature.into()),
+                description: Some(description.into()),
+            }),
+            ..item(label, None)
+        }
+    }
+
+    fn bounds_of(selector: &'static str, cx: &mut VisualTestContext) -> Bounds<Pixels> {
+        cx.debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} was drawn"))
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+    }
+
+    /// A row too wide for the menu keeps its name whole: its signature is
+    /// cut first, and its type once the signature is gone, at the row's
+    /// end. The type used to keep its width while the name shrank to
+    /// nothing, and rust-analyzer's `fn(…)` types drew rows with no name.
+    #[gpui::test]
+    fn a_row_too_wide_keeps_its_name_whole(cx: &mut TestAppContext) {
+        let (probe, cx) = probe(cx);
+        let name = "with_a_very_long_signature";
+        show(&probe, vec![laid_out(name, "", "")], cx);
+        let alone = bounds_of("completion-label", cx).size.width;
+        show(&probe, vec![laid_out("x", "", "bool")], cx);
+        let bool_width = bounds_of("completion-type", cx).size.width;
+
+        // a type wider than the menu: the name whole, the signature gone,
+        // and the type cut at the row's end
+        let long_type = format!(
+            "fn(&self, {}) -> bool",
+            "HashMap<String, Vec<i32>>, ".repeat(12)
+        );
+        let (_, list) = show(&probe, vec![laid_out(name, "(…)", &long_type)], cx);
+        let (label, ty) = (
+            bounds_of("completion-label", cx),
+            bounds_of("completion-type", cx),
+        );
+        assert_eq!(label.size.width, alone, "the name whole");
+        assert!(label.left() >= list.left());
+        assert!(ty.left() >= label.right(), "{label:?} {ty:?}");
+        assert!(ty.right() <= list.right(), "{ty:?} inside {list:?}");
+        assert!(ty.size.width > px(40.), "the type drawn, cut: {ty:?}");
+        let signature = bounds_of("completion-signature", cx);
+        assert!(signature.size.width < px(1.), "cut first: {signature:?}");
+
+        // a signature wider than the menu and a short type: the name and
+        // the type whole, the signature cut between them
+        let long_signature = format!("({})", "index: usize, ".repeat(40));
+        let (_, list) = show(&probe, vec![laid_out(name, &long_signature, "bool")], cx);
+        let (label, signature, ty) = (
+            bounds_of("completion-label", cx),
+            bounds_of("completion-signature", cx),
+            bounds_of("completion-type", cx),
+        );
+        assert_eq!(label.size.width, alone);
+        assert_eq!(ty.size.width, bool_width, "the type whole");
+        assert!(signature.left() >= label.right(), "{signature:?}");
+        assert!(signature.right() <= ty.left(), "{signature:?} {ty:?}");
+        assert!(ty.right() <= list.right());
+    }
+
+    /// Documentation longer than the panel scrolls in it: the wheel over the
+    /// panel moves the text, the panel stays, and the next row's
+    /// documentation is shown from its top. The panel used to clip what did
+    /// not fit, and nothing past it could be reached.
+    #[gpui::test]
+    fn the_documentation_scrolls_under_the_wheel(cx: &mut TestAppContext) {
+        let (probe, cx) = probe(cx);
+        let long = (0..80)
+            .map(|i| format!("Paragraph {i} of the documentation."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        show(
+            &probe,
+            vec![
+                documented("norm", markdown(&long)),
+                documented("north", markdown(&long)),
+            ],
+            cx,
+        );
+        let docs = placed(&probe, cx).docs.expect("a panel");
+        let top = bounds_of("completion-docs-content", cx).top();
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: docs.center(),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-200.))),
+            ..Default::default()
+        });
+        draw(cx);
+        let scrolled = bounds_of("completion-docs-content", cx).top();
+        assert!(scrolled < top - px(100.), "{top:?} to {scrolled:?}");
+        assert_eq!(placed(&probe, cx).docs, Some(docs), "the panel stays");
+
+        let menu = probe.read_with(cx, |probe, _| probe.menu.clone());
+        cx.update(|window, cx| menu.update(cx, |menu, cx| menu.on_action_down(window, cx)));
+        draw(cx);
+        assert_eq!(bounds_of("completion-docs-content", cx).top(), top);
+    }
+
+    /// A click in the documentation panel leaves the keyboard with the
+    /// editor, and the list open. The text in the panel took it, and the
+    /// keys typed after went nowhere while the list stayed.
+    #[gpui::test]
+    fn a_click_in_the_documentation_leaves_the_keyboard_with_the_editor(cx: &mut TestAppContext) {
+        let (probe, cx) = probe(cx);
+        let state = probe.read_with(cx, |probe, _| probe.state.clone());
+        cx.update(|window, cx| state.update(cx, |state, cx| state.focus(window, cx)));
+        show(
+            &probe,
+            vec![documented("norm", markdown("The norm of the vector."))],
+            cx,
+        );
+        let text = bounds_of("completion-docs-content", cx);
+        cx.simulate_click(text.origin + point(px(6.), px(6.)), gpui::Modifiers::none());
+        draw(cx);
+        let focused = cx.update(|window, cx| {
+            gpui::Focusable::focus_handle(state.read(cx), cx).is_focused(window)
+        });
+        assert!(focused, "the editor has the keyboard");
+        assert!(
+            cx.read(|cx| probe.read(cx).menu.read(cx).open),
+            "the list open"
+        );
+    }
+
+    /// The documentation beside a list below the caret stays inside the
+    /// editor: near its bottom the panel moves up, rather than over what is
+    /// under the editor, a status bar, down to the window's edge.
+    #[gpui::test]
+    fn the_documentation_stays_inside_the_editor(cx: &mut TestAppContext) {
+        let (probe, cx) = probe(cx);
+        let height = cx.update(|window, _| window.viewport_size().height);
+        // the editor 200 px tall, its bottom 60 px above the window's
+        redraw(&probe, cx, |probe| probe.top = height - px(260.));
+        let long = (0..80)
+            .map(|i| format!("Paragraph {i}."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        show(&probe, vec![documented("norm", markdown(&long))], cx);
+        let placed = placed(&probe, cx);
+        let docs = placed.docs.expect("a panel");
+        assert!(!placed.above, "the list below the caret");
+        assert!(
+            docs.bottom() <= height - px(60.),
+            "{docs:?} over the status bar"
+        );
+        assert!(
+            docs.top() >= height - px(260.),
+            "{docs:?} inside the editor"
+        );
+        assert!(
+            docs.size.height > px(150.),
+            "as tall as the editor lets it: {docs:?}"
+        );
+    }
+
+    /// With its caret scrolled out of the editor's view the menu closes: the
+    /// list was shown nowhere, and Enter took its highlighted row all the
+    /// same.
+    #[gpui::test]
+    fn the_menu_closes_when_the_caret_scrolls_out_of_view(cx: &mut TestAppContext) {
+        let (probe, cx) = probe(cx);
+        let state = probe.read_with(cx, |probe, _| probe.state.clone());
+        let text = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.set_value(text, window, cx);
+                state.set_selected_range(0..0, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        show(&probe, vec![item("norm", None)], cx);
+        let menu = probe.read_with(cx, |probe, _| probe.menu.clone());
+        assert!(cx.read(|cx| menu.read(cx).open));
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: point(px(600.), px(150.)),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-2000.))),
+            ..Default::default()
+        });
+        draw(cx);
+        draw(cx);
+        assert!(
+            !cx.read(|cx| menu.read(cx).open),
+            "closed with its caret out of view"
+        );
+    }
+
+    /// A close that is the user's, a click on a row or away from the list,
+    /// closes the list even when one was presented since the last frame. The
+    /// menu's check for its own close took it for one, the list stayed in
+    /// the editor, and the next frame showed it again.
+    #[gpui::test]
+    fn a_users_close_closes_a_list_presented_since_the_last_frame(cx: &mut TestAppContext) {
+        let (probe, cx) = probe(cx);
+        let state = probe.read_with(cx, |probe, _| probe.state.clone());
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.present_completion_items(0, "", vec![item("first", None)], cx)
+            });
+            window.draw(cx).clear(cx);
+        });
+        let menu = own_menu(&state, cx);
+        cx.update(|_, cx| {
+            state.update(cx, |state, cx| {
+                state.present_completion_items(0, "", vec![item("second", None)], cx)
+            });
+            menu.update(cx, |menu, cx| menu.hide(cx));
+        });
+        cx.run_until_parked();
+        assert!(!cx.read(|cx| state.read(cx).completion_menu_state().open));
+        draw(cx);
+        let shown = cx.read(|cx| {
+            crate::input::overlay::completion_menu_of(&state, cx)
+                .is_some_and(|menu| menu.read(cx).open)
+        });
+        assert!(!shown, "not shown again");
+    }
+
+    /// In an editor too short for the list on either side of the caret's
+    /// line, the list is as tall as the side with more room lets it be, and
+    /// scrolls. It went past the editor, over a status bar, and a click
+    /// there took one of its rows.
+    #[gpui::test]
+    fn a_list_in_a_short_editor_stays_inside_it(cx: &mut TestAppContext) {
+        let (probe, cx) = probe(cx);
+        let height = cx.update(|window, _| window.viewport_size().height);
+        let (top, bottom) = (height - px(180.), height - px(60.));
+        redraw(&probe, cx, |probe| {
+            probe.top = top;
+            probe.height = bottom - top;
+        });
+        let rows = (0..20).map(|i| item(&format!("row_{i}"), None)).collect();
+        show(&probe, rows, cx);
+        let placed = placed(&probe, cx);
+        assert!(
+            placed.list.top() >= top && placed.list.bottom() <= bottom,
+            "{:?} inside {top:?}..{bottom:?}",
+            placed.list
+        );
+        assert!(!placed.above, "below the caret, where the room is");
+
+        // given the room again, the list is drawn whole again: the frame
+        // the editor grows in finds the list short, and draws it again
+        redraw(&probe, cx, |probe| {
+            probe.top = px(0.);
+            probe.height = px(600.);
+        });
+        draw(cx);
+        let whole = cx
+            .read(|cx| probe.read(cx).menu.read(cx).placed())
+            .expect("placed");
+        assert!(
+            whole.list.size.height > placed.list.size.height + px(80.),
+            "{whole:?}"
+        );
+    }
+
+    /// A list handed again with the caret where it was, a late answer or
+    /// one asked for again with no key typed since, keeps highlighted the
+    /// row the keyboard moved to, where the new list has it: the highlight
+    /// went back to the first row, and an Enter pressed as the list came
+    /// took that one. After a key typed a list starts from its first row.
+    #[gpui::test]
+    fn a_list_handed_again_keeps_the_row_moved_to(cx: &mut TestAppContext) {
+        let (probe, cx) = probe(cx);
+        let state = probe.read_with(cx, |probe, _| probe.state.clone());
+        let present = |labels: &[&str], cx: &mut VisualTestContext| {
+            let items = labels.iter().map(|l| item(l, None)).collect();
+            cx.update(|_, cx| {
+                state.update(cx, |state, cx| {
+                    state.present_completion_items(0, "", items, cx)
+                })
+            });
+            draw(cx);
+        };
+        let highlighted = |cx: &mut VisualTestContext| {
+            let menu = own_menu(&state, cx);
+            cx.read(|cx| {
+                let delegate = menu.read(cx).list.read(cx).delegate();
+                delegate.items[delegate.selected_ix].label.clone()
+            })
+        };
+        present(&["alpha", "beta", "gamma", "delta"], cx);
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                for _ in 0..2 {
+                    state.route_overlay_action(Box::new(input::MoveDown), window, cx);
+                }
+            })
+        });
+        draw(cx);
+        assert_eq!(highlighted(cx), "gamma");
+        present(&["omega", "alpha", "beta", "gamma", "delta"], cx);
+        assert_eq!(highlighted(cx), "gamma", "the row moved to");
+        present(&["omega", "alpha"], cx);
+        assert_eq!(highlighted(cx), "omega", "not in the list: the first");
+
+        present(&["alpha", "beta", "gamma"], cx);
+        cx.update(|window, cx| {
+            state.update(cx, |state, cx| {
+                state.route_overlay_action(Box::new(input::MoveDown), window, cx);
+                state.insert("x", window, cx);
+            })
+        });
+        present(&["alpha", "beta", "gamma"], cx);
+        assert_eq!(highlighted(cx), "alpha", "a key typed since");
     }
 }

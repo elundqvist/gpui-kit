@@ -208,15 +208,15 @@ impl OverlayMode for crate::input::EditorMode {
                 (menu.query.clone(), menu.items.clone())
             };
             lsp.completion.update(cx, |menu, cx| {
-                // what the menu closes by itself is this revision's
-                menu.revision = revision;
                 if items_only {
                     menu.update_items(items, window, cx);
                 } else if open {
                     menu.update_query(start.unwrap_or(cursor), query);
                     menu.show(cursor, items, window, cx);
                 } else {
-                    menu.hide(cx);
+                    // the state closed already: the menu follows, and tells
+                    // it nothing, which would close a list presented since
+                    menu.close(cx);
                 }
             });
         }
@@ -365,11 +365,17 @@ impl<M: OverlayMode> InputOverlayHost<M> {
             if snapshot.code_action.open {
                 floating.push(lsp.code_actions.clone().into_any_element());
             }
-            if let Some(hover) = lsp.hover.as_ref() {
-                floating.push(hover.clone().into_any_element());
-            }
-            if let Some(diagnostic) = lsp.diagnostic.as_ref() {
-                floating.push(diagnostic.clone().into_any_element());
+            // A hover's popover and a problem's wait while the completion
+            // list is open, as VS Code keeps them back while its list shows:
+            // above the caret's line, where the list goes near the editor's
+            // bottom, they were drawn over its last rows.
+            if !snapshot.completion.open {
+                if let Some(hover) = lsp.hover.as_ref() {
+                    floating.push(hover.clone().into_any_element());
+                }
+                if let Some(diagnostic) = lsp.diagnostic.as_ref() {
+                    floating.push(diagnostic.clone().into_any_element());
+                }
             }
         }
         InputOverlays { search, floating }
@@ -552,9 +558,11 @@ mod tests {
             let mut host = InputOverlayHost::new(state.clone(), window, cx);
             let overlays = host.sync(&state, window, cx);
             assert!(overlays.search.is_some());
-            assert_eq!(overlays.floating.len(), 4);
-            assert_eq!(overlays.len(), 5);
-            assert_eq!(render_overlays(&state, window, cx).len(), 5);
+            // the hover's popover and the problem's wait for the completion
+            // list to close: they would lie over its rows
+            assert_eq!(overlays.floating.len(), 2);
+            assert_eq!(overlays.len(), 3);
+            assert_eq!(render_overlays(&state, window, cx).len(), 3);
             assert!(
                 cx.global::<InputOverlayRegistry<crate::input::EditorMode>>()
                     .hosts
@@ -564,6 +572,9 @@ mod tests {
             state.update(cx, |state, cx| {
                 assert!(state.route_overlay_action(Box::new(super::super::Escape), window, cx));
                 assert!(!state.completion_menu_state().open);
+            });
+            assert_eq!(host.sync(&state, window, cx).floating.len(), 3);
+            state.update(cx, |state, cx| {
                 state.dismiss_code_action_overlay(cx);
                 state.close_search(cx);
                 state.clear_hover_state(cx);
