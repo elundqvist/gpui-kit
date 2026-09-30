@@ -51,6 +51,8 @@ pub(super) const RIGHT_MARGIN: Pixels = px(10.);
 pub(super) const LINE_NUMBER_RIGHT_MARGIN: Pixels = px(10.);
 const FOLD_ICON_WIDTH: Pixels = px(14.);
 const FOLD_ICON_HITBOX_WIDTH: Pixels = px(18.);
+/// The room between a folded line's end and the `⋯` drawn after it.
+const FOLD_PLACEHOLDER_GAP: Pixels = px(4.);
 const MAX_HIGHLIGHT_LINE_LENGTH: usize = 10_000;
 const FOLD_CHEVRON_RIGHT_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>"#;
 const FOLD_CHEVRON_DOWN_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>"#;
@@ -1294,6 +1296,100 @@ impl<M: InputModeKind> TextElement<M> {
         icon_layout
     }
 
+    /// The `⋯` after the last character of each folded line in view, as VS
+    /// Code draws one: a folded line looked like any other, its body gone
+    /// with nothing to say so but the chevron in the gutter, which shows on
+    /// hover. A click on it opens the fold. `bounds` is the text's, scrolled.
+    fn layout_fold_placeholders(
+        &self,
+        bounds: &Bounds<Pixels>,
+        last_layout: &LastLayout,
+        current_row: Option<usize>,
+        ghost_lines_height: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<(usize, Bounds<Pixels>, AnyElement)> {
+        let spots: Vec<(usize, Point<Pixels>)> = {
+            let state = self.state.read(cx);
+            if !state.mode.is_folding() || state.display_map.folded_ranges().is_empty() {
+                return Vec::new();
+            }
+            let line_height = last_layout.line_height;
+            let mut offset_y = last_layout.visible_top;
+            let mut spots = Vec::new();
+            for (line, &buffer_line) in last_layout
+                .lines
+                .iter()
+                .zip(last_layout.visible_buffer_lines.iter())
+            {
+                if state.display_map.is_folded_at(buffer_line) {
+                    let len = state.text.slice_line(buffer_line).len();
+                    if let Some(end) = line.position_for_index(len, last_layout, false) {
+                        spots.push((
+                            buffer_line,
+                            bounds.origin
+                                + point(
+                                    last_layout.line_number_width + end.x + FOLD_PLACEHOLDER_GAP,
+                                    offset_y + end.y,
+                                ),
+                        ));
+                    }
+                }
+                offset_y += line.size(line_height).height;
+                if current_row == Some(buffer_line) {
+                    offset_y += ghost_lines_height;
+                }
+            }
+            spots
+        };
+
+        let (muted, line_height) = (
+            self.state.read(cx).editor_style.muted_foreground,
+            last_layout.line_height,
+        );
+        spots
+            .into_iter()
+            .map(|(buffer_line, origin)| {
+                let mut placeholder = gpui::div()
+                    .id(("fold-placeholder", buffer_line))
+                    .h(line_height)
+                    .flex()
+                    .items_center()
+                    .child(
+                        gpui::div()
+                            .px(px(3.))
+                            .rounded(px(3.))
+                            .bg(muted.opacity(0.18))
+                            .text_color(muted)
+                            .line_height(line_height * 0.8)
+                            .child("⋯"),
+                    )
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, {
+                        let state = self.state.clone();
+                        move |_, _: &mut Window, cx: &mut App| {
+                            cx.stop_propagation();
+                            state.update(cx, |state, cx| {
+                                state.display_map.set_folded(buffer_line, false);
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .into_any_element();
+                let size = placeholder.layout_as_root(
+                    size(
+                        gpui::AvailableSpace::MinContent,
+                        gpui::AvailableSpace::Definite(line_height),
+                    ),
+                    window,
+                    cx,
+                );
+                placeholder.prepaint_at(origin, window, cx);
+                (buffer_line, Bounds::new(origin, size), placeholder)
+            })
+            .collect()
+    }
+
     /// Paint fold icons using prepaint hitboxes.
     ///
     /// This handles:
@@ -1617,6 +1713,9 @@ pub(super) struct PrepaintState {
     bounds: Bounds<Pixels>,
     /// Fold icon layout data
     fold_icon_layout: FoldIconLayout,
+    /// The `⋯` after each folded line in view: its first line, its bounds
+    /// and the element.
+    fold_placeholders: Vec<(usize, Bounds<Pixels>, AnyElement)>,
     // Inline completion rendering data
     /// Shaped ghost lines to paint after cursor row (completion lines 2+)
     ghost_lines: Vec<ShapedLine>,
@@ -2129,6 +2228,14 @@ impl<M: InputModeKind> Element for TextElement<M> {
         }));
         let fold_icon_layout =
             self.layout_fold_icons(original_x, &bounds, &last_layout, window, cx);
+        let fold_placeholders = self.layout_fold_placeholders(
+            &bounds,
+            &last_layout,
+            current_row,
+            ghost_lines_height,
+            window,
+            cx,
+        );
 
         PrepaintState {
             bounds,
@@ -2145,6 +2252,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             document_color_paths,
             indent_guides_path,
             fold_icon_layout,
+            fold_placeholders,
             ghost_first_line,
             ghost_lines,
             ghost_lines_height,
@@ -2369,6 +2477,12 @@ impl<M: InputModeKind> Element for TextElement<M> {
             }
         }
 
+        // after the text and before the gutter, which is painted over what
+        // scrolls under it
+        for (_, _, placeholder) in prepaint.fold_placeholders.iter_mut() {
+            placeholder.paint(window, cx);
+        }
+
         // Paint blinking cursor
         if focused && show_cursor {
             if let Some(cursor_bounds) = prepaint.cursor_bounds_with_scroll() {
@@ -2445,6 +2559,11 @@ impl<M: InputModeKind> Element for TextElement<M> {
             state.set_input_bounds(input_bounds, cx);
             state.last_selected_range = Some(selected_range);
             state.scroll_size = prepaint.scroll_size;
+            state.fold_placeholders = prepaint
+                .fold_placeholders
+                .iter()
+                .map(|(line, bounds, _)| (*line, *bounds))
+                .collect();
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
             state.deferred_scroll_offset = None;
 

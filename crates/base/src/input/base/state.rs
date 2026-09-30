@@ -368,6 +368,9 @@ pub struct InputBaseState<M: InputModeKind> {
     /// Where the caret is painted in the frame being drawn: set as the text
     /// is laid out. See [`Self::painted_caret`].
     pub(super) painted_caret: Cell<Option<PaintedCaret>>,
+    /// The `⋯` painted after each folded line in view in the last frame:
+    /// the fold's first line and where it was painted.
+    pub(super) fold_placeholders: Vec<(usize, Bounds<Pixels>)>,
     pub(super) editor_paddings: Edges<Pixels>,
     /// Room in a code editor's gutter the caller paints in itself, between
     /// the line numbers and the fold icons. See [`Self::gutter_extra`].
@@ -724,6 +727,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             scroll_size: gpui::size(px(0.), px(0.)),
             editor_scrollbar_snapshot: Cell::new(None),
             painted_caret: Cell::new(None),
+            fold_placeholders: Vec::new(),
             editor_paddings: Edges::default(),
             gutter_extra: px(0.),
             deferred_scroll_offset: None,
@@ -888,7 +892,15 @@ impl<M: InputModeKind> InputBaseState<M> {
         let mut y_offset = last_layout.visible_top;
         for (vi, line) in last_layout.lines.iter().enumerate() {
             let prev_lines_offset = last_layout.visible_line_byte_offsets[vi];
-            let local_offset = offset.saturating_sub(prev_lines_offset);
+            // before this line and after the one before it: on a line a
+            // fold hides, or above the lines laid out. It has no place, where
+            // it was answered with this line's start, so that what belonged
+            // to every line a fold hid was drawn in one place on the line
+            // that closes the fold
+            if offset < prev_lines_offset {
+                break;
+            }
+            let local_offset = offset - prev_lines_offset;
             if let Some(pos) = line.position_for_index(local_offset, last_layout, false) {
                 let sub_line_index = (pos.y / line_height) as usize;
                 let adjusted_pos = point(pos.x + last_layout.line_number_width, pos.y + y_offset);
@@ -3789,6 +3801,107 @@ mod tests {
         assert!(asked > 0, "the frame short of lines asks for the next");
         cx.run_until_parked();
         cx.update(|_, cx| input.read_with(cx, |state, _| assert_caret_in_view(state, "moved")));
+    }
+
+    /// What lies on a line a fold hides has no place on screen. It was
+    /// answered with the start of the line that closes the fold, so a
+    /// caller drawing beside each line, a problem's note at its end, drew
+    /// every hidden line's there, one over the other (elundqvist/kvist#201).
+    #[gpui::test]
+    fn test_a_line_a_fold_hides_has_no_bounds(cx: &mut TestAppContext) {
+        use crate::input::FoldRange;
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(numbered_lines(0..12), window, cx);
+                state.apply_highlighter_fold_candidates(vec![FoldRange::new(2, 6)], cx);
+                state.display_map.set_folded(2, true);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                let text = &state.text;
+                for line in 3..6 {
+                    for at in [text.line_start_offset(line), text.line_end_offset(line)] {
+                        assert_eq!(state.range_to_bounds(&(at..at)), None, "line {line}");
+                    }
+                }
+                let top = |line: usize| {
+                    let at = text.line_end_offset(line);
+                    state.range_to_bounds(&(at..at)).expect("shown").top()
+                };
+                let row = state.line_height().unwrap();
+                assert_eq!(
+                    top(6) - top(2),
+                    row,
+                    "the line that closes the fold is right below it"
+                );
+                assert_eq!(top(7) - top(6), row);
+            });
+        });
+    }
+
+    /// A folded line ends in a `⋯`, as in VS Code, and a click on it opens
+    /// the fold. A folded line showed nothing of its body being gone but the
+    /// gutter's chevron, which shows on hover (elundqvist/kvist#201).
+    #[gpui::test]
+    fn test_a_folded_line_ends_in_a_placeholder_that_opens_it(cx: &mut TestAppContext) {
+        use crate::input::FoldRange;
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(numbered_lines(0..12), window, cx);
+                state.apply_highlighter_fold_candidates(
+                    vec![FoldRange::new(2, 6), FoldRange::new(7, 10)],
+                    cx,
+                );
+                state.display_map.set_folded(2, true);
+            });
+        });
+        cx.run_until_parked();
+        let placeholder = cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(
+                    state
+                        .fold_placeholders
+                        .iter()
+                        .map(|(line, _)| *line)
+                        .collect::<Vec<_>>(),
+                    vec![2],
+                    "one for the fold that is closed, none for the one that is open"
+                );
+                let (_, placeholder) = state.fold_placeholders[0];
+                let end = state.text.line_end_offset(2);
+                let end = state.range_to_bounds(&(end..end)).unwrap();
+                assert!(placeholder.left() > end.left(), "after the line's text");
+                assert!(placeholder.size.width > px(0.));
+                assert!(
+                    placeholder.top() >= end.top()
+                        && placeholder.bottom() <= end.bottom() + px(0.5)
+                );
+                placeholder
+            })
+        });
+
+        cx.simulate_mouse_down(
+            placeholder.center(),
+            MouseButton::Left,
+            gpui::Modifiers::none(),
+        );
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert!(!state.display_map.is_folded_at(2), "the click opened it");
+                assert!(state.fold_placeholders.is_empty());
+                // and did not move the caret, as a click on the text would
+                assert_eq!(state.cursor(), 0);
+            });
+        });
     }
 
     #[gpui::test]
