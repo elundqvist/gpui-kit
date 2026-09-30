@@ -684,6 +684,17 @@ impl<M: InputModeKind> TextElement<M> {
             .zip(lines.iter())
         {
             let prev_lines_offset = *prev_lines_offset;
+            // before this line and after the one before it is on the lines
+            // a fold hides, which have no place: a range that ends there is
+            // done, and one that lies there alone is not drawn, where it was
+            // drawn at the start of the line that closes the fold
+            if end_ix < prev_lines_offset
+                || (line_corners.is_empty()
+                    && start_ix < prev_lines_offset
+                    && end_ix == prev_lines_offset)
+            {
+                break;
+            }
             let line_size = line.size(line_height);
             let line_wrap_width = line_size.width;
 

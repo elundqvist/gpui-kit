@@ -4007,6 +4007,47 @@ mod tests {
         });
     }
 
+    /// A range on the lines a fold hides, a search match or a document
+    /// colour, is not drawn. It was drawn at the start of the line that
+    /// closes the fold, the place the editor gave what the fold hid
+    /// (elundqvist/kvist#201), as a box of six pixels.
+    #[gpui::test]
+    fn test_a_range_a_fold_hides_is_not_drawn(cx: &mut TestAppContext) {
+        use crate::input::FoldRange;
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(numbered_lines(0..12), window, cx);
+                state.apply_highlighter_fold_candidates(vec![FoldRange::new(2, 6)], cx);
+                state.display_map.set_folded(2, true);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                let text = &state.text;
+                let layout = state.last_layout.as_ref().expect("laid out");
+                let bounds = state.last_bounds.expect("laid out");
+                let drawn = |range: Range<usize>| {
+                    TextElement::<EditorMode>::layout_match_range(range, layout, &bounds).is_some()
+                };
+                let word = |line: usize| text.line_start_offset(line)..text.line_start_offset(line) + 4;
+                for line in 3..6 {
+                    assert!(!drawn(word(line)), "a match on line {line}, which the fold hides");
+                }
+                // to the end of the last line hidden, its newline and all
+                assert!(!drawn(text.line_start_offset(5)..text.line_start_offset(6)));
+                assert!(drawn(word(2)), "on the fold's first line");
+                assert!(drawn(word(6)), "on the line that closes it");
+                assert!(drawn(word(7)));
+                assert!(drawn(text.line_start_offset(4)..text.line_start_offset(6) + 2), "into the line that closes it");
+                assert!(drawn(text.line_start_offset(2)..text.line_start_offset(4) + 2), "from the fold's first line into it");
+            });
+        });
+    }
+
     /// A folded line ends in a `⋯`, as in VS Code, and a click on it opens
     /// the fold. A folded line showed nothing of its body being gone but the
     /// gutter's chevron, which shows on hover (elundqvist/kvist#201).
