@@ -141,6 +141,20 @@ impl Transition {
         self.easing.sample(progress)
     }
 
+    /// The duration of a transition shortened by `factor`, the share of the
+    /// way a reversal has to go back. A transition that is not reversed has
+    /// the duration it was given: scaled in `f32` by one, 100 ms came back
+    /// a few nanoseconds longer, since `f32` does not hold 0.1 s exactly,
+    /// and a transition sampled at its end was still running and still
+    /// asking for frames.
+    pub(crate) fn scaled_duration(&self, factor: f32) -> Duration {
+        if factor >= 1.0 {
+            self.duration
+        } else {
+            self.duration.mul_f64(f64::from(factor.max(0.0)))
+        }
+    }
+
     fn progress(&self, elapsed: Duration, duration: Duration) -> (f32, MotionStatus) {
         let Some(active_elapsed) = self.delay.active_elapsed(elapsed) else {
             return (0.0, MotionStatus::Delayed);
@@ -314,7 +328,7 @@ where
         } else {
             1.0
         };
-        let duration = policy.duration.mul_f32(reversing_factor);
+        let duration = policy.scaled_duration(reversing_factor);
         state.update(cx, |state, _| {
             state.from = sampled.clone();
             state.target = target.clone();
@@ -699,6 +713,27 @@ mod css_timing_tests {
         assert!(
             Easing::linear_stops([LinearStop::at(0.0, 0.8), LinearStop::at(1.0, 0.2)]).is_err()
         );
+    }
+
+    /// A transition that is not reversed runs for the duration it was
+    /// given and is finished at its end, whatever that duration is in
+    /// floating point; a reversal shortens it by its share.
+    #[test]
+    fn a_transition_not_reversed_ends_at_its_own_duration() {
+        use super::{MotionStatus, Transition};
+        for millis in [100, 150, 300, 1000] {
+            let duration = Duration::from_millis(millis);
+            let transition = Transition::new(duration);
+            let kept = transition.scaled_duration(1.0);
+            assert_eq!(kept, duration);
+            assert_eq!(
+                transition.progress(duration, kept).1,
+                MotionStatus::Finished
+            );
+        }
+        let transition = Transition::new(Duration::from_millis(100));
+        assert_eq!(transition.scaled_duration(0.5), Duration::from_millis(50));
+        assert_eq!(transition.scaled_duration(-1.0), Duration::ZERO);
     }
 
     #[test]
