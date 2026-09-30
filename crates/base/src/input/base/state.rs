@@ -362,6 +362,10 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(crate) scroll_handle: ScrollHandle,
     /// The deferred scroll offset to apply on next layout.
     pub(crate) deferred_scroll_offset: Option<Point<Pixels>>,
+    /// The deferred offset's x is the layout's to choose, by its follow of
+    /// the caret: the text has changed since the last layout, which the
+    /// column would be read from. See [`Self::scroll_to_edited`].
+    pub(crate) deferred_scroll_follows_caret: bool,
     /// The size of the scrollable content.
     pub(crate) scroll_size: gpui::Size<Pixels>,
     pub(super) editor_scrollbar_snapshot: Cell<Option<EditorScrollbarSnapshot>>,
@@ -731,6 +735,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             editor_paddings: Edges::default(),
             gutter_extra: px(0.),
             deferred_scroll_offset: None,
+            deferred_scroll_follows_caret: false,
             preferred_column: None,
             placeholder: SharedString::default(),
             mask_pattern: MaskPattern::default(),
@@ -1112,6 +1117,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.scroll_handle.set_offset(point(px(0.), px(0.)));
         if self.is_single_line() {
             self.deferred_scroll_offset = Some(point(px(0.), px(0.)));
+            self.deferred_scroll_follows_caret = false;
         }
     }
 
@@ -2041,10 +2047,8 @@ impl<M: InputModeKind> InputBaseState<M> {
             TextAlign::Right => px(0.),
             TextAlign::Center => CURSOR_WIDTH,
         };
-        if let Some(line) = last_layout
-            .lines
-            .get(row.saturating_sub(last_layout.visible_range.start))
-        {
+        // by the lines laid out, which skip what a fold hides
+        if let Some(line) = last_layout.line(row) {
             // Check to scroll horizontally and soft wrap lines
             if let Some(pos) = line.position_for_index(point.column, last_layout, false) {
                 let bounds_width = bounds.size.width - last_layout.line_number_width;
@@ -2099,7 +2103,20 @@ impl<M: InputModeKind> InputBaseState<M> {
         scroll_offset.x = scroll_offset.x.min(px(0.));
         scroll_offset.y = scroll_offset.y.clamp(safe_y_min, px(0.));
         self.deferred_scroll_offset = Some(scroll_offset);
+        self.deferred_scroll_follows_caret = false;
         cx.notify();
+    }
+
+    /// Scroll to `offset` after an edit, before the edited text is laid
+    /// out: down to its row, which the text as it is gives, and across as
+    /// far as the layout's follow of the caret goes, which reads the column
+    /// from the lines it lays out. [`Self::scroll_to`] reads it from the
+    /// last layout's, where the caret's line may be shorter than its
+    /// column now: an undo that gave a line back its tail left the caret
+    /// off to the right of the view (elundqvist/kvist#201).
+    fn scroll_to_edited(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.scroll_to(offset, None, cx);
+        self.deferred_scroll_follows_caret = self.deferred_scroll_offset.is_some();
     }
 
     /// How far the text as it is now scrolls, as the next layout will
@@ -2151,7 +2168,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             let new_text = clipboard.text().unwrap_or_default();
             self.undo_manager.pending_intent = Some(EditIntent::Atomic);
             self.replace_text_in_range_silent(None, &new_text, window, cx);
-            self.scroll_to(self.cursor(), None, cx);
+            self.scroll_to_edited(self.cursor(), cx);
         }
     }
 
@@ -2219,7 +2236,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             // caret's follow in the layout, the lines were those at the
             // old place and painted at the new, and an undone paste of
             // thousands of lines left the editor blank until the next frame
-            self.scroll_to(self.cursor(), None, cx);
+            self.scroll_to_edited(self.cursor(), cx);
         }
         self.undo_manager.set_ignoring(false);
     }
@@ -2233,7 +2250,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                 self.replace_text_in_range_silent(Some(range_utf16), &change.new_text, window, cx);
             }
             self.selected_range = selection;
-            self.scroll_to(self.cursor(), None, cx);
+            self.scroll_to_edited(self.cursor(), cx);
         }
         self.undo_manager.set_ignoring(false);
     }
@@ -2268,6 +2285,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// The offset will be clamped to the valid range, and applied after the next layout.
     pub fn set_scroll_offset(&mut self, offset: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
         self.deferred_scroll_offset = Some(offset);
+        self.deferred_scroll_follows_caret = false;
         cx.notify();
     }
 
@@ -3760,6 +3778,151 @@ mod tests {
                 assert_eq!(state.text.offset_to_point(state.cursor()).row, 4001);
                 assert_caret_in_view(state, "redone");
             });
+        });
+    }
+
+    /// The caret was painted inside the view across as well as down.
+    fn assert_caret_in_view_across<M: InputModeKind>(state: &InputBaseState<M>, what: &str) {
+        let caret = state.cursor();
+        let at = state
+            .range_to_bounds(&(caret..caret))
+            .expect("the caret has a place");
+        let view = state.input_bounds;
+        assert!(
+            at.left() >= view.left() && at.left() <= view.right(),
+            "{what}: the caret at {at:?} is outside the view {view:?}"
+        );
+    }
+
+    /// An undo that gives the caret's line back its tail, wider than the
+    /// view, a redo of typing past the view's width and a paste of a line
+    /// wider than it scroll across to the caret. They scroll to the caret
+    /// before the lines are laid out, and the column was read from the
+    /// last layout, where the line was shorter than the caret's column: the
+    /// scroll across was left where it was, and replaced the layout's own
+    /// follow of the caret, which left it off to the right
+    /// (elundqvist/kvist#201).
+    #[gpui::test]
+    fn test_an_undo_a_redo_and_a_paste_scroll_across_to_the_caret(cx: &mut TestAppContext) {
+        let view = InputView::build_editor(cx, |state| state.soft_wrap(false));
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let long = "x".repeat(1000);
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(format!("{long}\nshort\n"), window, cx)
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_selected_range(60..1000, cx);
+                state.delete(&Delete, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.cursor(), 60);
+                assert_caret_in_view_across(state, "deleted");
+            })
+        });
+
+        cx.update(|window, cx| input.update(cx, |state, cx| state.undo(&Undo, window, cx)));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.cursor(), 1000);
+                assert_caret_in_view_across(state, "undone");
+            })
+        });
+
+        // typing past the view's width, taken back to the line's start, and
+        // done again
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                let short = state.text.line_start_offset(1);
+                state.move_to(short, None, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| input.update(cx, |state, cx| state.insert(long.clone(), window, cx)));
+        cx.run_until_parked();
+        cx.update(|window, cx| input.update(cx, |state, cx| state.undo(&Undo, window, cx)));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.cursor(), state.text.line_start_offset(1));
+                assert_caret_in_view_across(state, "typing undone");
+            })
+        });
+        cx.update(|window, cx| input.update(cx, |state, cx| state.redo(&Redo, window, cx)));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.cursor(), state.text.line_start_offset(1) + 1000);
+                assert_caret_in_view_across(state, "redone");
+            })
+        });
+
+        // and a paste of a line wider than the view, into a short one
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("short\nshort\n", window, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(long.clone()));
+            input.update(cx, |state, cx| {
+                let short = state.text.line_start_offset(1);
+                state.move_to(short, None, cx);
+                state.paste(&Paste, window, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.cursor(), state.text.line_start_offset(1) + 1000);
+                assert_caret_in_view_across(state, "pasted");
+            })
+        });
+    }
+
+    /// A caret moved to a column past the view's width, on a line below a
+    /// fold, is scrolled across to. The column was read from the line laid
+    /// out at the caret's row less the first row laid out, which below a
+    /// fold is another line, or none: the scroll across was left where it
+    /// was, and replaced the layout's own follow of the caret.
+    #[gpui::test]
+    fn test_a_caret_below_a_fold_is_scrolled_across_to(cx: &mut TestAppContext) {
+        use crate::input::FoldRange;
+        let view = InputView::build_editor(cx, |state| state.soft_wrap(false));
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                let mut text = numbered_lines(0..20);
+                text.push_str(&"x".repeat(1000));
+                text.push('\n');
+                state.set_value(text, window, cx);
+                state.apply_highlighter_fold_candidates(vec![FoldRange::new(2, 12)], cx);
+                state.display_map.set_folded(2, true);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                let far = state.text.line_start_offset(20) + 900;
+                state.move_to(far, None, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.cursor(), state.text.line_start_offset(20) + 900);
+                assert_caret_in_view_across(state, "moved");
+            })
         });
     }
 

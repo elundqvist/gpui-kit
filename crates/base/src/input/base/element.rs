@@ -608,6 +608,7 @@ impl<M: InputModeKind> TextElement<M> {
             // while the text uses the deferred offset, flashing it mid-field.
             let cursor_scroll_x = state
                 .deferred_scroll_offset
+                .filter(|_| !state.deferred_scroll_follows_caret)
                 .map(|offset| offset.x)
                 .unwrap_or(scroll_offset.x);
 
@@ -628,8 +629,13 @@ impl<M: InputModeKind> TextElement<M> {
             ))
         };
 
+        // across, a target set after an edit is the follow's above, which
+        // reads the caret's column from the lines laid out for it
         if let Some(deferred_scroll_offset) = state.deferred_scroll_offset {
-            scroll_offset = deferred_scroll_offset;
+            scroll_offset.y = deferred_scroll_offset.y;
+            if !state.deferred_scroll_follows_caret {
+                scroll_offset.x = deferred_scroll_offset.x;
+            }
         }
         scroll_offset.y = clamp_auto_grow_vertical_scroll_offset(
             &state.mode,
@@ -2566,6 +2572,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 .collect();
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
             state.deferred_scroll_offset = None;
+            state.deferred_scroll_follows_caret = false;
 
             cx.notify();
         });
