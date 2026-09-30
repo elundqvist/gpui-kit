@@ -2130,8 +2130,9 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     /// How far the text as it is now scrolls, as the next layout will
-    /// measure it: its rows and the room kept below the last one.
-    /// `scroll_size` is the last layout's, which has not seen an edit since.
+    /// measure it: its rows on screen, without those a fold hides, and the
+    /// room kept below the last one. `scroll_size` is the last layout's,
+    /// which has not seen an edit since.
     fn scroll_height_now(&self, line_height: Pixels) -> Pixels {
         let below = super::element::empty_bottom_height(
             self.is_code_editor(),
@@ -2139,7 +2140,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             self.input_bounds.size.height,
             line_height,
         );
-        (line_height * self.display_map.wrap_row_count() as f32 + below)
+        (line_height * self.display_map.display_row_count() as f32 + below)
             .max(self.input_bounds.size.height)
     }
 
@@ -4118,6 +4119,60 @@ mod tests {
                 assert_eq!(state.cursor(), 0);
             });
         });
+    }
+
+    /// The text scrolls as far as its rows on screen go, and no further
+    /// for the rows a fold hides: its last line stops where it stops with
+    /// nothing folded. The height to scroll was counted with the hidden
+    /// rows, and a view scrolled to the end, or to the end of a paste or an
+    /// undo there, was that many rows past the last line, and blank
+    /// (elundqvist/kvist#201).
+    #[gpui::test]
+    fn test_a_fold_scrolls_no_further_than_its_rows(cx: &mut TestAppContext) {
+        use crate::input::FoldRange;
+        let last_line_at_the_end = |cx: &mut TestAppContext, fold: bool| {
+            let view = InputView::<EditorMode>::new(cx);
+            let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+            let input = view.input;
+            cx.update(|window, cx| {
+                input.update(cx, |state, cx| {
+                    state.set_value(numbered_lines(0..200), window, cx);
+                    state.apply_highlighter_fold_candidates(vec![FoldRange::new(2, 102)], cx);
+                    state.display_map.set_folded(2, fold);
+                });
+            });
+            cx.run_until_parked();
+            cx.update(|_, cx| {
+                input.update(cx, |state, cx| {
+                    state.set_scroll_offset(point(px(0.), px(-1_000_000.)), cx)
+                })
+            });
+            cx.run_until_parked();
+            cx.update(|_, cx| {
+                input.update(cx, |state, cx| {
+                    let end = state.text.len();
+                    state.move_to(end, None, cx);
+                })
+            });
+            cx.run_until_parked();
+            // and a paste at the end, which scrolls to it before it is laid out
+            cx.update(|window, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(numbered_lines(200..210)));
+                input.update(cx, |state, cx| state.paste(&Paste, window, cx));
+            });
+            cx.run_until_parked();
+            cx.update(|_, cx| {
+                input.read_with(cx, |state, _| {
+                    let end = state.text.len();
+                    let at = state.range_to_bounds(&(end..end)).expect("the last line is laid out");
+                    (at.top() - state.input_bounds.top(), state.scroll_handle.offset().y)
+                })
+            })
+        };
+        let (open, _) = last_line_at_the_end(cx, false);
+        let (folded, offset) = last_line_at_the_end(cx, true);
+        assert!(offset < px(0.), "scrolled");
+        assert_eq!(folded, open, "the last line with a fold of a hundred rows closed");
     }
 
     /// A `⋯` scrolled under the gutter takes no click there. It was placed

@@ -2077,7 +2077,9 @@ impl<M: InputModeKind> Element for TextElement<M> {
         let ghost_line_count = ghost_lines.len();
         let ghost_lines_height = ghost_line_count as f32 * line_height;
 
-        let total_wrapped_lines = state.display_map.wrap_row_count();
+        // the rows on screen: a fold's hidden rows scrolled the view past
+        // the last line by as many
+        let total_wrapped_lines = state.display_map.display_row_count();
         let empty_bottom_height = empty_bottom_height(
             state.is_code_editor(),
             state.scroll_beyond_last_line,
