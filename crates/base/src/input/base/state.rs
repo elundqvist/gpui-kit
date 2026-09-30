@@ -991,6 +991,32 @@ impl<M: InputModeKind> InputBaseState<M> {
         });
     }
 
+    /// Replace the text in `range`, UTF-8 byte offsets, with `text`, as one
+    /// step of undo, and move the cursor to the end of what was put in.
+    ///
+    /// Unlike selecting `range` and calling [`Self::replace`], the selection
+    /// is left alone until the edit is made, so undoing it puts back the
+    /// selection as it was before the call rather than selecting the range:
+    /// an edit that reaches far from the cursor, such as a completion that
+    /// adds an import at the top, is taken back with the cursor where it was.
+    pub fn replace_range(
+        &mut self,
+        range: Range<usize>,
+        text: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text: SharedString = text.into();
+        self.with_edits_allowed(|this| {
+            this.undo_manager.pending_intent = Some(EditIntent::Atomic);
+            let range = this.text.clip_offset(range.start, Bias::Left)
+                ..this.text.clip_offset(range.end, Bias::Right);
+            let range_utf16 = this.range_to_utf16(&range);
+            this.replace_text_in_range_silent(Some(range_utf16), &text, window, cx);
+            this.selected_range = (this.selected_range.end..this.selected_range.end).into();
+        });
+    }
+
     fn replace_text(
         &mut self,
         text: impl Into<SharedString>,
@@ -3843,6 +3869,35 @@ mod tests {
                 assert_eq!(state.value(), "aP");
                 state.undo(&Undo, window, cx);
                 assert_eq!(state.value(), "a");
+            });
+        });
+    }
+
+    /// `replace_range` is one step of undo apart from the typing before it,
+    /// and undoing it puts the caret back where it was rather than selecting
+    /// the range it replaced.
+    #[gpui::test]
+    fn test_replace_range_is_one_step_that_puts_the_caret_back(cx: &mut TestAppContext) {
+        let input_view = InputView::build_textarea(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.replace_text_in_range(None, "x = Has", window, cx);
+                assert_eq!(state.selected_range(), 7..7);
+                state.replace_range(0..7, "use m;\nx = HashMap", window, cx);
+                assert_eq!(state.value(), "use m;\nx = HashMap");
+                assert_eq!(state.selected_range(), 18..18, "after what was put in");
+
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "x = Has");
+                assert_eq!(state.selected_range(), 7..7, "the caret, not the range");
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "use m;\nx = HashMap");
+                state.undo(&Undo, window, cx);
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "");
             });
         });
     }
