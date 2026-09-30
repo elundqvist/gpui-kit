@@ -2081,6 +2081,16 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 cursor_scroll_offset,
                 state,
             )));
+        // where the caret is painted this frame, for what is placed by it
+        // after this, before the paint that keeps the layout in the state
+        state.painted_caret.set(cursor_bounds.map(|mut caret| {
+            caret.origin.y += cursor_scroll_offset.y;
+            super::state::PaintedCaret {
+                bounds: caret,
+                line_height,
+                input_bounds,
+            }
+        }));
         let fold_icon_layout =
             self.layout_fold_icons(original_x, &bounds, &last_layout, window, cx);
 

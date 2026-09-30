@@ -11,6 +11,7 @@ pub struct CompletionMenuState {
     pub query: String,
     pub items: Vec<CompletionItem>,
     revision: u64,
+    item_revision: u64,
 }
 
 impl CompletionMenuState {
@@ -20,6 +21,13 @@ impl CompletionMenuState {
     /// to rebuild, so it never has to compare the item list itself.
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Bumped when an item of the list is replaced in place
+    /// ([`InputBaseState::replace_completion_item`]): the list is the same,
+    /// and a renderer keeps its highlighted row and its scroll.
+    pub fn item_revision(&self) -> u64 {
+        self.item_revision
     }
 
     pub(super) fn bump(&mut self) {
@@ -81,6 +89,31 @@ impl InputBaseState<EditorMode> {
             !self.extras.context_menu_content.completion.items.is_empty();
         self.extras.context_menu_content.completion.bump();
         cx.notify();
+    }
+
+    /// Replace the item at `index` of the list shown, if it is still `old`:
+    /// an item resolved for its documentation or detail
+    /// ([`CompletionProvider::completion_selected`]). The menu keeps its
+    /// highlighted row and its scroll, as it would not for a new list.
+    /// Whether it was replaced; a list replaced since, or closed, is left
+    /// as it is.
+    pub fn replace_completion_item(
+        &mut self,
+        index: usize,
+        old: &CompletionItem,
+        new: CompletionItem,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let menu = &mut self.extras.context_menu_content.completion;
+        match menu.items.get_mut(index) {
+            Some(item) if menu.open && item == old => {
+                *item = new;
+                menu.item_revision = menu.item_revision.wrapping_add(1);
+                cx.notify();
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn present_code_actions(&mut self, items: Vec<CodeActionItem>, cx: &mut Context<Self>) {

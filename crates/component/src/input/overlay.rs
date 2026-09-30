@@ -37,10 +37,13 @@ struct InputOverlayHost<M: OverlayMode> {
 /// with its own documentation. The engine bumps a revision when it swaps the
 /// content, and the popovers are keyed by cheap identity instead — a revision,
 /// an `Rc` pointer, or a range.
-#[derive(PartialEq, Eq, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 struct OverlaySignature {
     open: bool,
     revision: u64,
+    /// Bumped when an item is replaced in the list shown: the list is the
+    /// same, and the menu keeps its highlighted row and its scroll.
+    item_revision: u64,
 }
 
 /// The popovers driven by language features: completion, code actions, hover
@@ -150,11 +153,13 @@ impl OverlayMode for crate::input::EditorMode {
             completion: OverlaySignature {
                 open: completion.open,
                 revision: completion.revision(),
+                item_revision: completion.item_revision(),
             },
             completion_start: completion.trigger_start_offset,
             code_action: OverlaySignature {
                 open: code_actions.open,
                 revision: code_actions.revision(),
+                item_revision: 0,
             },
             hover: state
                 .hover_popover()
@@ -191,11 +196,11 @@ impl OverlayMode for crate::input::EditorMode {
         let cursor = snapshot.cursor;
 
         if snapshot.completion != lsp.completion_signature {
-            lsp.completion_signature = OverlaySignature {
-                open: snapshot.completion.open,
-                revision: snapshot.completion.revision,
-            };
+            let was = std::mem::replace(&mut lsp.completion_signature, snapshot.completion);
             let open = snapshot.completion.open;
+            let revision = snapshot.completion.revision;
+            // the list open as it was, with an item replaced in it
+            let items_only = open && was.open && was.revision == revision;
             let start = snapshot.completion_start;
             // Read the items only now, on a frame where they changed.
             let (query, items) = {
@@ -203,7 +208,11 @@ impl OverlayMode for crate::input::EditorMode {
                 (menu.query.clone(), menu.items.clone())
             };
             lsp.completion.update(cx, |menu, cx| {
-                if open {
+                // what the menu closes by itself is this revision's
+                menu.revision = revision;
+                if items_only {
+                    menu.update_items(items, window, cx);
+                } else if open {
                     menu.update_query(start.unwrap_or(cursor), query);
                     menu.show(cursor, items, window, cx);
                 } else {
@@ -213,10 +222,7 @@ impl OverlayMode for crate::input::EditorMode {
         }
 
         if snapshot.code_action != lsp.code_action_signature {
-            lsp.code_action_signature = OverlaySignature {
-                open: snapshot.code_action.open,
-                revision: snapshot.code_action.revision,
-            };
+            lsp.code_action_signature = snapshot.code_action;
             let open = snapshot.code_action.open;
             let items = state.read(cx).code_action_menu_state().items.clone();
             lsp.code_actions.update(cx, |menu, cx| {
@@ -256,6 +262,17 @@ impl OverlayMode for crate::input::EditorMode {
                 .map(|entry| DiagnosticPopover::new(entry, state.clone(), cx));
         }
     }
+}
+
+/// The completion menu an editor draws, while it has one open.
+#[cfg(test)]
+pub(crate) fn completion_menu_of(
+    state: &Entity<crate::input::EditorState>,
+    cx: &App,
+) -> Option<Entity<CompletionMenu>> {
+    let registry = cx.try_global::<InputOverlayRegistry<crate::input::EditorMode>>()?;
+    let (_, host) = registry.hosts.get(&state.entity_id())?;
+    host.lsp.as_ref().map(|lsp| lsp.completion.clone())
 }
 
 #[derive(Default)]

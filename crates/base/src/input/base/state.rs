@@ -365,6 +365,9 @@ pub struct InputBaseState<M: InputModeKind> {
     /// The size of the scrollable content.
     pub(crate) scroll_size: gpui::Size<Pixels>,
     pub(super) editor_scrollbar_snapshot: Cell<Option<EditorScrollbarSnapshot>>,
+    /// Where the caret is painted in the frame being drawn: set as the text
+    /// is laid out. See [`Self::painted_caret`].
+    pub(super) painted_caret: Cell<Option<PaintedCaret>>,
     pub(super) editor_paddings: Edges<Pixels>,
     /// Room in a code editor's gutter the caller paints in itself, between
     /// the line numbers and the fold icons. See [`Self::gutter_extra`].
@@ -502,7 +505,45 @@ impl InputPresentation {
 
 impl<M: InputModeKind> EventEmitter<InputEvent> for InputBaseState<M> {}
 
+/// Where an input paints its caret in the frame being drawn, in window
+/// coordinates. See [`InputBaseState::painted_caret`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaintedCaret {
+    /// The caret as it is painted: as tall as most of its line, and
+    /// centred in it.
+    pub bounds: Bounds<Pixels>,
+    pub line_height: Pixels,
+    /// The input's own bounds, its gutter with its text, as laid out in
+    /// the same frame.
+    pub input_bounds: Bounds<Pixels>,
+}
+
+impl PaintedCaret {
+    /// The line the caret is on, from its top to its bottom.
+    pub fn line(&self) -> Bounds<Pixels> {
+        let top = self.bounds.origin.y - (self.line_height - self.bounds.size.height) / 2.;
+        Bounds::new(
+            gpui::point(self.bounds.origin.x, top),
+            gpui::size(self.bounds.size.width, self.line_height),
+        )
+    }
+}
+
 impl<M: InputModeKind> InputBaseState<M> {
+    /// Where the caret is painted in the frame being drawn, in window
+    /// coordinates, and the input's own bounds in that frame.
+    ///
+    /// The input lays its text out before anything painted over it is
+    /// placed, so a deferred element (a completion menu, a popover) that
+    /// reads this in its prepaint finds the caret where it is drawn now.
+    /// [`Self::cursor_layout`] is kept from the last paint, which after an
+    /// edit is the frame before, and something placed by it is a frame
+    /// behind the caret. `None` before the first layout, and while the
+    /// caret is not laid out.
+    pub fn painted_caret(&self) -> Option<PaintedCaret> {
+        self.painted_caret.get()
+    }
+
     #[doc(hidden)]
     pub fn cursor_layout(&self) -> Option<(Bounds<Pixels>, Pixels)> {
         let layout = self.last_layout.as_ref()?;
@@ -682,6 +723,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             scroll_handle: ScrollHandle::new(),
             scroll_size: gpui::size(px(0.), px(0.)),
             editor_scrollbar_snapshot: Cell::new(None),
+            painted_caret: Cell::new(None),
             editor_paddings: Edges::default(),
             gutter_extra: px(0.),
             deferred_scroll_offset: None,

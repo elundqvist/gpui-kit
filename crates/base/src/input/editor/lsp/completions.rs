@@ -26,14 +26,20 @@ pub struct CompletionMenuOptions {
     /// (nor than the window: near its right edge the popover moves left to
     /// fit). Defaults to 320 px, which is fine for most identifiers but can
     /// truncate longer labels and their detail. Widen this when hosting an
-    /// editor that surfaces long completion labels.
+    /// editor that surfaces long completion labels. The documentation
+    /// panel beside the list is at most this wide too.
     pub max_width: Pixels,
+    /// Whether each row begins with its item's kind, a coloured letter:
+    /// `m` for a method, `C` for a class. Off by default; rows without a
+    /// `kind` leave the column blank.
+    pub show_kinds: bool,
 }
 
 impl Default for CompletionMenuOptions {
     fn default() -> Self {
         Self {
             max_width: px(320.),
+            show_kinds: false,
         }
     }
 }
@@ -125,6 +131,37 @@ pub trait CompletionProvider {
     ) -> bool {
         false
     }
+
+    /// The menu's highlighted row is now `item`, at `index` of the list
+    /// shown: moved to by the keyboard, or the first row of a list just
+    /// shown.
+    ///
+    /// This is where a provider resolves the item for what the list left
+    /// out (`completionItem/resolve`: its documentation, its detail) and
+    /// hands it back with [`InputBaseState::replace_completion_item`], which
+    /// keeps the row highlighted and the list where it is scrolled.
+    ///
+    /// Called with no entity borrowed, once the change is made, and only
+    /// while the menu is open with `item` still at `index`.
+    fn completion_selected(
+        &self,
+        _index: usize,
+        _item: &CompletionItem,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) {
+    }
+
+    /// Where `item`'s label matches what was typed, as byte ranges of the
+    /// label, in order: the menu paints them as matched.
+    ///
+    /// `None` leaves it to the menu, which paints the start of the label as
+    /// long as the item's `filter_text`, or else the query, is. A provider
+    /// that filters by more than a prefix (initials, letters apart) knows
+    /// where each letter matched, and says so here.
+    fn completion_label_matches(&self, _item: &CompletionItem) -> Option<Vec<Range<usize>>> {
+        None
+    }
 }
 
 pub(crate) struct InlineCompletion {
@@ -206,46 +243,58 @@ impl InputBaseState<EditorMode> {
 
         let provider_responses =
             provider.completions(&self.text, new_offset, completion_context, window, cx);
+        // An answer the provider has at once is shown in the same update as
+        // the keystroke, and drawn in its frame: through a task it lands a
+        // frame later, and the keystroke draws the menu twice.
+        if provider_responses.is_ready() {
+            use futures::FutureExt as _;
+            if let Some(response) = provider_responses.now_or_never() {
+                let completions = match response {
+                    Ok(CompletionResponse::Array(items)) => items,
+                    Ok(CompletionResponse::List(list)) => list.items,
+                    Err(_) => vec![],
+                };
+                self.extras.context_menu_task = Task::ready(Ok(()));
+                self.show_completions(completions, window, cx);
+            }
+            return;
+        }
         self.extras.context_menu_task = cx.spawn_in(window, async move |editor, cx| {
-            let mut completions: Vec<CompletionItem> = vec![];
-            if let Some(provider_responses) = provider_responses.await.ok() {
-                match provider_responses {
-                    CompletionResponse::Array(items) => completions.extend(items),
-                    CompletionResponse::List(list) => completions.extend(list.items),
-                }
-            }
-
-            if completions.is_empty() {
-                editor.update(cx, |editor, cx| {
-                    editor.extras.context_menu_content.completion.open = false;
-                    editor.extras.context_menu_content.completion.items.clear();
-                    editor.extras.context_menu_content.completion.bump();
-                    cx.notify();
-                })?;
-                return Ok(());
-            }
-
-            editor
-                .update_in(cx, |editor, window, cx| {
-                    if !editor.focus_handle.is_focused(window) {
-                        return;
-                    }
-
-                    editor.extras.context_menu_content.completion.items = completions;
-                    editor.extras.context_menu_content.completion.open = !editor
-                        .extras
-                        .context_menu_content
-                        .completion
-                        .items
-                        .is_empty();
-                    editor.extras.context_menu_content.completion.bump();
-
-                    cx.notify();
-                })
-                .ok();
-
+            let completions = match provider_responses.await {
+                Ok(CompletionResponse::Array(items)) => items,
+                Ok(CompletionResponse::List(list)) => list.items,
+                Err(_) => vec![],
+            };
+            editor.update_in(cx, |editor, window, cx| {
+                editor.show_completions(completions, window, cx)
+            })?;
             Ok(())
         });
+    }
+
+    /// Show the provider's answer to a keystroke: an empty one closes the
+    /// menu, and another is shown only while the input has the keyboard.
+    fn show_completions(
+        &mut self,
+        completions: Vec<CompletionItem>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let menu = &mut self.extras.context_menu_content.completion;
+        if completions.is_empty() {
+            menu.open = false;
+            menu.items.clear();
+            menu.bump();
+            cx.notify();
+            return;
+        }
+        if !self.focus_handle.is_focused(window) {
+            return;
+        }
+        menu.items = completions;
+        menu.open = true;
+        menu.bump();
+        cx.notify();
     }
 
     pub(crate) fn hide_context_menu(&mut self, cx: &mut Context<Self>) {
