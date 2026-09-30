@@ -1936,10 +1936,17 @@ console.log(answer);
         finished
     }
 
+    /// A highlighter with `source` parsed whole, its injected spans with as
+    /// long as they take, as the editor has it once its background parse is
+    /// in. The spans had the 20 ms a keystroke gives them, and on a loaded
+    /// machine a fence of 3,000 lines was not parsed in that: the test that
+    /// edits it found no fence to keep its colour (elundqvist/kvist#201).
     #[cfg(feature = "tree-sitter-languages")]
     fn fresh_highlighter(language: &str, source: &str) -> SyntaxHighlighter {
         let mut highlighter = SyntaxHighlighter::new(language);
+        highlighter.injection_parse_timeout = Duration::MAX;
         assert!(highlighter.update(None, &Rope::from_str(source), None));
+        highlighter.injection_parse_timeout = INJECTION_PARSE_TIMEOUT;
         highlighter
     }
 
