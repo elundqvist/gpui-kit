@@ -2078,12 +2078,30 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         // Clamp the deferred target into the same safe range that
         // `update_scroll_offset` enforces on persist, so paint never shows an
-        // over-scrolled frame before the post-paint clamp pulls it back.
-        let safe_y_min = (-self.scroll_size.height + self.input_bounds.size.height).min(px(0.));
+        // over-scrolled frame before the post-paint clamp pulls it back. The
+        // range is the text's as it is now: the last layout's scroll size is
+        // older than a paste, and a paste past the end stopped the view at
+        // the height the text had before it.
+        let safe_y_min =
+            (-self.scroll_height_now(line_height) + self.input_bounds.size.height).min(px(0.));
         scroll_offset.x = scroll_offset.x.min(px(0.));
         scroll_offset.y = scroll_offset.y.clamp(safe_y_min, px(0.));
         self.deferred_scroll_offset = Some(scroll_offset);
         cx.notify();
+    }
+
+    /// How far the text as it is now scrolls, as the next layout will
+    /// measure it: its rows and the room kept below the last one.
+    /// `scroll_size` is the last layout's, which has not seen an edit since.
+    fn scroll_height_now(&self, line_height: Pixels) -> Pixels {
+        let below = super::element::empty_bottom_height(
+            self.is_code_editor(),
+            self.scroll_beyond_last_line,
+            self.input_bounds.size.height,
+            line_height,
+        );
+        (line_height * self.display_map.wrap_row_count() as f32 + below)
+            .max(self.input_bounds.size.height)
     }
 
     pub(super) fn show_character_palette(
@@ -2185,6 +2203,11 @@ impl<M: InputModeKind> InputBaseState<M> {
                 self.replace_text_in_range_silent(Some(range_utf16), &change.old_text, window, cx);
             }
             self.selected_range = selection;
+            // before the next layout chooses its lines: left to the
+            // caret's follow in the layout, the lines were those at the
+            // old place and painted at the new, and an undone paste of
+            // thousands of lines left the editor blank until the next frame
+            self.scroll_to(self.cursor(), None, cx);
         }
         self.undo_manager.set_ignoring(false);
     }
@@ -2198,6 +2221,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                 self.replace_text_in_range_silent(Some(range_utf16), &change.new_text, window, cx);
             }
             self.selected_range = selection;
+            self.scroll_to(self.cursor(), None, cx);
         }
         self.undo_manager.set_ignoring(false);
     }
@@ -3614,6 +3638,157 @@ mod tests {
                 );
             });
         });
+    }
+
+    /// `line {i}` for each `i` in `lines`, a line apiece.
+    fn numbered_lines(lines: std::ops::Range<usize>) -> String {
+        lines.map(|i| format!("line {i}\n")).collect()
+    }
+
+    /// The caret's line was laid out in the last frame and the caret was
+    /// painted inside the view.
+    fn assert_caret_in_view<M: InputModeKind>(state: &InputBaseState<M>, what: &str) {
+        let caret = state.cursor();
+        let row = state.text.offset_to_point(caret).row;
+        let rows = state.visible_row_range().expect("laid out");
+        assert!(
+            rows.contains(&row),
+            "{what}: the caret's line {row} is not among the lines laid out, {rows:?}"
+        );
+        let at = state
+            .range_to_bounds(&(caret..caret))
+            .expect("the caret has a place");
+        let view = state.input_bounds;
+        assert!(
+            at.top() >= view.top() && at.bottom() <= view.bottom(),
+            "{what}: the caret at {at:?} is outside the view {view:?}"
+        );
+    }
+
+    /// A paste past the end of the text ends with its last line in view. It
+    /// scrolled before the pasted lines were laid out, against the height
+    /// the text had before them, and the view stopped there with the caret
+    /// thousands of lines below it (elundqvist/kvist#201).
+    #[gpui::test]
+    fn test_a_paste_past_the_end_scrolls_to_its_last_line(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(numbered_lines(0..100), window, cx)
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                let end = state.text.len();
+                state.move_to(end, None, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(numbered_lines(100..4100)));
+            input.update(cx, |state, cx| state.paste(&Paste, window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.text.offset_to_point(state.cursor()).row, 4100);
+                assert_caret_in_view(state, "after the paste");
+            });
+        });
+    }
+
+    /// An undo that takes the caret thousands of lines back, and the redo
+    /// after it, draw the lines about the caret in the frame that follows.
+    /// The undo moved the caret and left the view to the layout's follow,
+    /// which chose the lines at the old place and then jumped to the caret:
+    /// the frame was blank until another came, a third of a second later
+    /// with the caret's blink (elundqvist/kvist#201).
+    #[gpui::test]
+    fn test_an_undone_paste_is_drawn_about_the_caret(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(numbered_lines(0..200), window, cx)
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                let second = state.text.line_start_offset(1);
+                state.move_to(second, None, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(numbered_lines(1000..5000)));
+            input.update(cx, |state, cx| state.paste(&Paste, window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| input.read_with(cx, |state, _| assert_caret_in_view(state, "pasted")));
+
+        cx.update(|window, cx| input.update(cx, |state, cx| state.undo(&Undo, window, cx)));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.text.lines_len(), 201);
+                assert_caret_in_view(state, "undone");
+            });
+        });
+
+        cx.update(|window, cx| input.update(cx, |state, cx| state.redo(&Redo, window, cx)));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.text.offset_to_point(state.cursor()).row, 4001);
+                assert_caret_in_view(state, "redone");
+            });
+        });
+    }
+
+    /// A caret moved far out of view with nothing to scroll to it first is
+    /// followed by the layout, which jumps there after choosing the lines
+    /// for the old place: that frame is short of lines, and it asks for the
+    /// next, which draws the lines at the caret.
+    #[gpui::test]
+    fn test_a_frame_short_of_lines_asks_for_the_next(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(numbered_lines(0..3000), window, cx)
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                let end = state.text.len();
+                state.move_to(end, None, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                state.selected_range = (10..10).into();
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        let asked = cx.update(|window, cx| window.simulate_next_frame(cx));
+        assert!(asked > 0, "the frame short of lines asks for the next");
+        cx.run_until_parked();
+        cx.update(|_, cx| input.read_with(cx, |state, _| assert_caret_in_view(state, "moved")));
     }
 
     #[gpui::test]

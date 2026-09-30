@@ -370,13 +370,24 @@ pub(super) fn cursor_surrounding_padding(
     raw.min(viewport_half)
 }
 
+/// Whether the lines laid out, over `laid` in the content's coordinates,
+/// cover the part of the view the text has rows in: `view` is the view, and
+/// the rows end at `rows_height`, below which there is nothing to draw.
+fn lines_cover_view(laid: Range<Pixels>, view: Range<Pixels>, rows_height: Pixels) -> bool {
+    let bottom = view.end.min(rows_height);
+    // a hair of slack for the rounding of a scroll offset
+    let slack = px(0.5);
+    view.start >= bottom
+        || (laid.start <= view.start.max(px(0.)) + slack && laid.end + slack >= bottom)
+}
+
 /// Pixel height of the empty area below the last line in the editor's
 /// scrollable region. Backs [`InputBaseState::scroll_beyond_last_line`].
 ///
 /// `0` outside code-editor mode. Inside it, `None` is half the viewport
 /// (floored at [`BOTTOM_MARGIN_ROWS`] line-heights); `Some(n)` is exactly
 /// `n` line-heights.
-fn empty_bottom_height(
+pub(super) fn empty_bottom_height(
     is_code_editor: bool,
     override_rows: Option<usize>,
     viewport_height: Pixels,
@@ -2011,6 +2022,31 @@ impl<M: InputModeKind> Element for TextElement<M> {
         let (cursor_bounds, cursor_scroll_offset, current_row) =
             self.layout_cursor(&last_layout, &mut bounds, scroll_size, window, cx);
         last_layout.cursor_bounds = cursor_bounds;
+
+        // The lines were chosen for the offset the frame began with, and
+        // following the caret may have moved it since, by a jump when the
+        // caret is far out of view. What they leave of the view is blank
+        // this frame, and the offset kept after the paint asks for no frame
+        // after it, so the frame is asked for here: until then, an undo that
+        // took the caret thousands of lines back left the editor blank.
+        if multi_line {
+            let laid_top = last_layout.visible_top;
+            let laid_height = last_layout
+                .lines
+                .iter()
+                .map(|line| line.size(line_height).height)
+                .fold(ghost_lines_height, |sum, height| sum + height);
+            let view_top = -cursor_scroll_offset.y;
+            let rows_height =
+                line_height * self.state.read(cx).display_map.display_row_count() as f32;
+            if !lines_cover_view(
+                laid_top..laid_top + laid_height,
+                view_top..view_top + bounds.size.height,
+                rows_height,
+            ) {
+                window.request_animation_frame();
+            }
+        }
 
         let search_match_paths = self.layout_search_matches(&last_layout, &mut bounds, cx);
         let selection_path = self.layout_selections(&last_layout, &mut bounds, window, cx);
