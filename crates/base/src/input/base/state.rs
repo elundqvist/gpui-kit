@@ -565,6 +565,16 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.last_bounds
     }
 
+    /// Where the `⋯` after folded `line` was painted in the last frame, in
+    /// window coordinates: none when the line is not folded, or not in view.
+    /// What a caller draws after a folded line's end goes after this.
+    pub fn fold_placeholder_bounds(&self, line: usize) -> Option<Bounds<Pixels>> {
+        self.fold_placeholders
+            .iter()
+            .find(|(folded, _)| *folded == line)
+            .map(|(_, bounds)| *bounds)
+    }
+
     pub fn diagnostic_popover(&self) -> Option<Rc<crate::input::DiagnosticEntry>> {
         self.diagnostic_popover.clone()
     }
@@ -4080,6 +4090,8 @@ mod tests {
                     "one for the fold that is closed, none for the one that is open"
                 );
                 let (_, placeholder) = state.fold_placeholders[0];
+                assert_eq!(state.fold_placeholder_bounds(2), Some(placeholder));
+                assert_eq!(state.fold_placeholder_bounds(7), None, "open");
                 let end = state.text.line_end_offset(2);
                 let end = state.range_to_bounds(&(end..end)).unwrap();
                 assert!(placeholder.left() > end.left(), "after the line's text");
@@ -4104,6 +4116,61 @@ mod tests {
                 assert!(state.fold_placeholders.is_empty());
                 // and did not move the caret, as a click on the text would
                 assert_eq!(state.cursor(), 0);
+            });
+        });
+    }
+
+    /// A `⋯` scrolled under the gutter takes no click there. It was placed
+    /// with the text, scrolled, and only its paint was covered by the
+    /// gutter's: a click on the number of its line went to it, and opened
+    /// the fold (elundqvist/kvist#201).
+    #[gpui::test]
+    fn test_a_placeholder_under_the_gutter_takes_no_click(cx: &mut TestAppContext) {
+        use crate::input::FoldRange;
+        cx.update(crate::init);
+        let view = InputView::build_editor(cx, |state| state.soft_wrap(false));
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                let mut text = numbered_lines(0..12);
+                text.push_str(&"x".repeat(1000));
+                state.set_value(text, window, cx);
+                state.apply_highlighter_fold_candidates(vec![FoldRange::new(2, 6)], cx);
+                state.display_map.set_folded(2, true);
+            });
+        });
+        cx.run_until_parked();
+        let (placeholder, gutter) = cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                let gutter = state.last_layout.as_ref().unwrap().line_number_width;
+                assert!(gutter > px(20.), "the editor has line numbers");
+                (state.fold_placeholders[0].1, gutter)
+            })
+        });
+        // its middle a quarter of the way into the gutter, over the numbers
+        let across = gutter * 0.25 - placeholder.center().x;
+        assert!(across < px(0.));
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                state.set_scroll_offset(point(across, px(0.)), cx);
+            })
+        });
+        cx.run_until_parked();
+        let under = cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.scroll_handle.offset().x, across, "scrolled across");
+                let (_, under) = state.fold_placeholders[0];
+                assert!(under.center().x < state.input_bounds.left() + gutter);
+                under
+            })
+        });
+        cx.simulate_mouse_down(under.center(), MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(under.center(), MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert!(state.display_map.is_folded_at(2), "the click on the gutter left the fold closed");
             });
         });
     }

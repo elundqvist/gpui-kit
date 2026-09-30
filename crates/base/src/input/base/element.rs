@@ -1316,10 +1316,14 @@ impl<M: InputModeKind> TextElement<M> {
     /// The `⋯` after the last character of each folded line in view, as VS
     /// Code draws one: a folded line looked like any other, its body gone
     /// with nothing to say so but the chevron in the gutter, which shows on
-    /// hover. A click on it opens the fold. `bounds` is the text's, scrolled.
+    /// hover. A click on it opens the fold. `bounds` is the text's, scrolled,
+    /// and `text_area` the part of the view right of the gutter, which a
+    /// `⋯` is drawn and clicked inside alone: scrolled under the gutter, it
+    /// took a click on its line's number there and opened the fold.
     fn layout_fold_placeholders(
         &self,
         bounds: &Bounds<Pixels>,
+        text_area: Bounds<Pixels>,
         last_layout: &LastLayout,
         current_row: Option<usize>,
         ghost_lines_height: Pixels,
@@ -1401,7 +1405,9 @@ impl<M: InputModeKind> TextElement<M> {
                     window,
                     cx,
                 );
-                placeholder.prepaint_at(origin, window, cx);
+                window.with_content_mask(Some(gpui::ContentMask { bounds: text_area }), |window| {
+                    placeholder.prepaint_at(origin, window, cx)
+                });
                 (buffer_line, Bounds::new(origin, size), placeholder)
             })
             .collect()
@@ -1731,8 +1737,9 @@ pub(super) struct PrepaintState {
     /// Fold icon layout data
     fold_icon_layout: FoldIconLayout,
     /// The `⋯` after each folded line in view: its first line, its bounds
-    /// and the element.
+    /// and the element, and the part of the view they are drawn inside.
     fold_placeholders: Vec<(usize, Bounds<Pixels>, AnyElement)>,
+    fold_placeholder_area: Bounds<Pixels>,
     // Inline completion rendering data
     /// Shaped ghost lines to paint after cursor row (completion lines 2+)
     ghost_lines: Vec<ShapedLine>,
@@ -2245,8 +2252,13 @@ impl<M: InputModeKind> Element for TextElement<M> {
         }));
         let fold_icon_layout =
             self.layout_fold_icons(original_x, &bounds, &last_layout, window, cx);
+        let fold_placeholder_area = Bounds::from_corners(
+            point(input_bounds.left() + last_layout.line_number_width, input_bounds.top()),
+            input_bounds.bottom_right(),
+        );
         let fold_placeholders = self.layout_fold_placeholders(
             &bounds,
+            fold_placeholder_area,
             &last_layout,
             current_row,
             ghost_lines_height,
@@ -2270,6 +2282,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             indent_guides_path,
             fold_icon_layout,
             fold_placeholders,
+            fold_placeholder_area,
             ghost_first_line,
             ghost_lines,
             ghost_lines_height,
@@ -2496,9 +2509,12 @@ impl<M: InputModeKind> Element for TextElement<M> {
 
         // after the text and before the gutter, which is painted over what
         // scrolls under it
-        for (_, _, placeholder) in prepaint.fold_placeholders.iter_mut() {
-            placeholder.paint(window, cx);
-        }
+        let area = gpui::ContentMask { bounds: prepaint.fold_placeholder_area };
+        window.with_content_mask(Some(area), |window| {
+            for (_, _, placeholder) in prepaint.fold_placeholders.iter_mut() {
+                placeholder.paint(window, cx);
+            }
+        });
 
         // Paint blinking cursor
         if focused && show_cursor {
