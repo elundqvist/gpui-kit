@@ -241,6 +241,23 @@ impl SyntaxColors {
             return None;
         }
 
+        // What tree-sitter's grammars capture under a name of their own,
+        // for what the theme names otherwise: taken by its first part
+        // alone, `self` was a variable, an escape and a heading nothing, and
+        // a macro a function. A macro is in the preprocessor's colour, as
+        // Vim links the two. A theme without the name takes the first part,
+        // below, as before.
+        let own = match name {
+            "variable.builtin" => self.variable_special,
+            "escape" => self.string_escape,
+            "text.title" => self.title,
+            "function.macro" => self.preproc,
+            _ => None,
+        };
+        if let Some(own) = own {
+            return Some(own.into());
+        }
+
         let style = match name {
             "attribute" => self.attribute,
             "boolean" => self.boolean,
@@ -536,6 +553,48 @@ impl LanguageRegistry {
 #[cfg(test)]
 mod tests {
     use crate::highlighter::LanguageConfig;
+
+    /// What tree-sitter's grammars capture as `variable.builtin`, `escape`,
+    /// `text.title` and `function.macro` takes the colour the theme gives
+    /// the same thing under its own name, `variable.special`,
+    /// `string.escape`, `title` and `preproc`, as a macro is linked to the
+    /// preprocessor's colour in Vim. They were taken by their first part
+    /// alone: `self` as a variable, an escape and a heading as nothing, and
+    /// a macro as a function. A theme without those names takes them by
+    /// their first part, as before.
+    #[test]
+    fn a_grammars_name_for_what_the_theme_names_otherwise_takes_its_colour() {
+        use super::{SyntaxColors, ThemeStyle};
+        let colour = |hex: &str| -> Option<ThemeStyle> {
+            serde_json::from_value(serde_json::json!({ "color": hex })).ok()
+        };
+        let mut theme = SyntaxColors {
+            variable: colour("#101010"),
+            function: colour("#202020"),
+            string: colour("#303030"),
+            ..Default::default()
+        };
+        let aliases = [
+            ("variable.builtin", "variable.special"),
+            ("escape", "string.escape"),
+            ("text.title", "title"),
+            ("function.macro", "preproc"),
+        ];
+        let colour_of = |theme: &SyntaxColors, name: &str| theme.style(name).and_then(|s| s.color);
+        assert_eq!(colour_of(&theme, "variable.builtin"), colour_of(&theme, "variable"));
+        assert_eq!(colour_of(&theme, "function.macro"), colour_of(&theme, "function"));
+        assert_eq!(colour_of(&theme, "escape"), None);
+        assert_eq!(colour_of(&theme, "text.title"), None);
+
+        theme.variable_special = colour("#404040");
+        theme.string_escape = colour("#505050");
+        theme.title = colour("#606060");
+        theme.preproc = colour("#707070");
+        for (grammars, own) in aliases {
+            assert!(colour_of(&theme, own).is_some());
+            assert_eq!(colour_of(&theme, grammars), colour_of(&theme, own), "{grammars}");
+        }
+    }
 
     #[test]
     fn test_registry() {
