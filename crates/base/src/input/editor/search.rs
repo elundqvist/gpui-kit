@@ -172,9 +172,25 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// after Enter has gone down the text and the query is typed again,
     /// the bar named a match above the view and nothing moved
     /// (elundqvist/kvist#208).
+    ///
+    /// A fold that hides the match's line opens first, every one of them
+    /// where they nest, as VS Code and IntelliJ open the fold the match
+    /// gone to is in: folded, the bar counted to a match nobody could see,
+    /// and neither what was typed nor Enter showed it.
     fn show_search_match(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let row = self.text.offset_to_point(offset).row;
+        // a fold hides the lines between its first and its last
+        let hiding: Vec<usize> = self
+            .display_map
+            .folded_ranges()
+            .iter()
+            .filter(|fold| row > fold.start_line && row < fold.end_line)
+            .map(|fold| fold.start_line)
+            .collect();
+        for start_line in hiding {
+            self.display_map.set_folded(start_line, false);
+        }
         let direction = self.last_layout.as_ref().map(|layout| {
-            let row = self.text.offset_to_point(offset).row;
             let top = layout.line_height * self.display_map.buffer_line_to_display_row(row);
             if top < -self.scroll_handle.offset().y {
                 MoveDirection::Up

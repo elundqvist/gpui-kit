@@ -4059,6 +4059,81 @@ mod tests {
         );
     }
 
+    /// A match in a fold opens it when it is gone to, by typing or by
+    /// Enter, as VS Code and IntelliJ open the fold the current match is
+    /// in. Folded, the bar said 1/1 and the match stayed hidden whatever
+    /// was pressed.
+    #[gpui::test]
+    fn test_a_match_gone_to_in_a_fold_opens_it(cx: &mut TestAppContext) {
+        use crate::input::FoldRange;
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let text: String = (0..30)
+            .map(|i| {
+                if [7, 20].contains(&i) {
+                    format!("needle {i}\n")
+                } else {
+                    format!("line {i}\n")
+                }
+            })
+            .collect();
+        let fold = |state: &mut InputBaseState<EditorMode>| {
+            state.display_map.set_folded(2, true);
+            state.display_map.set_folded(4, true);
+            assert!(state.display_map.is_buffer_line_hidden(7));
+        };
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(text, window, cx);
+                // one fold inside another, both over line 7
+                state.apply_highlighter_fold_candidates(
+                    vec![FoldRange::new(2, 12), FoldRange::new(4, 9)],
+                    cx,
+                );
+                fold(state);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                state.open_search(false, cx);
+                state.set_search_query("needle", true, cx);
+                assert!(state.display_map.folded_ranges().is_empty(), "typed");
+            })
+        });
+        assert_current_match(&input, &mut cx, 0, 7, "typed, in a fold");
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                state.next_search_match(cx);
+                fold(state);
+                // round to the first again, which the folds hide
+                state.next_search_match(cx);
+                assert!(state.display_map.folded_ranges().is_empty(), "Enter");
+            })
+        });
+        assert_current_match(&input, &mut cx, 0, 7, "Enter, in a fold");
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                state.next_search_match(cx);
+                fold(state);
+                state.previous_search_match(cx);
+                assert!(state.display_map.folded_ranges().is_empty(), "Shift+Enter");
+            })
+        });
+        assert_current_match(&input, &mut cx, 0, 7, "Shift+Enter, in a fold");
+        // a fold that does not hide the match stays shut
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                state.display_map.set_folded(4, true);
+                assert!(!state.display_map.is_buffer_line_hidden(20));
+                state.next_search_match(cx);
+                assert_eq!(state.display_map.folded_ranges().len(), 1);
+            })
+        });
+        assert_current_match(&input, &mut cx, 1, 20, "beside a fold");
+    }
+
     /// The caret was painted inside the view across as well as down.
     fn assert_caret_in_view_across<M: InputModeKind>(state: &InputBaseState<M>, what: &str) {
         let caret = state.cursor();
