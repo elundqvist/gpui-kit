@@ -1,6 +1,5 @@
 use ropey::Rope;
 use rust_i18n::t;
-use std::ops::Range;
 
 use gpui::{
     App, AppContext as _, Context, Empty, Entity, FocusHandle, Focusable, Half,
@@ -93,7 +92,7 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
                         // Handle search input changes
                         match ev {
                             InputEvent::Change => {
-                                this.update_search_query(None, cx);
+                                this.update_search_query(cx);
                             }
                             _ => {}
                         }
@@ -115,7 +114,6 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
         &mut self,
         selected_text: &Rope,
         replace_mode: bool,
-        visible_range_offset: Option<Range<usize>>,
         focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -136,20 +134,21 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
             this.select_all(window, cx);
         });
 
-        // The `set_value` does not emit `InputEvent::Change`, so update the query
-        // here to match the value of the search input.
-        self.update_search_query(visible_range_offset, cx);
+        // The query the bar opens on, the selection or the one it last
+        // held, is the editor's already, counted from where the search
+        // begins and with the view left where it is: opening the bar moves
+        // nothing, as VS Code's does not, and only what is typed is
+        // followed. `set_value` emits no `InputEvent::Change`, so an input
+        // that holds something else is handed over here, as typed.
+        if self.search_input.read(cx).value() != self.session.query {
+            self.update_search_query(cx);
+        }
     }
 
-    /// Update the matcher by the value of the search input.
-    ///
-    /// The `visible_range_offset` is to select the nearest match of the visible range,
-    /// it is passed in, because the editor may be borrowed by the caller.
-    fn update_search_query(
-        &mut self,
-        visible_range_offset: Option<Range<usize>>,
-        cx: &mut Context<Self>,
-    ) {
+    /// Hand the editor the search input's value as the query, which it
+    /// follows to its first match from where the search began, and take
+    /// its matches for the bar's count.
+    fn update_search_query(&mut self, cx: &mut Context<Self>) {
         let query = self.search_input.read(cx).value();
         let editor = self.editor.clone();
         let _ = editor.update(cx, |state, cx| {
@@ -157,11 +156,6 @@ impl<M: crate::input::overlay::OverlayMode> SearchPanel<M> {
         });
         if let Ok(session) = editor.read_with(cx, |state, _| state.search_session().clone()) {
             self.session = session;
-        }
-        if let Some(visible_range_offset) = visible_range_offset {
-            self.session
-                .matcher
-                .update_cursor_by_offset(visible_range_offset.start);
         }
         cx.notify();
     }
@@ -359,7 +353,7 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.session.case_insensitive =
                                                     !this.session.case_insensitive;
-                                                this.update_search_query(None, cx);
+                                                this.update_search_query(cx);
                                                 cx.notify();
                                             })),
                                     )
@@ -466,6 +460,170 @@ impl<M: crate::input::overlay::OverlayMode> Render for SearchPanel<M> {
 mod tests {
     use super::*;
     use ropey::Rope;
+
+    /// 400 lines in an editor, "needle N" on lines 20, 250 and 330, the
+    /// caret on line 150 and the view on it.
+    struct Probe {
+        editor: Entity<crate::input::EditorState>,
+    }
+
+    impl Render for Probe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(crate::input::Editor::new(&self.editor).h_full())
+        }
+    }
+
+    /// What the editor's find bar holds: its input's value and its count.
+    fn bar(
+        editor: &Entity<crate::input::EditorState>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> (String, String) {
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|_, cx| {
+            let panel =
+                crate::input::overlay::search_panel_of(editor, cx).expect("the bar is open");
+            let panel = panel.read(cx);
+            (
+                panel.search_input.read(cx).value().to_string(),
+                panel.session.matcher.label(),
+            )
+        })
+    }
+
+    /// The line the editor's current match is on, which is in view.
+    fn current_line(
+        editor: &Entity<crate::input::EditorState>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> usize {
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|_, cx| {
+            use gpui_base::input::RopeExt as _;
+            let state = editor.read(cx);
+            let matcher = &state.search_session().matcher;
+            let range = matcher.matched_ranges()[matcher.current_match_index()].clone();
+            let line = state.text().offset_to_point(range.start).row;
+            let rows = state.visible_row_range().expect("laid out");
+            assert!(rows.contains(&line), "line {line} is not in view, {rows:?}");
+            line
+        })
+    }
+
+    /// Typed into the find bar itself, a character at a time, the query is
+    /// followed to its first match from the caret, the bar counting from
+    /// it, and Enter goes on to the next; typed again with the view where
+    /// Enter left it, it is followed back up. Opened again on the query it
+    /// held, the bar moves nothing. The bar handed the editor each change
+    /// and the editor counted from the first match in the text and stayed
+    /// where it was until Enter, which went to the second
+    /// (elundqvist/kvist#208).
+    #[gpui::test]
+    fn the_find_bar_follows_what_is_typed_into_it(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        use gpui_base::input::Position;
+
+        cx.update(crate::init);
+        let mut editor = None;
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|cx| crate::input::EditorState::new(window, cx));
+            editor = Some(state.clone());
+            Probe { editor: state }
+        });
+        let editor = editor.unwrap();
+        let text: String = (0..400)
+            .map(|i| {
+                if [20, 250, 330].contains(&i) {
+                    format!("needle {i}\n")
+                } else {
+                    format!("line {i}\n")
+                }
+            })
+            .collect();
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| {
+                state.set_value(text, window, cx);
+                state.set_cursor_position(Position::new(150, 0), window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| state.open_search(false, cx));
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(bar(&editor, cx), (String::new(), "0/0".to_string()));
+        // the bar takes the keys, as it does when it opens outside a test
+        cx.update(|window, cx| {
+            let panel = crate::input::overlay::search_panel_of(&editor, cx).unwrap();
+            let input = panel.read(cx).search_input.clone();
+            input.read(cx).focus_handle(cx).focus(window, cx);
+            window.draw(cx).clear(cx);
+        });
+        cx.simulate_input("needle");
+        assert_eq!(bar(&editor, cx), ("needle".to_string(), "2/3".to_string()));
+        assert_eq!(
+            current_line(&editor, cx),
+            250,
+            "typed, the first from the caret"
+        );
+        cx.simulate_keystrokes("enter");
+        assert_eq!(bar(&editor, cx).1, "3/3");
+        assert_eq!(current_line(&editor, cx), 330, "Enter, on to the next");
+        // the query typed over, with the view down where Enter left it
+        cx.update(|window, cx| {
+            let panel = crate::input::overlay::search_panel_of(&editor, cx).unwrap();
+            let input = panel.read(cx).search_input.clone();
+            input.update(cx, |input, cx| input.select_all(window, cx));
+        });
+        cx.simulate_input("line 15");
+        // "line 15" and "line 150" to "line 159": the caret is on 150
+        assert_eq!(
+            bar(&editor, cx),
+            ("line 15".to_string(), "2/11".to_string())
+        );
+        assert_eq!(current_line(&editor, cx), 150, "typed again, back up to it");
+
+        // closed and opened again on what it held: nothing moves
+        cx.simulate_input("9");
+        assert_eq!(current_line(&editor, cx), 159);
+        cx.update(|window, cx| {
+            let panel = crate::input::overlay::search_panel_of(&editor, cx).unwrap();
+            panel.update(cx, |panel, cx| panel.hide_with_focus(false, window, cx));
+            editor.update(cx, |state, cx| {
+                state.set_cursor_position(Position::new(20, 0), window, cx)
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let was = cx.update(|_, cx| editor.read(cx).scroll_offset());
+        cx.update(|window, cx| {
+            editor.update(cx, |state, cx| state.open_search(false, cx));
+            window.draw(cx).clear(cx);
+        });
+        assert_eq!(
+            bar(&editor, cx),
+            ("line 159".to_string(), "1/1".to_string())
+        );
+        assert_eq!(
+            cx.update(|_, cx| editor.read(cx).scroll_offset()),
+            was,
+            "the bar opened on its last query and the view stayed"
+        );
+        // and the first Enter goes to that match, which is out of sight
+        cx.update(|window, cx| {
+            let panel = crate::input::overlay::search_panel_of(&editor, cx).unwrap();
+            let input = panel.read(cx).search_input.clone();
+            input.read(cx).focus_handle(cx).focus(window, cx);
+            window.draw(cx).clear(cx);
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(bar(&editor, cx).1, "1/1");
+        assert_eq!(current_line(&editor, cx), 159);
+    }
 
     #[test]
     fn test_search() {

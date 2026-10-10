@@ -275,6 +275,17 @@ pub(crate) fn completion_menu_of(
     host.lsp.as_ref().map(|lsp| lsp.completion.clone())
 }
 
+/// The find bar an editor draws, while it has one open.
+#[cfg(test)]
+pub(super) fn search_panel_of(
+    state: &Entity<crate::input::EditorState>,
+    cx: &App,
+) -> Option<Entity<SearchPanel<crate::input::EditorMode>>> {
+    let registry = cx.try_global::<InputOverlayRegistry<crate::input::EditorMode>>()?;
+    let (_, host) = registry.hosts.get(&state.entity_id())?;
+    Some(host.search.clone())
+}
+
 #[derive(Default)]
 pub(super) struct InputOverlays {
     pub search: Option<AnyElement>,
@@ -336,15 +347,7 @@ impl<M: OverlayMode> InputOverlayHost<M> {
                 self.search.update(cx, |panel, cx| {
                     if search_open {
                         let selected = Rope::from(search_session.query.clone());
-                        let visible = search_session.anchor_offset.map(|offset| offset..offset);
-                        panel.show_with_focus(
-                            &selected,
-                            replace_mode,
-                            visible,
-                            !cfg!(test),
-                            window,
-                            cx,
-                        );
+                        panel.show_with_focus(&selected, replace_mode, !cfg!(test), window, cx);
                     } else {
                         panel.hide_with_focus(!cfg!(test), window, cx);
                     }

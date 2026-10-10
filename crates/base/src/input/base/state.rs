@@ -3792,6 +3792,273 @@ mod tests {
         });
     }
 
+    /// The text at `at` was laid out in the last frame and painted inside
+    /// the view.
+    fn assert_offset_in_view<M: InputModeKind>(state: &InputBaseState<M>, at: usize, what: &str) {
+        let row = state.text.offset_to_point(at).row;
+        let rows = state.visible_row_range().expect("laid out");
+        assert!(
+            rows.contains(&row),
+            "{what}: line {row} is not among the lines laid out, {rows:?}"
+        );
+        let bounds = state.range_to_bounds(&(at..at)).expect("it has a place");
+        let view = state.input_bounds;
+        assert!(
+            bounds.top() >= view.top() && bounds.bottom() <= view.bottom(),
+            "{what}: line {row} at {bounds:?} is outside the view {view:?}"
+        );
+    }
+
+    /// 400 lines, "needle N" on lines 20, 250 and 330 and "line N" on the
+    /// rest, in an editor with the caret at the start of `caret_line` and
+    /// the view on it.
+    fn needles(
+        cx: &mut TestAppContext,
+        caret_line: usize,
+    ) -> (Entity<InputBaseState<EditorMode>>, VisualTestContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let text: String = (0..400)
+            .map(|i| {
+                if [20, 250, 330].contains(&i) {
+                    format!("needle {i}\n")
+                } else {
+                    format!("line {i}\n")
+                }
+            })
+            .collect();
+        cx.update(|window, cx| input.update(cx, |state, cx| state.set_value(text, window, cx)));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                let at = state.text.line_start_offset(caret_line);
+                state.move_to(at, None, cx);
+            })
+        });
+        cx.run_until_parked();
+        (input, cx)
+    }
+
+    /// The find bar's current match, counted from none, and that its line
+    /// is in view.
+    fn assert_current_match(
+        input: &Entity<InputBaseState<EditorMode>>,
+        cx: &mut VisualTestContext,
+        index: usize,
+        line: usize,
+        what: &str,
+    ) {
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                let matcher = &state.search_session().matcher;
+                assert_eq!(matcher.current_match_index(), index, "{what}");
+                let range = matcher.matched_ranges()[index].clone();
+                assert_eq!(state.text.offset_to_point(range.start).row, line, "{what}");
+                assert_offset_in_view(state, range.start, what);
+            })
+        });
+    }
+
+    /// A query typed into the find bar goes to its first match from where
+    /// the search began, the caret, which is the current one, and Enter on
+    /// to the one after it, as VS Code and IntelliJ do; one with no match
+    /// after the caret goes round to the first in the text. The matches
+    /// were counted from the first in the text, out of sight above, and
+    /// nothing moved until Enter, which went to the second
+    /// (elundqvist/kvist#208).
+    #[gpui::test]
+    fn test_a_query_typed_goes_to_its_first_match_from_the_caret(cx: &mut TestAppContext) {
+        // the caret, and the view with it, well past the first needle and
+        // short of the second
+        let (input, mut cx) = needles(cx, 150);
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                state.open_search(false, cx);
+                // typed a character at a time, as the bar hands them over
+                for typed in ["n", "ne", "needle"] {
+                    state.set_search_query(typed, true, cx);
+                }
+                assert_eq!(state.search_session().matcher.len(), 3);
+            })
+        });
+        assert_current_match(&input, &mut cx, 1, 250, "typed");
+        cx.update(|_, cx| input.update(cx, |state, cx| state.next_search_match(cx)));
+        assert_current_match(&input, &mut cx, 2, 330, "Enter goes on to the next");
+        // the query typed again, with the view where Enter left it, below
+        // what it finds from the caret: the view goes back up to it. It
+        // was told to go down, by the matches' order, and stayed
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                for typed in ["l", "line 15"] {
+                    state.set_search_query(typed, true, cx);
+                }
+            })
+        });
+        // "line 15" and "line 150" to "line 159": the caret is on 150
+        assert_current_match(&input, &mut cx, 1, 150, "typed again, above the view");
+        // nothing after the caret: round to the first in the text
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                state.close_search(cx);
+                let at = state.text.line_start_offset(399);
+                state.move_to(at, None, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                state.open_search(false, cx);
+                state.set_search_query("needle 2", true, cx);
+            })
+        });
+        assert_current_match(&input, &mut cx, 0, 20, "nothing after the caret");
+    }
+
+    /// The find bar opened on a selection has that occurrence as its
+    /// current match, and Enter goes to the one after it, as VS Code and
+    /// IntelliJ do. The search began at the top of the view: a match above
+    /// the selection was the current one, and Enter went back up to an
+    /// earlier one (elundqvist/kvist#208). With nothing selected and the
+    /// caret scrolled out of sight, it begins with what is in view.
+    #[gpui::test]
+    fn test_a_search_begins_at_the_selection_or_the_caret(cx: &mut TestAppContext) {
+        let (input, mut cx) = needles(cx, 245);
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                // "line 2" is on line 2, on 21 to 29 and from 200 on, of
+                // which the view holds some above the one selected, on 240
+                let at = state.text.line_start_offset(240);
+                state.selected_range = (at..at + "line 2".len()).into();
+                let top = state
+                    .last_layout
+                    .as_ref()
+                    .unwrap()
+                    .visible_range_offset
+                    .start;
+                assert!(
+                    top < state.text.line_start_offset(239),
+                    "the view begins above it"
+                );
+                state.open_search(false, cx);
+                assert_eq!(state.search_session().query, "line 2");
+                assert_eq!(state.search_session().anchor_offset, Some(at));
+            })
+        });
+        // counted from none, the one on 240 is the 50th
+        let selected = 1 + 9 + 40;
+        assert_current_match(&input, &mut cx, selected, 240, "the selection");
+        cx.update(|_, cx| input.update(cx, |state, cx| state.next_search_match(cx)));
+        assert_current_match(
+            &input,
+            &mut cx,
+            selected + 1,
+            241,
+            "Enter, the one after it",
+        );
+
+        // the caret left on line 10 and the view scrolled away from it
+        let (input, mut cx) = needles(&mut cx.cx, 10);
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                let line_height = state.last_layout.as_ref().unwrap().line_height;
+                state.set_scroll_offset(gpui::point(px(0.), -line_height * 300usize), cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                state.open_search(false, cx);
+                assert_eq!(
+                    state.search_session().anchor_offset,
+                    Some(state.text.line_start_offset(300)),
+                    "the top of the view"
+                );
+                state.set_search_query("needle", true, cx);
+            })
+        });
+        assert_current_match(&input, &mut cx, 2, 330, "the caret out of sight");
+    }
+
+    /// The find bar opened on the query it last held moves nothing, as VS
+    /// Code's does not: its current match is the first from the caret, and
+    /// the first Enter goes to that one where it is out of sight, not past
+    /// it, and on to the next where it is in view.
+    #[gpui::test]
+    fn test_the_find_bar_opens_on_its_last_query_and_moves_nothing(cx: &mut TestAppContext) {
+        let (input, mut cx) = needles(cx, 150);
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                state.open_search(false, cx);
+                state.set_search_query("needle", true, cx);
+                state.close_search(cx);
+                let at = state.text.line_start_offset(150);
+                state.move_to(at, None, cx);
+            })
+        });
+        cx.run_until_parked();
+        let was = cx.update(|_, cx| input.read_with(cx, |state, _| state.scroll_offset()));
+        cx.update(|_, cx| input.update(cx, |state, cx| state.open_search(false, cx)));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.search_session().query, "needle");
+                assert_eq!(state.search_session().matcher.current_match_index(), 1);
+                assert_eq!(
+                    state.scroll_offset(),
+                    was,
+                    "the bar opened and the view stayed"
+                );
+            })
+        });
+        cx.update(|_, cx| input.update(cx, |state, cx| state.next_search_match(cx)));
+        assert_current_match(
+            &input,
+            &mut cx,
+            1,
+            250,
+            "the first Enter, to the one out of sight",
+        );
+        cx.update(|_, cx| input.update(cx, |state, cx| state.next_search_match(cx)));
+        assert_current_match(&input, &mut cx, 2, 330, "the second, on to the next");
+        // opened with its current match in view, Enter goes on from it
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                state.close_search(cx);
+                let at = state.text.line_start_offset(248);
+                state.move_to(at, None, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| input.update(cx, |state, cx| state.open_search(false, cx)));
+        assert_current_match(&input, &mut cx, 1, 250, "opened beside it");
+        cx.update(|_, cx| input.update(cx, |state, cx| state.next_search_match(cx)));
+        assert_current_match(&input, &mut cx, 2, 330, "Enter, on from the one in view");
+        // Shift+Enter from where the bar opened goes to the one before
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                state.close_search(cx);
+                let at = state.text.line_start_offset(150);
+                state.move_to(at, None, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                state.open_search(false, cx);
+                state.previous_search_match(cx);
+            })
+        });
+        assert_current_match(
+            &input,
+            &mut cx,
+            0,
+            20,
+            "Shift+Enter, the one before the caret",
+        );
+    }
+
     /// The caret was painted inside the view across as well as down.
     fn assert_caret_in_view_across<M: InputModeKind>(state: &InputBaseState<M>, what: &str) {
         let caret = state.cursor();

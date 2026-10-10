@@ -23,7 +23,15 @@ pub struct SearchSession {
     pub case_insensitive: bool,
     pub query: String,
     pub replacement: String,
+    /// Where the search begins, set as the bar opens
+    /// (`InputBaseState::search_start`): a query's first match is the first
+    /// that begins here or after.
     pub anchor_offset: Option<usize>,
+    /// The bar has opened on a query, remembered or the selection, and
+    /// nothing has gone to its current match yet: Enter goes to that one
+    /// where it is out of sight, and on to the next only where it is in
+    /// view.
+    pub(crate) unvisited: bool,
     pub matcher: SearchMatcher,
 }
 
@@ -36,6 +44,7 @@ impl Default for SearchSession {
             query: String::new(),
             replacement: String::new(),
             anchor_offset: None,
+            unvisited: false,
             matcher: SearchMatcher::new(),
         }
     }
@@ -59,6 +68,10 @@ impl SearchSession {
 }
 
 impl<M: InputModeKind> InputBaseState<M> {
+    /// Open the find bar. Its query is the selection, or else the one it
+    /// last held, and its current match the first from where the search
+    /// begins ([`Self::search_start`]); the view stays where it is, as VS
+    /// Code's does until something is typed or Enter is pressed.
     pub fn open_search(&mut self, replace_mode: bool, cx: &mut Context<Self>) {
         if !self.searchable {
             return;
@@ -66,22 +79,41 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.search_session
             .open(replace_mode, self.is_replaceable());
         let selected = self.selected_text().to_string();
-        if !selected.is_empty() {
+        let seeded = !selected.is_empty();
+        if seeded {
             self.search_session.query = selected;
         }
-        self.search_session.anchor_offset = self
-            .last_layout
-            .as_ref()
-            .map(|layout| layout.visible_range_offset.start);
+        let start = self.search_start(seeded);
+        self.search_session.anchor_offset = Some(start);
         self.search_session.matcher.update_query(
             &self.search_session.query,
             self.search_session.case_insensitive,
         );
         self.search_session.matcher.update(&self.text);
-        if let Some(anchor) = self.search_session.anchor_offset {
-            self.search_session.matcher.update_cursor_by_offset(anchor);
-        }
+        self.search_session.unvisited = self.search_session.matcher.select_from(start).is_some();
         cx.notify();
+    }
+
+    /// Where a search begins: the start of the selection, which is the
+    /// caret where nothing is selected, as VS Code's and IntelliJ's begin
+    /// there, so a selection the bar opens on is itself the current match
+    /// and Enter goes to the one after it. With nothing selected and the
+    /// caret out of sight, scrolled away from, it begins at the top of the
+    /// view, with what is in sight. It began at the top of the view
+    /// always: Ctrl+F on a selection further down made a match above it
+    /// current, and Enter went back up to an earlier one
+    /// (elundqvist/kvist#208).
+    fn search_start(&self, seeded: bool) -> usize {
+        let caret = self.selected_range.start.min(self.selected_range.end);
+        let Some(layout) = self.last_layout.as_ref() else {
+            return caret;
+        };
+        let view = &layout.visible_range_offset;
+        if seeded || (view.start <= caret && caret <= view.end) {
+            caret
+        } else {
+            view.start
+        }
     }
 
     pub fn search_session(&self) -> &SearchSession {
@@ -110,7 +142,62 @@ impl<M: InputModeKind> InputBaseState<M> {
     ) {
         self.search_session.update_query(query, case_insensitive);
         self.search_session.matcher.update(&self.text);
+        self.follow_search_query(cx);
         cx.notify();
+    }
+
+    /// The match the query finds first from where the search began
+    /// ([`Self::search_start`]), the first in the text where none is after
+    /// it, is the current one and the view goes to it: as each character
+    /// is typed, as VS Code's find widget and IntelliJ's search do, so
+    /// Enter goes on to the one after it. The query's matches were counted
+    /// from the first in the text, out of sight, and nothing moved until
+    /// Enter, which went to the second (elundqvist/kvist#208).
+    fn follow_search_query(&mut self, cx: &mut Context<Self>) {
+        self.search_session.unvisited = false;
+        let from = self
+            .search_session
+            .anchor_offset
+            .unwrap_or_else(|| self.selected_range.start.min(self.selected_range.end));
+        let Some(range) = self.search_session.matcher.select_from(from) else {
+            return;
+        };
+        self.show_search_match(range.end, cx);
+    }
+
+    /// Bring the match at `offset` into view, up or down by where the view
+    /// is now. [`Self::scroll_to`] keeps the view from going the other way
+    /// than it is told, and the way was told by the matches' order alone:
+    /// with the view below a match that came later in that order, as it is
+    /// after Enter has gone down the text and the query is typed again,
+    /// the bar named a match above the view and nothing moved
+    /// (elundqvist/kvist#208).
+    fn show_search_match(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let direction = self.last_layout.as_ref().map(|layout| {
+            let row = self.text.offset_to_point(offset).row;
+            let top = layout.line_height * self.display_map.buffer_line_to_display_row(row);
+            if top < -self.scroll_handle.offset().y {
+                MoveDirection::Up
+            } else {
+                MoveDirection::Down
+            }
+        });
+        self.scroll_to(offset, direction, cx);
+    }
+
+    /// Whether the line `range` begins on lies whole inside the view, as
+    /// last laid out and scrolled.
+    fn search_match_in_view(&self, range: &Range<usize>) -> bool {
+        let Some(layout) = self.last_layout.as_ref() else {
+            return false;
+        };
+        let row = self.text.offset_to_point(range.start).row;
+        if self.display_map.is_buffer_line_hidden(row) {
+            return false;
+        }
+        let top = layout.line_height * self.display_map.buffer_line_to_display_row(row);
+        let view_top = -self.scroll_handle.offset().y;
+        top >= view_top && top + layout.line_height <= view_top + self.input_bounds.size.height
     }
 
     pub fn close_search(&mut self, cx: &mut Context<Self>) {
@@ -119,20 +206,32 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub fn next_search_match(&mut self, cx: &mut Context<Self>) -> Option<Range<usize>> {
-        let previous = self.search_session.matcher.current_match_index();
-        let range = self.search_session.matcher.next()?;
-        let direction = (self.search_session.matcher.current_match_index() > previous)
-            .then_some(MoveDirection::Down);
-        self.scroll_to(range.end, direction, cx);
+        // the bar opened on this query and has gone nowhere yet: its
+        // current match, the first from where the search began, is gone to
+        // and not past where it is out of sight, as VS Code's first Enter
+        // goes to the first match after the caret
+        let current = std::mem::take(&mut self.search_session.unvisited)
+            .then(|| {
+                let matcher = &self.search_session.matcher;
+                matcher
+                    .matched_ranges()
+                    .get(matcher.current_match_index())
+                    .cloned()
+            })
+            .flatten()
+            .filter(|range| !self.search_match_in_view(range));
+        let range = match current {
+            Some(range) => range,
+            None => self.search_session.matcher.next()?,
+        };
+        self.show_search_match(range.end, cx);
         Some(range)
     }
 
     pub fn previous_search_match(&mut self, cx: &mut Context<Self>) -> Option<Range<usize>> {
-        let previous = self.search_session.matcher.current_match_index();
+        self.search_session.unvisited = false;
         let range = self.search_session.matcher.next_back()?;
-        let direction = (self.search_session.matcher.current_match_index() < previous)
-            .then_some(MoveDirection::Up);
-        self.scroll_to(range.start, direction, cx);
+        self.show_search_match(range.start, cx);
         Some(range)
     }
 
@@ -292,6 +391,24 @@ impl SearchMatcher {
                 return;
             }
         }
+    }
+
+    /// Make the first match that begins at `offset` or after it the
+    /// current one, the first in the text where none does, as a search
+    /// that reaches the end goes on from the top, and hand it back.
+    pub fn select_from(&mut self, offset: usize) -> Option<Range<usize>> {
+        if self.matched_ranges.is_empty() {
+            return None;
+        }
+        let ix = self
+            .matched_ranges
+            .partition_point(|range| range.start < offset);
+        self.current_match_ix = if ix == self.matched_ranges.len() {
+            0
+        } else {
+            ix
+        };
+        self.matched_ranges.get(self.current_match_ix).cloned()
     }
 
     /// Preserve the current logical match while a replacement mutates text.
