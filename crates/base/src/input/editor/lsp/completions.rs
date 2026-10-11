@@ -33,6 +33,11 @@ pub struct CompletionMenuOptions {
     /// `m` for a method, `C` for a class. Off by default; rows without a
     /// `kind` leave the column blank.
     pub show_kinds: bool,
+    /// The priority the list is painted deferred at, 0 by default. gpui
+    /// paints every deferred draw in one sort by priority, so a list at 0
+    /// goes under a dialog that is itself painted deferred above 0: an
+    /// editor put into such a dialog raises this past the dialog's.
+    pub priority: usize,
 }
 
 impl Default for CompletionMenuOptions {
@@ -40,6 +45,7 @@ impl Default for CompletionMenuOptions {
         Self {
             max_width: px(320.),
             show_kinds: false,
+            priority: 0,
         }
     }
 }

@@ -1089,6 +1089,9 @@ impl Render for CompletionMenu {
             )
             .into_any_element();
 
+        // painted at the priority the editor's options ask, so that an
+        // editor inside a dialog painted deferred has its list over it
+        let priority = editor.read(cx).lsp().completion_menu.priority;
         deferred(Placement {
             editor,
             menu: cx.weak_entity(),
@@ -1099,6 +1102,7 @@ impl Render for CompletionMenu {
             docs_element: None,
             placed: self.placed.clone(),
         })
+        .with_priority(priority)
         .into_any_element()
     }
 }
