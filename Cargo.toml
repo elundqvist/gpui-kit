@@ -39,8 +39,11 @@ members = [
 # from its directory; crates/gpui-pre/FORK.md says how, and what it changes.
 # gpui-pre-linux, gpui's Linux platform (its X11 and Wayland clients), is
 # carried the same way for fixes to the X11 client;
-# crates/gpui-pre-linux/FORK.md says what they are.
-exclude = ["crates/gpui-pre", "crates/gpui-pre-linux"]
+# crates/gpui-pre-linux/FORK.md says what they are. gpui-pre-wgpu, gpui's
+# wgpu renderer and the cosmic-text text system Linux draws text with, is
+# carried the same way for fixes to that text system;
+# crates/gpui-pre-wgpu/FORK.md says what they are.
+exclude = ["crates/gpui-pre", "crates/gpui-pre-linux", "crates/gpui-pre-wgpu"]
 resolver = "2"
 
 [workspace.package]
