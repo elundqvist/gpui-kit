@@ -58,6 +58,13 @@ impl SearchSession {
 
     pub(crate) fn close(&mut self) {
         self.open = false;
+        // shut, the bar follows no edit (`InputBaseState::update_search`)
+        // and shows no match: the text it last looked in goes now, rather
+        // than outlive the editor's own hold on it and be freed on the UI
+        // thread (`set_prepared_value` frees the old text on a background
+        // thread, and only the last hold frees it), and the bar finds the
+        // matches of the text as it is when it opens again
+        self.matcher.forget();
     }
 
     pub(crate) fn update_query(&mut self, query: impl Into<String>, case_insensitive: bool) {
@@ -85,11 +92,14 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
         let start = self.search_start(seeded);
         self.search_session.anchor_offset = Some(start);
+        // the text as it is now, which the matches have not followed while
+        // the bar was shut (`update_search`), and the query looked for in
+        // it once
+        self.search_session.matcher.text = self.text.clone();
         self.search_session.matcher.update_query(
             &self.search_session.query,
             self.search_session.case_insensitive,
         );
-        self.search_session.matcher.update(&self.text);
         self.search_session.unvisited = self.search_session.matcher.select_from(start).is_some();
         cx.notify();
     }
@@ -306,7 +316,17 @@ impl<M: InputModeKind> InputBaseState<M> {
         count
     }
 
+    /// The matches follow the text while the find bar is open. Shut, it
+    /// shows none, steps through none and holds none, nor the text they
+    /// were of (`SearchSession::close`), so an edit has nothing to follow
+    /// and the bar finds them again as it opens (`open_search`): an edit
+    /// copied the whole text and looked for the query in it at every
+    /// keystroke once a query had ever been set, 9 ms a key in a file of
+    /// 1.4 MB with the bar long shut (elundqvist/kvist#315).
     pub(super) fn update_search(&mut self, _cx: &mut gpui::App) {
+        if !self.search_session.open {
+            return;
+        }
         self.search_session.matcher.update(&self.text);
     }
 
@@ -345,6 +365,20 @@ impl SearchMatcher {
             current_match_ix: 0,
             replacing: false,
         }
+    }
+
+    /// Let go of the text and its matches, as the find bar shuts.
+    fn forget(&mut self) {
+        self.text = Rope::new();
+        self.matched_ranges = Rc::new(Vec::new());
+        self.current_match_ix = 0;
+        self.replacing = false;
+    }
+
+    /// The text the matches are of.
+    #[cfg(test)]
+    pub(crate) fn text(&self) -> &Rope {
+        &self.text
     }
 
     /// Update the source text and recompute matches.

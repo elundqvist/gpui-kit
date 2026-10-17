@@ -4059,6 +4059,53 @@ mod tests {
         );
     }
 
+    /// With the find bar shut, an edit does not look for its query in the
+    /// text again: it copied and scanned the whole text at every keystroke
+    /// once a query had been set (elundqvist/kvist#315). The bar finds the
+    /// matches of the text as it is when it opens, and follows each edit
+    /// while it is open.
+    #[gpui::test]
+    fn test_a_shut_find_bar_does_not_search_at_each_edit(cx: &mut TestAppContext) {
+        let (input, mut cx) = needles(cx, 0);
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.open_search(false, cx);
+                state.set_search_query("needle", true, cx);
+                assert_eq!(state.search_session().matcher.len(), 3);
+                state.close_search(cx);
+                // shut, it holds neither the text it looked in nor its
+                // matches, so nothing but the editor keeps an old text
+                let matcher = &state.search_session().matcher;
+                assert_eq!(
+                    matcher.text().len(),
+                    0,
+                    "the text is let go as the bar shuts"
+                );
+                assert!(matcher.is_empty());
+                // a fourth typed at the top, with the bar shut
+                state.replace_text_in_range(None, "needle\n", window, cx);
+                let matcher = &state.search_session().matcher;
+                assert_eq!(
+                    (matcher.len(), matcher.text().len()),
+                    (0, 0),
+                    "not looked for while the bar is shut"
+                );
+                state.open_search(false, cx);
+                let matcher = &state.search_session().matcher;
+                assert_eq!(matcher.len(), 4, "found as the bar opens");
+                assert_eq!(matcher.matched_ranges()[0], 0..6);
+                // open, an edit is followed at once
+                let end = state.text.len();
+                state.replace_text_in_range(Some(end..end), "needle", window, cx);
+                assert_eq!(
+                    state.search_session().matcher.len(),
+                    5,
+                    "followed while the bar is open"
+                );
+            })
+        });
+    }
+
     /// A match in a fold opens it when it is gone to, by typing or by
     /// Enter, as VS Code and IntelliJ open the fold the current match is
     /// in. Folded, the bar said 1/1 and the match stayed hidden whatever
