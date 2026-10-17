@@ -122,6 +122,25 @@ impl UndoManager {
         self.coalescing_boundary = intent == EditIntent::Atomic;
     }
 
+    /// Record `changes`, made one after another, as one step of undo of
+    /// their own, which nothing typed after it joins: a replace-all's, a
+    /// change to each match (`InputBaseState::replace_steps`).
+    pub(super) fn record_step(&mut self, changes: Vec<Change>) {
+        if self.ignoring || changes.is_empty() {
+            return;
+        }
+        self.commit_transaction();
+        self.redo_transactions.clear();
+        if self.undo_transactions.len() >= MAX_UNDO_TRANSACTIONS {
+            self.undo_transactions.remove(0);
+        }
+        self.undo_transactions.push(UndoTransaction {
+            intent: EditIntent::Atomic,
+            changes,
+        });
+        self.coalescing_boundary = true;
+    }
+
     pub(super) fn break_transaction_coalescing(&mut self) {
         self.commit_transaction();
         self.coalescing_boundary = true;

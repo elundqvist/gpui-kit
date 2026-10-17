@@ -305,13 +305,13 @@ impl<M: InputModeKind> InputBaseState<M> {
         if ranges.is_empty() {
             return 0;
         }
-        let mut text = self.text.clone();
-        for range in ranges.iter().rev() {
-            text.replace(range.clone(), replacement);
-        }
         self.search_session.matcher.begin_replacement();
         let count = ranges.len();
-        self.replace_text_in_range_silent(Some(0..self.text.len()), &text.to_string(), window, cx);
+        // a change to each match, the last first, as one step of undo: the
+        // problems between two matches stay on their text, where the text
+        // made anew took them (elundqvist/kvist#370)
+        let edits: Vec<(Range<usize>, &str)> = ranges.iter().rev().map(|range| (range.clone(), replacement)).collect();
+        self.replace_steps(&edits, window, cx);
         self.scroll_to(0, Some(MoveDirection::Down), cx);
         count
     }

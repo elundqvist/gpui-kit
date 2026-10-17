@@ -1098,6 +1098,13 @@ impl<M: InputModeKind> InputBaseState<M> {
             let range = 0..this.text.chars().map(|c| c.len_utf16()).sum();
             this.replace_text_in_range_silent(Some(range), &text, window, cx);
             this.reset_highlighter(cx);
+            // a text set whole has none of the old one's problems, as
+            // `set_prepared_value`'s has not: moved by an edit over the
+            // whole, every one was taken with it, and whoever hands them
+            // finds none held and hands them again (elundqvist/kvist#370)
+            if let Some(diagnostics) = this.mode.diagnostics_mut() {
+                diagnostics.reset(&this.text)
+            }
         });
     }
 
@@ -2301,9 +2308,11 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// edit, from where the first begins to where the last ends, and one
     /// `Change`. Each was made as an edit of its own, so 28 keys typed in
     /// a large file and undone were parsed, folded and marked 28 times
-    /// over, and the view answered 28 changes (elundqvist/kvist#368). A
-    /// single line goes as typed, through its mask and its check of what
-    /// it holds, as it is short.
+    /// over, and the view answered 28 changes (elundqvist/kvist#368). The
+    /// problems move with each change in turn, so one between two of them
+    /// stays on its text (`DiagnosticSet::edit_steps`). A single line goes
+    /// as typed, through its mask and its check of what it holds, as it
+    /// is short.
     fn replay(&mut self, steps: &[(Range<usize>, &str)], window: &mut Window, cx: &mut Context<Self>) {
         if !self.is_multi_line() {
             for (range, text) in steps {
@@ -2321,17 +2330,19 @@ impl<M: InputModeKind> InputBaseState<M> {
         let old_text = self.text.clone();
         // what is alike before the first change and after the last
         let (mut head, mut tail) = (usize::MAX, usize::MAX);
+        let mut made = Vec::with_capacity(steps.len());
         for (range, text) in steps {
             let range = self.text.clip_offset(range.start, Bias::Left)
                 ..self.text.clip_offset(range.end, Bias::Right);
             head = head.min(range.start);
             tail = tail.min(self.text.len() - range.end);
+            made.push((range.clone(), text.len()));
             self.text.replace(range, text);
         }
         let range = head..old_text.len() - tail;
         let new_text = self.text.slice(head..self.text.len() - tail).to_string();
         M::adjust_annotations(self, &range, new_text.len());
-        self.follow_edit(&old_text, &range, &new_text, window, cx);
+        self.follow_edit(&old_text, &range, &new_text, &made, window, cx);
         self.ime_marked_range.take();
         self.preferred_column = None;
         self.update_search(cx);
@@ -2340,6 +2351,57 @@ impl<M: InputModeKind> InputBaseState<M> {
             cx.emit(InputEvent::Change);
         }
         cx.notify();
+    }
+
+    /// Put each of `edits` in, ranges of the text as it is, apart and the
+    /// last first, with what goes in each, as one step of undo of a change
+    /// apiece, and made as an undo makes its step (`replay`): the problems
+    /// move with each, so one between two stays on its text, and the rest
+    /// that follows the text takes one edit. The caret goes to the end of
+    /// the text, as the replace of the whole text this was put it. A
+    /// replace-all made the text anew in one change, so the underline of
+    /// a problem between two matches went with it, and went again with the
+    /// undo (elundqvist/kvist#370). A single line takes the edits as one
+    /// change of the whole, through its mask and its check.
+    pub(crate) fn replace_steps(
+        &mut self,
+        edits: &[(Range<usize>, &str)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if edits.is_empty() || !self.is_editable() {
+            return;
+        }
+        if !self.is_multi_line() {
+            let mut text = self.text.clone();
+            for (range, new) in edits {
+                text.replace(range.clone(), new);
+            }
+            let range = self.range_to_utf16(&(0..self.text.len()));
+            self.replace_text_in_range_silent(Some(range), &text.to_string(), window, cx);
+            return;
+        }
+        self.undo_manager.pending_intent.take();
+        let before = self.selected_range;
+        let len = edits.iter().fold(self.text.len() as isize, |len, (range, new)| {
+            len + new.len() as isize - range.len() as isize
+        });
+        let after = Selection::new(len as usize, len as usize);
+        // as undo keeps them: each on the text the ones before it left,
+        // which is the text as it is where it begins, as they are the last
+        // first
+        let changes: Vec<Change> = edits
+            .iter()
+            .map(|(range, new)| {
+                let range = self.text.clip_offset(range.start, Bias::Left)
+                    ..self.text.clip_offset(range.end, Bias::Right);
+                let old = self.text.slice(range.clone()).to_string();
+                Change::new(range.clone(), &old, range.start..range.start + new.len(), new, before, after)
+            })
+            .collect();
+        self.undo_manager.record_step(changes);
+        self.replay(edits, window, cx);
+        self.selected_range = after;
     }
 
     /// Get byte offset of the cursor.
@@ -2930,20 +2992,24 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     /// What follows the text through an edit, once the text has it:
-    /// `range` of `old_text`, the text before it, is `new_text` now. The
-    /// problems, the folds and the lines laid out are moved with it, and
-    /// the highlighter, the fold candidates and the language features take
-    /// it in.
+    /// `range` of `old_text`, the text before it, is `new_text` now, made
+    /// as `steps`, the changes in turn, each its range in the text the
+    /// ones before it left and how long what went there is. The problems
+    /// move with each change, and the folds and the lines laid out with
+    /// the edit, and the highlighter, the fold candidates and the language
+    /// features take it in.
     fn follow_edit(
         &mut self,
         old_text: &Rope,
         range: &Range<usize>,
         new_text: &str,
+        steps: &[(Range<usize>, usize)],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let text = self.text.clone();
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
-            diagnostics.reset(&self.text)
+            diagnostics.edit_steps(steps, &text)
         }
         // Adjust folds before updating wrap map: remove overlapping folds and shift others
         self.display_map
@@ -3170,7 +3236,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         // edit into the same change, which then carries the text and selection
         // of the first composition.
         self.undo_manager.commit_transaction();
-        self.follow_edit(&old_text, &range, new_text, window, cx);
+        self.follow_edit(&old_text, &range, new_text, &[(range.clone(), new_text.len())], window, cx);
         self.selected_range = (new_offset..new_offset).into();
         self.ime_marked_range.take();
         // The layout is older than the text now, so the caret's place in it
@@ -3246,7 +3312,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         }
 
         M::adjust_annotations(self, &range, new_text.len());
-        self.follow_edit(&old_text, &range, new_text, window, cx);
+        self.follow_edit(&old_text, &range, new_text, &[(range.clone(), new_text.len())], window, cx);
         if new_text.is_empty() {
             // Cancel selection, when cancel IME input.
             self.selected_range = (range.start..range.start).into();
@@ -4252,6 +4318,128 @@ mod tests {
         });
         cx.run_until_parked();
         cx.update(|_, cx| input.read_with(cx, |state, _| assert_caret_in_view(state, "a word deleted")));
+    }
+
+    /// The editor's problems move with what is typed above and before
+    /// them, and stay where they are for what is typed after them. They
+    /// were dropped at every edit and had to be handed back at every key
+    /// (elundqvist/kvist#370).
+    #[gpui::test]
+    fn test_problems_move_with_an_edit(cx: &mut TestAppContext) {
+        use crate::input::{Diagnostic, Position};
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("select a;\nselect b;\nselect c;\n", window, cx);
+                let set = state.diagnostics_mut().unwrap();
+                set.push(Diagnostic::new(Position::new(1, 7)..Position::new(1, 8), "b"));
+                set.push(Diagnostic::new(Position::new(2, 7)..Position::new(2, 8), "c"));
+            })
+        });
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                // a line put in above both, and a column before `c`
+                state.replace_text_in_range(Some(0..0), "-- note\n", window, cx);
+                let at = state.text.line_start_offset(3);
+                let at = state.range_to_utf16(&(at..at));
+                state.replace_text_in_range(Some(at), "  ", window, cx);
+                // and something after `b`, on its line
+                let end = state.text.line_end_offset(2);
+                let end = state.range_to_utf16(&(end..end));
+                state.replace_text_in_range(Some(end), " -- b", window, cx);
+                let marks: Vec<(String, String)> = state
+                    .diagnostics()
+                    .unwrap()
+                    .iter()
+                    .map(|d| (d.message.to_string(), state.text.slice(d.range.clone()).to_string()))
+                    .collect();
+                assert_eq!(marks, [("b".into(), "b".into()), ("c".into(), "c".into())]);
+                let at: Vec<Position> = state.diagnostics().unwrap().iter().map(|d| d.diagnostic.range.start).collect();
+                assert_eq!(at, [Position::new(2, 7), Position::new(3, 9)]);
+            })
+        });
+    }
+
+    /// A replace-all of the find bar, its undo and its redo leave a
+    /// problem between two matches on its text: each match is a change of
+    /// its own, in one step of undo, and the problems move with each. The
+    /// text was made anew in one change, from the first match to the last
+    /// for its undo, and the underline between them went with it until
+    /// the problems were handed again (elundqvist/kvist#370).
+    #[gpui::test]
+    fn test_problems_stay_between_the_matches_of_a_replace_all(cx: &mut TestAppContext) {
+        use crate::input::{Diagnostic, Position};
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let text = "fn main() {\n    let x: i32 = \"no\";\n    if x {\n    }\n}\n";
+        let marks = |state: &InputBaseState<EditorMode>| -> Vec<(String, Position)> {
+            state
+                .diagnostics()
+                .unwrap()
+                .iter()
+                .map(|d| (state.text.slice(d.range.clone()).to_string(), d.diagnostic.range.start))
+                .collect()
+        };
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(text, window, cx);
+                let set = state.diagnostics_mut().unwrap();
+                set.push(Diagnostic::new(Position::new(1, 17)..Position::new(1, 21), "expected i32"));
+                state.open_search(true, cx);
+                state.set_search_query("{", true, cx);
+            })
+        });
+        cx.run_until_parked();
+        let said = vec![("\"no\"".to_string(), Position::new(1, 17))];
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                assert_eq!(state.replace_all_search_matches("{ ", window, cx), 2);
+                assert_eq!(state.text.to_string(), text.replace('{', "{ "));
+                assert_eq!(marks(state), said, "the replace");
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.text.to_string(), text, "one step of undo");
+                assert_eq!(marks(state), said, "its undo");
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.text.to_string(), text.replace('{', "{ "));
+                assert_eq!(marks(state), said, "its redo");
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.text.to_string(), text);
+            })
+        });
+    }
+
+    /// A text set whole holds none of the old one's problems, by
+    /// `set_value` and by `replace_all`, so whoever hands them hands them
+    /// again. Moved by one edit over the whole, every one was left an
+    /// empty mark at the start, which the hover found, and Kvist took
+    /// them to be held still and handed none after Blame or a file read
+    /// again (elundqvist/kvist#370).
+    #[gpui::test]
+    fn test_a_text_set_whole_holds_no_problems(cx: &mut TestAppContext) {
+        use crate::input::{Diagnostic, Position};
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let mark = |state: &mut InputBaseState<EditorMode>| {
+            let set = state.diagnostics_mut().unwrap();
+            set.push(Diagnostic::new(Position::new(1, 7)..Position::new(1, 8), "b"));
+            assert_eq!(set.len(), 1);
+        };
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("select a;\nselect b;\n", window, cx);
+                mark(state);
+                state.set_value("select a;\nselect b;\n", window, cx);
+                assert_eq!(state.diagnostics().unwrap().len(), 0, "set_value");
+                assert!(state.diagnostics().unwrap().for_offset(0).is_none());
+                mark(state);
+                state.replace_all("select a;\nselect bb;\n", window, cx);
+                assert_eq!(state.diagnostics().unwrap().len(), 0, "replace_all");
+            })
+        });
     }
 
     /// Counts what an editor hands its highlighter: the edit of each update.

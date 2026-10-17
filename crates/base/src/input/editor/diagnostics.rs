@@ -201,6 +201,107 @@ impl DiagnosticSet {
         self.clear();
     }
 
+    /// Move the marks with an edit of the text: `range` of the text the
+    /// set was of is `new_len` bytes now, and `text` is the text after it
+    /// (`edit_steps`, of one step).
+    pub fn edit(&mut self, range: &Range<usize>, new_len: usize, text: &Rope) {
+        self.edit_steps(&[(range.clone(), new_len)], text)
+    }
+
+    /// Move the marks with edits made one after another, `steps`, each a
+    /// range of the text as the ones before it left it and how many bytes
+    /// went there, as an undo or a replace-all makes them; `text` is the
+    /// text after the last. A mark before them stays, one after them
+    /// moves with its text, and one between two of them stays on its
+    /// text; one an edit reached keeps what is left of it, an end in the
+    /// edit put at its edge, and one an edit took whole is dropped, as it
+    /// has nothing left to underline. None grows by what is typed at its
+    /// edges, as VS Code's markers do not. Dropped at every edit, a
+    /// thousand marks were handed back at every key and cost 1.8 ms of it
+    /// (elundqvist/kvist#370); moved by one edit from the first step to
+    /// the last, as the highlighter is handed an undo, a mark between two
+    /// of them went with the text that edit took. Whoever hands them is
+    /// to hand them again once it knows where the edits left them.
+    pub fn edit_steps(&mut self, steps: &[(Range<usize>, usize)], text: &Rope) {
+        let old = std::mem::replace(&mut self.text, text.clone());
+        if self.diagnostics.is_empty() || steps.is_empty() {
+            return;
+        }
+        let grown_by = |edits: &[(Range<usize>, usize)]| {
+            let mut grown = vec![0isize; edits.len() + 1];
+            for (k, (range, len)) in edits.iter().enumerate() {
+                grown[k + 1] = grown[k] + *len as isize - range.len() as isize;
+            }
+            grown
+        };
+        // the edits as edits of the text before them, where the steps are
+        // in order, as an undo's and a replace-all's are: an offset is
+        // looked up among them; in another order, it goes through each
+        let edits = apart(steps);
+        let grown = edits.as_deref().map(grown_by).unwrap_or_default();
+        let map = |at: usize, start: bool| match &edits {
+            Some(edits) => moved(at, start, edits, &grown),
+            None => steps.iter().fold(at, |at, step| {
+                moved(at, start, std::slice::from_ref(step), &grown_by(std::slice::from_ref(step)))
+            }),
+        };
+        // before the first edit a mark keeps its place as it was said;
+        // past the line the last ends on it keeps its column and moves by
+        // the lines the edits put in or took; between, its place is read
+        // again from the text
+        let first = match &edits {
+            Some(edits) => edits[0].0.start,
+            None => steps.iter().map(|(range, _)| range.start).min().unwrap_or(0),
+        };
+        let (past, rows) = match edits.as_deref().and_then(|edits| edits.last().map(|last| (edits.len() - 1, last))) {
+            Some((k, (range, len))) => {
+                let end_row = old.offset_to_point(range.end.min(old.len())).row;
+                let past = if end_row + 1 < old.lines_len() {
+                    old.line_start_offset(end_row + 1)
+                } else {
+                    usize::MAX
+                };
+                let new_end = (range.start as isize + grown[k]).max(0) as usize + len;
+                (past, text.offset_to_point(new_end.min(text.len())).row as i64 - end_row as i64)
+            }
+            None => (usize::MAX, 0),
+        };
+        let position = |was: usize, now: usize, said: Position| {
+            if was < first {
+                said
+            } else if was >= past {
+                Position::new((said.line as i64 + rows).max(0) as u32, said.character)
+            } else {
+                text.offset_to_position(now)
+            }
+        };
+        let mut entries: Vec<DiagnosticEntry> = self
+            .diagnostics
+            .iter()
+            .filter_map(|entry| {
+                let (from, to) = if entry.range.is_empty() {
+                    // a point stays a point, out of what is typed at it
+                    let at = map(entry.range.start, false);
+                    (at, at)
+                } else {
+                    (map(entry.range.start, true), map(entry.range.end, false))
+                };
+                if from >= to && !entry.range.is_empty() {
+                    return None;
+                }
+                let mut diagnostic = entry.diagnostic.clone();
+                diagnostic.range = position(entry.range.start, from, diagnostic.range.start)
+                    ..position(entry.range.end, to, diagnostic.range.end);
+                Some(DiagnosticEntry {
+                    range: from..to,
+                    diagnostic,
+                })
+            })
+            .collect();
+        entries.sort_by_key(|entry| (entry.range.start, entry.range.end));
+        self.diagnostics = SumTree::from_iter(entries, &());
+    }
+
     pub fn push(&mut self, diagnostic: impl Into<Diagnostic>) {
         let diagnostic = diagnostic.into();
         let start = self.text.position_to_offset(&diagnostic.range.start);
@@ -261,6 +362,51 @@ impl DiagnosticSet {
     }
 }
 
+/// `steps`, edits made one after another, each a range of the text as the
+/// ones before it left it and how many bytes went there, as edits of the
+/// text before the first of them, in order and apart, where the steps
+/// allow it: each beginning at or past where the one before it put its
+/// text, as a redo's do, or ending at or before where the one before it
+/// began, as an undo's and a replace-all's do. None for steps in another
+/// order, which overlap.
+pub(crate) fn apart(steps: &[(Range<usize>, usize)]) -> Option<Vec<(Range<usize>, usize)>> {
+    if steps.windows(2).all(|w| w[1].0.end <= w[0].0.start) {
+        return Some(steps.iter().rev().cloned().collect());
+    }
+    let (mut grown, mut past) = (0isize, 0usize);
+    let mut edits = Vec::with_capacity(steps.len());
+    for (range, len) in steps {
+        if range.start < past {
+            return None;
+        }
+        let back = |at: usize| (at as isize - grown).max(0) as usize;
+        edits.push((back(range.start)..back(range.end), *len));
+        grown += *len as isize - range.len() as isize;
+        past = range.start + len;
+    }
+    Some(edits)
+}
+
+/// Where `at`, an offset of the text before `edits` (as `apart` gives
+/// them), is after them, `grown[k]` being what the first `k` grew the text
+/// by: a start in an edit goes past what went there, an end in one to
+/// where it begins, and one at an edge stays out of it, so nothing grows
+/// by what is typed at its edges.
+fn moved(at: usize, start: bool, edits: &[(Range<usize>, usize)], grown: &[isize]) -> usize {
+    let k = edits.partition_point(|(range, _)| if start { range.end <= at } else { range.end < at });
+    let shift = |x: usize| (x as isize + grown[k]).max(0) as usize;
+    match edits.get(k) {
+        Some((range, len)) if range.start < at || (start && range.start == at) => {
+            if start {
+                shift(range.start) + len
+            } else {
+                shift(range.start)
+            }
+        }
+        _ => shift(at),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::input::Position;
@@ -315,5 +461,135 @@ mod tests {
 
         diagnostics.clear();
         assert_eq!(diagnostics.len(), 0);
+    }
+
+    /// Marks moved with an edit are what marks put where their text went
+    /// are, on the text after it: one above the edit stays, one after it
+    /// on its line moves along the line, one below moves with its line,
+    /// one the edit reached keeps what is left of it, and one it took
+    /// whole is dropped. They were dropped at every edit, and handed back
+    /// at every key (elundqvist/kvist#370).
+    #[test]
+    fn test_marks_move_with_an_edit() {
+        use ropey::Rope;
+
+        use super::{Diagnostic, DiagnosticSet};
+        use crate::input::RopeExt as _;
+
+        fn set(text: &str, marks: &[((u32, u32), (u32, u32))]) -> DiagnosticSet {
+            let mut set = DiagnosticSet::new(&Rope::from(text));
+            for (i, (from, to)) in marks.iter().enumerate() {
+                set.push(Diagnostic::new(
+                    Position::new(from.0, from.1)..Position::new(to.0, to.1),
+                    format!("mark {i}"),
+                ));
+            }
+            set
+        }
+        fn edit(set: &mut DiagnosticSet, text: &str, from: (u32, u32), to: (u32, u32), new: &str) -> String {
+            let rope = Rope::from(text);
+            let range = rope.position_to_offset(&Position::new(from.0, from.1))
+                ..rope.position_to_offset(&Position::new(to.0, to.1));
+            let edited = format!("{}{new}{}", &text[..range.start], &text[range.end..]);
+            set.edit(&range, new.len(), &Rope::from(edited.as_str()));
+            edited
+        }
+
+        let text = "fn a() {}\nlet x = 1;\nlet y = 2;\nlet z = 3;\n";
+        let mut moved = set(
+            text,
+            &[((0, 3), (0, 4)), ((1, 4), (1, 5)), ((2, 0), (2, 5)), ((2, 8), (2, 9)), ((3, 4), (3, 5))],
+        );
+        // two lines put in on the third, over `y = `
+        let text = edit(&mut moved, text, (2, 4), (2, 8), "w = 0;\nlet v = 1;\nlet u = ");
+        let marks = [((0, 3), (0, 4)), ((1, 4), (1, 5)), ((2, 0), (2, 4)), ((4, 8), (4, 9)), ((5, 4), (5, 5))];
+        assert_eq!(
+            moved.iter().map(|e| (e.range.clone(), e.diagnostic.range.clone())).collect::<Vec<_>>(),
+            set(&text, &marks).iter().map(|e| (e.range.clone(), e.diagnostic.range.clone())).collect::<Vec<_>>(),
+            "an edit above some and below others"
+        );
+        // the `z` below typed over, and a line taken above it
+        let text = edit(&mut moved, &text, (5, 4), (5, 5), "zz");
+        let text = edit(&mut moved, &text, (1, 0), (2, 0), "");
+        let marks = [((0, 3), (0, 4)), ((1, 0), (1, 4)), ((3, 8), (3, 9))];
+        assert_eq!(
+            moved.iter().map(|e| (e.range.clone(), e.diagnostic.range.clone())).collect::<Vec<_>>(),
+            set(&text, &marks).iter().map(|e| (e.range.clone(), e.diagnostic.range.clone())).collect::<Vec<_>>(),
+            "a mark typed over and a line taken"
+        );
+        let said: Vec<&str> = moved.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(said, ["mark 0", "mark 2", "mark 3"], "the `x` and the `z` taken whole");
+    }
+
+    /// The marks moved by the edits of an undo or a replace-all, made one
+    /// after another, are where each edit in turn puts them: one between
+    /// two of them stays on its text. Moved by one edit from the first to
+    /// the last, a problem's underline between two matches of a replace,
+    /// or two changes of an undo, went with the text that edit took, until
+    /// the problems were handed again (elundqvist/kvist#370).
+    #[test]
+    fn test_marks_move_with_edits_in_turn() {
+        use ropey::Rope;
+
+        use super::{apart, Diagnostic, DiagnosticSet};
+
+        // `lines` lines of 8 bytes, a mark over the second to fifth bytes
+        // of each other one
+        let lines = 40;
+        let text: String = (0..lines).map(|i| format!("line {i:02}\n")).collect();
+        let fresh = |text: &str| {
+            let mut set = DiagnosticSet::new(&Rope::from(text));
+            for i in (0..lines as u32).step_by(2) {
+                set.push(Diagnostic::new(Position::new(i, 1)..Position::new(i, 5), format!("mark {i}")));
+            }
+            set
+        };
+        let marks = |set: &DiagnosticSet| -> Vec<(String, std::ops::Range<usize>, std::ops::Range<Position>)> {
+            set.iter().map(|e| (e.message.to_string(), e.range.clone(), e.diagnostic.range.clone())).collect()
+        };
+        // each step in the text the ones before it left, and the text after
+        // each, from the last line up, from the first down, and in no order
+        let falling: Vec<(std::ops::Range<usize>, &str)> = (0..lines).rev().filter(|i| i % 4 == 1).map(|i| (i * 8 + 5..i * 8 + 7, "\nab\n")).collect();
+        let mut rising: Vec<(std::ops::Range<usize>, &str)> = Vec::new();
+        let mut grown = 0isize;
+        for i in (0..lines).filter(|i| i % 4 == 3) {
+            let at = (i as isize * 8 + grown) as usize;
+            rising.push((at..at + 4, "x"));
+            grown += 1 - 4;
+        }
+        let tangled: Vec<(std::ops::Range<usize>, &str)> = vec![(100..104, "zz\nzz"), (20..30, ""), (95..96, "q")];
+        for (what, steps) in [("falling", falling), ("rising", rising), ("tangled", tangled)] {
+            // each step in turn, with the text it leaves
+            let mut one_by_one = fresh(&text);
+            let mut now = text.clone();
+            for (range, new) in &steps {
+                now = format!("{}{new}{}", &now[..range.start], &now[range.end..]);
+                one_by_one.edit(range, new.len(), &Rope::from(now.as_str()));
+            }
+            let lengths: Vec<(std::ops::Range<usize>, usize)> = steps.iter().map(|(r, n)| (r.clone(), n.len())).collect();
+            assert_eq!(apart(&lengths).is_some(), what != "tangled", "{what}");
+            let mut at_once = fresh(&text);
+            at_once.edit_steps(&lengths, &Rope::from(now.as_str()));
+            assert_eq!(marks(&at_once), marks(&one_by_one), "{what}");
+            assert!(at_once.len() > lines / 4, "{what}: those between the edits kept");
+        }
+
+        // and a mark between the first change and the last keeps its range,
+        // where one edit over both took it: `{` replaced with `{ ` on the
+        // lines above and below it, the last match first
+        let text = "fn a() {\n    let x: i32 = \"no\";\n    if x {\n    }\n}\n";
+        let replaced = text.replace('{', "{ ");
+        let braces: Vec<usize> = text.match_indices('{').map(|(at, _)| at).collect();
+        let mut set = DiagnosticSet::new(&Rope::from(text));
+        set.push(Diagnostic::new(Position::new(1, 17)..Position::new(1, 21), "expected i32"));
+        let mut covered = set.clone();
+        let steps: Vec<(std::ops::Range<usize>, usize)> = braces.iter().rev().map(|&at| (at..at + 1, 2)).collect();
+        set.edit_steps(&steps, &Rope::from(replaced.as_str()));
+        let kept: Vec<&str> = set.iter().map(|e| &replaced[e.range.clone()]).collect();
+        assert_eq!(kept, ["\"no\""]);
+        assert_eq!(set.iter().next().unwrap().diagnostic.range, Position::new(1, 17)..Position::new(1, 21));
+        // one edit from the first to the last took it
+        covered.edit(&(braces[0]..braces[1] + 1), braces[1] + 3 - braces[0], &Rope::from(replaced.as_str()));
+        assert_eq!(covered.len(), 0);
     }
 }
