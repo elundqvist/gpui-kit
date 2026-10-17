@@ -37,7 +37,10 @@ members = [
 # version. The crates here do not: they build on the gpui-pre in Cargo.lock,
 # from crates.io, so their tests never run on its fixes. Its own tests run
 # from its directory; crates/gpui-pre/FORK.md says how, and what it changes.
-exclude = ["crates/gpui-pre"]
+# gpui-pre-linux, gpui's Linux platform (its X11 and Wayland clients), is
+# carried the same way for fixes to the X11 client;
+# crates/gpui-pre-linux/FORK.md says what they are.
+exclude = ["crates/gpui-pre", "crates/gpui-pre-linux"]
 resolver = "2"
 
 [workspace.package]
