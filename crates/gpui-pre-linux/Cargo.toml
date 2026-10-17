@@ -81,6 +81,12 @@ x11 = [
 name = "gpui_linux"
 path = "src/gpui_linux.rs"
 
+# Not in the published crate: added in elundqvist/gpui-kit (FORK.md).
+[[example]]
+name = "xdnd_source"
+path = "examples/xdnd_source.rs"
+required-features = ["x11"]
+
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.accesskit]
 version = "0.24.0"
 features = ["enumn"]

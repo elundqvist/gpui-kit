@@ -42,6 +42,28 @@ asks (section 4(b)); each says so at its top:
   answers go to the source the message names, where they went to the
   last `XdndEnter`'s, which is window 0, the pointer's window, when
   there was none. Tests of the drag state.
+- `Cargo.toml`: an `[[example]]` entry for `examples/xdnd_source.rs`,
+  which the fork adds (the published manifest names its targets and
+  has no examples).
+
+## Trying a drag by hand
+
+`examples/xdnd_source.rs` is an XDND drag source, since `xdotool`
+cannot be one: given a window id and the types to offer, it enters the
+window, moves to its centre, answers the request for the drag's data,
+prints whether the window accepted, and leaves or drops. On a display
+with a gpui window on it:
+
+    DISPLAY=:99 cargo run --locked --example xdnd_source -- \
+        "$(DISPLAY=:99 xdotool search --name <title> | head -1)" image/png
+    DISPLAY=:99 cargo run --locked --example xdnd_source -- <window id> \
+        text/uri-list --data file:///tmp/x.txt --drop
+
+The first should print `status: not accepted` and the application log
+nothing about it; the second `status: accepted`, `selection asked for
+in text/uri-list: answered` and `finished: accepted`. `--no-enter`
+sends the `XdndPosition` with no `XdndEnter` before it, and
+`--type-list` offers the types in `XdndTypeList`.
 
 ## Tests
 
