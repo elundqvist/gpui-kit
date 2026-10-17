@@ -1150,20 +1150,9 @@ impl X11Client {
                     return Some(());
                 };
                 if let Ok(file_list) = str::from_utf8(&reply.value) {
-                    let paths: SmallVec<[_; 2]> = file_list
-                        .lines()
-                        .filter_map(|path| Url::parse(path).log_err())
-                        .filter_map(|url| match url.to_file_path() {
-                            Ok(url) => Some(url),
-                            Err(()) => {
-                                log::error!("Failed turn {url:?} into a file path");
-                                None
-                            }
-                        })
-                        .collect();
                     let input = PlatformInput::FileDrop(FileDropEvent::Entered {
                         position,
-                        paths: gpui::ExternalPaths(paths),
+                        paths: gpui::ExternalPaths(xdnd_paths(file_list)),
                     });
                     drop(state);
                     window.handle_input(input);
@@ -2509,6 +2498,34 @@ fn check_gtk_frame_extents_supported(
     supported_atom_ids.contains(&atoms._GTK_FRAME_EXTENTS)
 }
 
+/// The files a drag's data names: its `file:` URLs, one a line, as
+/// `text/uri-list` has them (RFC 2483).
+///
+/// Changed in elundqvist/gpui-kit (elundqvist/kvist#218): every other line
+/// was logged as an error, "relative URL without a base" for a line of
+/// text and "Failed turn … into a file path" for a URL of another scheme,
+/// so a drag of text, which gpui takes as well, or of a link, filled the
+/// log with errors. Such lines name no file, which is no failure: they
+/// are passed over, and only counted at debug level.
+fn xdnd_paths(data: &str) -> SmallVec<[PathBuf; 2]> {
+    let mut passed_over = 0;
+    let paths = data
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            let path = Url::parse(line)
+                .ok()
+                .and_then(|url| url.to_file_path().ok());
+            passed_over += usize::from(path.is_none());
+            path
+        })
+        .collect();
+    if passed_over > 0 {
+        log::debug!("XDND data: passed over {passed_over} line(s) that name no file");
+    }
+    paths
+}
+
 fn xdnd_is_atom_supported(atom: u32, atoms: &XcbAtoms) -> bool {
     atom == atoms.TEXT
         || atom == atoms.STRING
@@ -3359,8 +3376,9 @@ mod tests {
 
 #[cfg(test)]
 mod xdnd_tests {
-    use super::{XdndDrags, XdndReply, xdnd_drag_type};
+    use super::{XdndDrags, XdndReply, xdnd_drag_type, xdnd_paths};
     use gpui::{Pixels, Point, point, px};
+    use std::{cell::RefCell, path::PathBuf};
 
     const WINDOW: u32 = 0x0400_0001;
     const OTHER_WINDOW: u32 = 0x0400_0002;
@@ -3566,5 +3584,67 @@ mod xdnd_tests {
             xdnd_drag_type(0, || panic!("the types of window 0 were asked for"), takes),
             0
         );
+    }
+
+    thread_local! {
+        /// What this thread logged at warning level or above, while a test
+        /// listens.
+        static LOUD: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+
+    struct Listener;
+
+    impl log::Log for Listener {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record) {
+            if record.level() <= log::Level::Warn {
+                LOUD.with_borrow_mut(|loud| {
+                    if let Some(loud) = loud {
+                        loud.push(record.args().to_string());
+                    }
+                });
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// What `f` logs at warning level or above.
+    fn loud<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        static LISTENER: Listener = Listener;
+        // another test's may be set already: its warnings are lost then,
+        // which only lets this test pass
+        if log::set_logger(&LISTENER).is_ok() {
+            log::set_max_level(log::LevelFilter::Trace);
+        }
+        LOUD.with_borrow_mut(|loud| *loud = Some(Vec::new()));
+        let value = f();
+        (
+            value,
+            LOUD.with_borrow_mut(|loud| loud.take().unwrap_or_default()),
+        )
+    }
+
+    /// A drag's files are its `file:` URLs; a line of text, a comment and
+    /// a URL of another scheme name none and are passed over, where each
+    /// was logged as an error, so a drag of text filled the log with them.
+    #[test]
+    fn a_drags_files_are_its_file_urls_and_other_lines_log_no_error() {
+        let (paths, logged) = loud(|| {
+            xdnd_paths(
+                "file:///tmp/a%20b.txt\r\n# a comment\r\nhttps://example.com/x\r\n\r\nfile:///tmp/c\r\n",
+            )
+        });
+        assert_eq!(
+            paths.as_slice(),
+            [PathBuf::from("/tmp/a b.txt"), PathBuf::from("/tmp/c")]
+        );
+        assert_eq!(logged, Vec::<String>::new());
+        let (paths, logged) = loud(|| xdnd_paths("hello world\nsecond line"));
+        assert!(paths.is_empty());
+        assert_eq!(logged, Vec::<String>::new());
     }
 }

@@ -42,6 +42,13 @@ asks (section 4(b)); each says so at its top:
   answers go to the source the message names, where they went to the
   last `XdndEnter`'s, which is window 0, the pointer's window, when
   there was none. Tests of the drag state.
+
+  A line of a drag's data that names no file, a line of text, a comment
+  or a URL of another scheme, is passed over and counted at debug level
+  (`xdnd_paths`): each was logged as an error, "relative URL without a
+  base" or "Failed turn … into a file path", so a drag of text, which
+  gpui takes as well, or of a link filled the log with them. Tested
+  with a listener for what is logged.
 - `Cargo.toml`: an `[[example]]` entry for `examples/xdnd_source.rs`,
   which the fork adds (the published manifest names its targets and
   has no examples).
