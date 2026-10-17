@@ -758,10 +758,14 @@ impl SyntaxHighlighter {
             new_end_position: Point::new(0, 0),
         });
 
-        let mut old_tree = self
-            .tree
-            .take()
-            .unwrap_or(self.parser.parse("", None).unwrap());
+        // The tree of the empty text is made only where there is no tree:
+        // made for every call, as `unwrap_or` made it, it was made before
+        // anything else, and on a parser a time limit had halted it went on
+        // with the halted parse instead.
+        let mut old_tree = match self.tree.take() {
+            Some(tree) => tree,
+            None => self.parser.parse("", None).unwrap(),
+        };
         old_tree.edit(&edit);
         self.edit_injection_layers(&edit);
         self.note_edit(&edit);
@@ -796,6 +800,12 @@ impl SyntaxHighlighter {
         );
 
         if timed_out || new_tree.is_none() {
+            // A halted parse is taken up again by the parser's next call,
+            // from the stack and the old tree it was halted with, over
+            // whatever text that call hands it, the tree that call hands it
+            // passed over (tree-sitter's `Parser::reset`): reset, the next
+            // call starts afresh from its own tree.
+            self.parser.reset();
             // Restore the old tree so highlighting continues with stale data.
             self.tree = Some(old_tree);
             self.text = text.clone();
@@ -2732,6 +2742,42 @@ $x = 1;
         ));
         let source = format!("{source} ");
         assert!(highlighter.update(None, &Rope::from_str(&source), None));
+        assert_eq!(
+            highlight_names(&highlighter, &source),
+            highlight_names(&fresh_highlighter("javascript", &source), &source)
+        );
+    }
+
+    /// A parse a time limit halted is not taken up again by the next call.
+    /// tree-sitter goes on with a halted parse at the parser's next call,
+    /// from the stack and the old tree it was halted with, over whatever
+    /// text that call hands it, until the parser is reset; and `unwrap_or`
+    /// made a tree of the empty text at every call, before anything else,
+    /// which went on with the halted parse instead, over the empty text and
+    /// with no limit.
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_a_halted_parse_is_not_resumed_on_the_next_edit() {
+        let source = format!("const greeting = \"hello\";\n{}", statements(0..3000));
+        let mut highlighter = fresh_highlighter("javascript", &source);
+        let resumed = Arc::new(AtomicBool::new(false));
+        let seen = resumed.clone();
+        highlighter.parser.set_logger(Some(Box::new(move |_, message| {
+            if message.starts_with("resume_parsing") {
+                seen.store(true, Ordering::Relaxed);
+            }
+        })));
+        let at = source.find("hello").unwrap();
+        let (edit, source) = replace(&source, at..at, "x");
+        assert!(!highlighter.update(Some(edit), &Rope::from_str(&source), Some(Duration::ZERO)));
+        let (edit, source) = replace(&source, at..at, "y");
+        assert!(!highlighter.update(Some(edit), &Rope::from_str(&source), Some(Duration::ZERO)));
+        let (edit, source) = replace(&source, at..at, "z");
+        assert!(highlighter.update(Some(edit), &Rope::from_str(&source), None));
+        assert!(
+            !resumed.load(Ordering::Relaxed),
+            "a parse a time limit halted was taken up again"
+        );
         assert_eq!(
             highlight_names(&highlighter, &source),
             highlight_names(&fresh_highlighter("javascript", &source), &source)
