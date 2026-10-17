@@ -30,6 +30,12 @@ const MAX_INJECTION_LANGUAGE_BYTES: usize = 64;
 const MAX_NON_COMBINED_INJECTION_PARSES: usize = 512;
 const INJECTION_PARSE_TIMEOUT: Duration = Duration::from_millis(20);
 
+#[cfg(test)]
+thread_local! {
+    /// How many injection layers this thread has parsed, for the tests.
+    static LAYER_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A syntax highlighter that supports incremental parsing, multiline text,
 /// and caching of highlight results.
 #[allow(unused)]
@@ -38,6 +44,9 @@ pub struct SyntaxHighlighter {
     query: Option<Query>,
     /// The full injections query. This is used to build injection layers during parsing.
     injections_query: Option<Arc<Query>>,
+    /// The kind of node each pattern of the injections query starts at
+    /// (`pattern_root_kinds`).
+    injection_roots: Arc<[Option<SharedString>]>,
 
     locals_pattern_index: usize,
     highlights_pattern_index: usize,
@@ -59,6 +68,10 @@ pub struct SyntaxHighlighter {
     /// Parsed injection trees.
     /// These are built once in update() and queried multiple times in match_styles().
     injection_layers: Vec<InjectionLayer>,
+    /// The layers are every span the last query over the whole text found,
+    /// each parsed to its end, and moved with the edits since: an edit
+    /// that reaches none of them leaves them as they are.
+    layers_whole: bool,
     /// How long one injected span may parse in update().
     injection_parse_timeout: Duration,
     /// `tree` was edited to the text but not parsed again, as it is while
@@ -99,6 +112,12 @@ pub(crate) struct InjectionLayer {
     /// to the text but not parsed again: what the edits touched is left
     /// plain until a parse of the span finishes.
     stale: bool,
+    /// Where the host's node the injection pattern matched lies
+    /// (`match_range`), moved with the edits as `ranges` are: an edit or a
+    /// change of the host's structure inside it may make the match or
+    /// unmake it, and one outside it cannot. `None` where the pattern's
+    /// node could not be told.
+    pub(crate) match_range: Option<tree_sitter::Range>,
 }
 
 /// Data needed to compute injection layers on a background thread.
@@ -115,6 +134,14 @@ pub(crate) struct InjectionParseData {
     pub(crate) parse_timeout: Option<Duration>,
     /// Stops every parse still running once it is set.
     pub(crate) cancel: Option<Arc<AtomicBool>>,
+    /// The kind of node each pattern of `query` starts at.
+    pub(crate) roots: Arc<[Option<SharedString>]>,
+    /// What the edits since the old layers were made reach in the host's
+    /// new tree, where `old_layers` are every span found then, each
+    /// parsed to its end: only this is queried again, and an old layer
+    /// whose match lies outside it is kept as it is. `None` queries the
+    /// whole text.
+    pub(crate) reach: Option<Range<usize>>,
 }
 
 pub(crate) struct ReusableInjectionLayer {
@@ -122,6 +149,7 @@ pub(crate) struct ReusableInjectionLayer {
     highlight_query: Arc<Query>,
     pub(crate) ranges: Vec<tree_sitter::Range>,
     pub(crate) tree: Tree,
+    pub(crate) match_range: Option<tree_sitter::Range>,
 }
 
 struct TextProvider<'a>(&'a Rope);
@@ -265,6 +293,64 @@ fn normalize_combined_injection_ranges(
     }
 
     normalized
+}
+
+/// The kind of node each pattern of an injection query starts at, read
+/// from the query's source: `(fenced_code_block …)` starts at a fence and
+/// `((html_block) @injection.content …)` at an HTML block. A pattern that
+/// starts at a wildcard, an alternation or a string has none, and so has
+/// one that is not one node with the rest within it (tree-sitter's
+/// `is_pattern_rooted`): `((comment) @injection.content . (function))`
+/// is two nodes side by side, and the match hangs on the second, outside
+/// the first, which holds every capture.
+fn pattern_root_kinds(query: &Query, source: &str) -> Vec<Option<SharedString>> {
+    (0..query.pattern_count())
+        .map(|i| {
+            if !query.is_pattern_rooted(i) {
+                return None;
+            }
+            let pattern = source.get(query.start_byte_for_pattern(i)..)?;
+            let name = pattern.trim_start_matches(|c: char| c == '(' || c.is_whitespace());
+            if !pattern[..pattern.len() - name.len()].contains('(') {
+                return None;
+            }
+            let kind = &name[..name
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(name.len())];
+            (!kind.is_empty() && kind != "_").then(|| SharedString::from(kind.to_string()))
+        })
+        .collect()
+}
+
+/// Where the node a match of an injection pattern starts at lies, or a
+/// node around it: the outermost node of the pattern's root kind on the way
+/// down from the root to the smallest node that holds every capture. The
+/// node the pattern matched is one of those, and the outermost holds it.
+/// Nothing outside it can make the match or unmake it but a change of the
+/// tree's structure, which the tree's changed ranges say.
+fn match_range(
+    root: tree_sitter::Node,
+    captures: &[tree_sitter::QueryCapture],
+    root_kind: Option<&str>,
+) -> Option<tree_sitter::Range> {
+    let root_kind = root_kind?;
+    let first = captures.first()?.node;
+    let (start, end) = captures.iter().fold((usize::MAX, 0), |(start, end), capture| {
+        (start.min(capture.node.start_byte()), end.max(capture.node.end_byte()))
+    });
+    let mut node = root;
+    loop {
+        if node.kind() == root_kind {
+            return Some(node.range());
+        }
+        if node.id() == first.id() {
+            return None;
+        }
+        match node.child_with_descendant(first) {
+            Some(child) if child.start_byte() <= start && end <= child.end_byte() => node = child,
+            _ => return None,
+        }
+    }
 }
 
 /// Whether a language's spans are parsed from scratch on every change,
@@ -417,6 +503,7 @@ impl SyntaxHighlighter {
             language,
             query: None,
             injections_query: None,
+            injection_roots: Arc::from([]),
             locals_pattern_index: 0,
             highlights_pattern_index: 0,
             non_local_variable_patterns: Vec::new(),
@@ -430,6 +517,7 @@ impl SyntaxHighlighter {
             parser: Parser::new(),
             tree: None,
             injection_layers: Vec::new(),
+            layers_whole: false,
             injection_parse_timeout: INJECTION_PARSE_TIMEOUT,
             stale: false,
             edited: Vec::new(),
@@ -487,6 +575,10 @@ impl SyntaxHighlighter {
         } else {
             None
         };
+        let injection_roots = injections_query
+            .as_ref()
+            .map_or_else(Vec::new, |q| pattern_root_kinds(q, &config.injections))
+            .into();
 
         // Injection layers are computed separately during parsing, so do not
         // emit injection captures from the main highlight query.
@@ -539,6 +631,7 @@ impl SyntaxHighlighter {
             language: config.name.clone(),
             query: Some(query),
             injections_query,
+            injection_roots,
 
             locals_pattern_index,
             highlights_pattern_index,
@@ -553,6 +646,7 @@ impl SyntaxHighlighter {
             parser,
             tree: None,
             injection_layers: Vec::new(),
+            layers_whole: false,
             injection_parse_timeout: INJECTION_PARSE_TIMEOUT,
             stale: false,
             edited: Vec::new(),
@@ -590,6 +684,7 @@ impl SyntaxHighlighter {
             None => {
                 self.tree = None;
                 self.injection_layers.clear();
+                self.layers_whole = false;
                 self.edited.clear();
             }
         }
@@ -693,6 +788,9 @@ impl SyntaxHighlighter {
             for range in &mut layer.ranges {
                 edit.edit_range(range);
             }
+            if let Some(range) = layer.match_range.as_mut() {
+                edit.edit_range(range);
+            }
             if let Some(byte_range) = bounding_byte_range(&layer.ranges) {
                 layer.byte_range = byte_range;
             }
@@ -749,6 +847,9 @@ impl SyntaxHighlighter {
             return true;
         }
 
+        // An edit of a text parsed before: what it reaches is all the
+        // injections need looked at again.
+        let edited = edit.is_some() && self.tree.is_some() && self.injections_query.is_some();
         let edit = edit.unwrap_or(InputEdit {
             start_byte: 0,
             old_end_byte: 0,
@@ -817,12 +918,32 @@ impl SyntaxHighlighter {
         self.tree = Some(new_tree.clone());
         self.stale = false;
         self.text = text.clone();
-        let injections_finished = self.parse_injection_layers(&new_tree);
+        let reach = edited.then(|| self.reach(&old_tree, &new_tree)).flatten();
+        let injections_finished = self.parse_injection_layers(&new_tree, reach);
         if injections_finished {
             self.edited.clear();
         }
         // Only a caller with a time limit parses again in the background.
         injections_finished || timeout.is_none()
+    }
+
+    /// What the edits since the last finished parse reach in `new_tree`,
+    /// parsed from `old_tree` edited by them: where they lie, a byte
+    /// either side, and where the two trees' structure differs. `None`
+    /// where the layers are not every span a whole query found, or nothing
+    /// was edited.
+    fn reach(&self, old_tree: &Tree, new_tree: &Tree) -> Option<Range<usize>> {
+        if !self.layers_whole {
+            return None;
+        }
+        let changed = old_tree.changed_ranges(new_tree).map(|r| r.start_byte..r.end_byte);
+        let (start, end) = self
+            .edited
+            .iter()
+            .cloned()
+            .chain(changed)
+            .fold((usize::MAX, 0), |(start, end), r| (start.min(r.start), end.max(r.end)));
+        (start <= end).then(|| start.saturating_sub(1)..(end + 1).min(self.text.len()))
     }
 
     /// Returns the data needed to compute injection layers on a background thread.
@@ -841,10 +962,13 @@ impl SyntaxHighlighter {
                     highlight_query: layer.highlight_query.clone(),
                     ranges: layer.ranges.clone(),
                     tree: layer.tree.clone(),
+                    match_range: layer.match_range,
                 })
                 .collect(),
             parse_timeout: Some(self.injection_parse_timeout),
             cancel: None,
+            roots: self.injection_roots.clone(),
+            reach: None,
         })
     }
 
@@ -852,11 +976,97 @@ impl SyntaxHighlighter {
     /// every span's parse finished in time.
     /// This is pure computation with no side effects and is safe to run on a
     /// background thread.
+    ///
+    /// With a `reach` (`InjectionParseData::reach`), an old layer whose
+    /// match lies outside it is kept as it is, its tree moved with the text
+    /// and not parsed again, and only the reach, grown over the matches of
+    /// the old layers it touches, is queried again. The query over the whole
+    /// text visits every node of it, and on a keystroke in a README of 190
+    /// KB it was nearly all of the keystroke: 9 ms of 10, the parse of the
+    /// host and of the layers the rest.
     pub(crate) fn compute_injection_layers(
         data: InjectionParseData,
         tree: &Tree,
         text: &Rope,
     ) -> (Vec<InjectionLayer>, bool) {
+        if let Some((span, kept)) = Self::layers_beyond(&data) {
+            let (mut layers, finished, parses) =
+                Self::query_injection_layers(&data, tree, text, Some(span));
+            let kept_count = kept.iter().filter(|kept| **kept).count();
+            // past the cap a whole query keeps only the first spans
+            if parses + kept_count < MAX_NON_COMBINED_INJECTION_PARSES {
+                for (layer, _) in data.old_layers.into_iter().zip(kept).filter(|(_, kept)| *kept) {
+                    let Some(byte_range) = bounding_byte_range(&layer.ranges) else {
+                        continue;
+                    };
+                    layers.push(InjectionLayer {
+                        language_name: layer.language_name,
+                        highlight_query: layer.highlight_query,
+                        ranges: layer.ranges,
+                        byte_range,
+                        tree: layer.tree,
+                        stale: false,
+                        match_range: layer.match_range,
+                    });
+                }
+                layers.sort_by_key(|layer| layer.byte_range.start);
+                return (layers, finished);
+            }
+        }
+        let (layers, finished, _) = Self::query_injection_layers(&data, tree, text, None);
+        (layers, finished)
+    }
+
+    /// The span a query must look at again for `data.reach`, and which of
+    /// the old layers are kept: the reach, grown over the match of every old
+    /// layer it touches, as that match is looked for again. `None` where
+    /// the whole text must be queried: no reach, a combined pattern, whose
+    /// one layer gathers spans from all over the text, an old layer whose
+    /// match is not known, or as many as the cap.
+    fn layers_beyond(data: &InjectionParseData) -> Option<(Range<usize>, Vec<bool>)> {
+        let mut span = data.reach.clone()?;
+        let combined = (0..data.query.pattern_count()).any(|i| {
+            data.query
+                .property_settings(i)
+                .iter()
+                .any(|prop| prop.key.as_ref() == "injection.combined")
+        });
+        if combined || data.old_layers.len() >= MAX_NON_COMBINED_INJECTION_PARSES {
+            return None;
+        }
+        let matched = data
+            .old_layers
+            .iter()
+            .map(|layer| layer.match_range.map(|r| r.start_byte..r.end_byte))
+            .collect::<Option<Vec<_>>>()?;
+        let mut kept = vec![true; matched.len()];
+        loop {
+            let mut grown = false;
+            for (range, kept) in matched.iter().zip(kept.iter_mut()) {
+                if *kept && range.start <= span.end && span.start <= range.end {
+                    *kept = false;
+                    if range.start < span.start || range.end > span.end {
+                        span = span.start.min(range.start)..span.end.max(range.end);
+                        grown = true;
+                    }
+                }
+            }
+            if !grown {
+                return Some((span, kept));
+            }
+        }
+    }
+
+    /// Query the injections of `tree`, over the whole of it or over `span`,
+    /// and parse a layer for each: the layers, whether every span's parse
+    /// finished in time, and how many spans that are not combined were
+    /// parsed, which the cap counts.
+    fn query_injection_layers(
+        data: &InjectionParseData,
+        tree: &Tree,
+        text: &Rope,
+        span: Option<Range<usize>>,
+    ) -> (Vec<InjectionLayer>, bool, usize) {
         struct CombinedRanges {
             ranges: Vec<tree_sitter::Range>,
             byte_count: usize,
@@ -935,6 +1145,9 @@ impl SyntaxHighlighter {
 
         let root_node = tree.root_node();
         let mut cursor = QueryCursor::new();
+        if let Some(span) = span {
+            cursor.set_byte_range(span);
+        }
         let mut matches = cursor.matches(&data.query, root_node, TextProvider(text));
 
         let mut combined_ranges: HashMap<SharedString, CombinedRanges> = HashMap::new();
@@ -1063,16 +1276,18 @@ impl SyntaxHighlighter {
 
                 non_combined_parses += 1;
                 let old_tree = old_tree_for(&language_name, &ranges, false);
+                let root_kind = data.roots.get(query_match.pattern_index).cloned().flatten();
+                let match_range = match_range(root_node, query_match.captures, root_kind.as_deref());
                 if let Some(layer) = Self::parse_injection_layer(
                     &language_name,
                     highlight_query,
                     ranges,
                     old_tree,
                     text,
-                    &data,
+                    data,
                     &mut finished,
                 ) {
-                    new_layers.push(layer);
+                    new_layers.push(InjectionLayer { match_range, ..layer });
                 }
             }
         }
@@ -1097,14 +1312,14 @@ impl SyntaxHighlighter {
                 ranges,
                 old_tree,
                 text,
-                &data,
+                data,
                 &mut finished,
             ) {
                 new_layers.push(layer);
             }
         }
         new_layers.sort_by_key(|layer| layer.byte_range.start);
-        (new_layers, finished)
+        (new_layers, finished, non_combined_parses)
     }
 
     /// Parse one injection layer over the given included ranges, from the
@@ -1129,6 +1344,8 @@ impl SyntaxHighlighter {
         let mut parser = Parser::new();
         parser.set_language(config.language.as_ref()?).ok()?;
         parser.set_included_ranges(&ranges).ok()?;
+        #[cfg(test)]
+        LAYER_PARSES.with(|parses| parses.set(parses.get() + 1));
         let parse_start = Instant::now();
         let mut timed_out = false;
         let mut progress = |_: &tree_sitter::ParseState| -> ControlFlow<()> {
@@ -1181,6 +1398,7 @@ impl SyntaxHighlighter {
             byte_range,
             tree,
             stale,
+            match_range: None,
         })
     }
 
@@ -1202,19 +1420,23 @@ impl SyntaxHighlighter {
         self.tree = Some(tree);
         self.stale = false;
         self.injection_layers = injection_layers;
+        self.layers_whole = true;
         self.edited.clear();
     }
 
     /// Parse injection layers after the main tree is updated, and return
-    /// whether every span's parse finished in time.
+    /// whether every span's parse finished in time. With a `reach`, only
+    /// what it reaches is queried again (`InjectionParseData::reach`).
     /// pattern: parse once in update, query many times in render.
-    fn parse_injection_layers(&mut self, tree: &Tree) -> bool {
+    fn parse_injection_layers(&mut self, tree: &Tree, reach: Option<Range<usize>>) -> bool {
         let Some(data) = self.injection_parse_data() else {
             self.injection_layers.clear();
             return true;
         };
+        let data = InjectionParseData { reach, ..data };
         let (layers, finished) = Self::compute_injection_layers(data, tree, &self.text.clone());
         self.injection_layers = layers;
+        self.layers_whole = finished;
         finished
     }
 
@@ -2782,6 +3004,258 @@ $x = 1;
             highlight_names(&highlighter, &source),
             highlight_names(&fresh_highlighter("javascript", &source), &source)
         );
+    }
+
+    /// Markdown with injections for fences, HTML blocks and front matter
+    /// and none for inline syntax, as Kvist has it: the inline layer is one
+    /// layer over every paragraph, combined, and a query with a combined
+    /// pattern is always made over the whole text.
+    #[cfg(feature = "tree-sitter-languages")]
+    fn markdown_blocks() -> &'static str {
+        const INJECTIONS: &str = r#"
+(fenced_code_block
+  (info_string
+    (language) @injection.language)
+  (code_fence_content) @injection.content)
+
+((html_block) @injection.content (#set! injection.language "html"))
+
+((minus_metadata) @injection.content (#set! injection.language "yaml"))
+"#;
+        let registry = LanguageRegistry::singleton();
+        if registry.language("markdown-blocks").is_none() {
+            let markdown = registry.language("markdown").unwrap();
+            registry.register(
+                "markdown-blocks",
+                &crate::highlighter::LanguageConfig::new(
+                    "markdown-blocks",
+                    markdown.language.clone().unwrap(),
+                    vec![],
+                    &markdown.highlights,
+                    INJECTIONS,
+                    "",
+                ),
+            );
+        }
+        "markdown-blocks"
+    }
+
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_pattern_root_kinds_are_read_from_the_query() {
+        let markdown = LanguageRegistry::singleton().language("markdown").unwrap();
+        let query = Query::new(markdown.language.as_ref().unwrap(), &markdown.injections).unwrap();
+        let roots = pattern_root_kinds(&query, &markdown.injections);
+        let roots = roots.iter().map(|r| r.as_deref()).collect::<Vec<_>>();
+        assert_eq!(
+            roots,
+            [
+                Some("fenced_code_block"),
+                Some("html_block"),
+                Some("document"),
+                Some("minus_metadata"),
+                Some("plus_metadata"),
+                Some("inline"),
+            ]
+        );
+        let html = LanguageRegistry::singleton().language("html").unwrap();
+        let source = concat!(
+            "[(script_element) (style_element)] @injection.content\n",
+            "((_) @injection.content)\n",
+            // two nodes side by side: the match hangs on the element, which
+            // holds no capture, as much as on the comment
+            "((comment) @injection.content . (element))\n",
+            "((comment) @injection.content)\n",
+        );
+        let query = Query::new(html.language.as_ref().unwrap(), source).unwrap();
+        assert_eq!(
+            pattern_root_kinds(&query, source),
+            [None, None, None, Some(SharedString::from("comment"))]
+        );
+    }
+
+    /// A keystroke looks for injections again only where the edits since
+    /// the last finished parse reach, and keeps the layers beyond, their
+    /// trees moved with the text and not parsed again: looked for over the
+    /// whole text at every key, a README of 190 KB spent 9 ms of each
+    /// keystroke's 10 on the query (elundqvist/kvist#43).
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_a_keystroke_keeps_the_layers_its_edit_does_not_reach() {
+        let language = markdown_blocks();
+        let source: String = (0..6)
+            .map(|i| format!("```rust\nfn function_{i}() {{}}\n```\n\nProse about function {i}.\n\n"))
+            .collect();
+        let mut highlighter = fresh_highlighter(language, &source);
+        assert_eq!(highlighter.injection_layers.len(), 6);
+        let parses = || LAYER_PARSES.with(|parses| parses.get());
+
+        let at = source.find("about function 2").unwrap();
+        let (edit, source) = replace(&source, at..at, "x");
+        let before = parses();
+        assert!(highlighter.update(Some(edit), &Rope::from_str(&source), Some(Duration::MAX)));
+        assert_eq!(
+            parses() - before,
+            0,
+            "a layer the edit does not reach was looked for and parsed again"
+        );
+        assert_eq!(highlighter.injection_layers.len(), 6);
+        assert_eq!(
+            highlight_names(&highlighter, &source),
+            highlight_names(&fresh_highlighter(language, &source), &source)
+        );
+
+        // an edit in a fence parses that fence again, and it alone
+        let at = source.find("function_4").unwrap();
+        let (edit, source) = replace(&source, at..at, "x");
+        let before = parses();
+        assert!(highlighter.update(Some(edit), &Rope::from_str(&source), Some(Duration::MAX)));
+        assert_eq!(parses() - before, 1);
+        assert_eq!(highlighter.injection_layers.len(), 6);
+        assert_eq!(
+            highlight_names(&highlighter, &source),
+            highlight_names(&fresh_highlighter(language, &source), &source)
+        );
+    }
+
+    /// A keystroke whose parse ran out of time leaves its edit to the next
+    /// one that finishes, which looks for the layers as far as both reach:
+    /// the edit in a fence a halted keystroke made is parsed into its layer,
+    /// with the prose typed after it far away, and no layer is left stale;
+    /// and the other way round, a halted keystroke in prose, then one in a
+    /// fence.
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_a_keystroke_after_one_out_of_time_looks_where_both_reach() {
+        let language = markdown_blocks();
+        let prose: String = (0..200)
+            .map(|i| format!("Paragraph {i} says *something* about a [link](#{i}).\n\n"))
+            .collect();
+        let source: String = (0..6)
+            .map(|i| format!("```rust\nfn function_{i}() {{}}\n```\n\nProse about function {i}.\n\n{prose}"))
+            .collect();
+        let parses = || LAYER_PARSES.with(|parses| parses.get());
+        // (where the halted keystroke types, what, then where the one with
+        // time types, what, and how many fences lie between the two, both
+        // included): a number typed between the braces is a number only in
+        // the layer parsed again
+        let orders: [(&str, &str, &str, &str, usize); 2] = [
+            ("fn function_1() {", " 0x7f ", "about function 4", "x", 4),
+            ("about function 1", "x", "fn function_4() {", " 0x7f ", 3),
+        ];
+        for (halted_at, halted, timed_at, timed, fences) in orders {
+            let mut highlighter = fresh_highlighter(language, &source);
+            assert_eq!(highlighter.injection_layers.len(), 6);
+
+            let at = source.find(halted_at).unwrap() + halted_at.len();
+            let (edit, edited) = replace(&source, at..at, halted);
+            assert!(
+                !highlighter.update(Some(edit), &Rope::from_str(&edited), Some(Duration::ZERO)),
+                "the host's parse was to run out of time"
+            );
+            assert!(highlighter.injection_layers.iter().all(|layer| layer.stale));
+
+            let at = edited.find(timed_at).unwrap() + timed_at.len();
+            let (edit, edited) = replace(&edited, at..at, timed);
+            let before = parses();
+            assert!(highlighter.update(Some(edit), &Rope::from_str(&edited), Some(Duration::MAX)));
+            // the fences from the first edit to the second, and no others
+            assert_eq!(parses() - before, fences, "after {halted:?} at {halted_at:?}");
+            assert!(highlighter.injection_layers.iter().all(|layer| !layer.stale));
+            let fresh = fresh_highlighter(language, &edited);
+            let names = highlight_names(&highlighter, &edited);
+            assert_eq!(names, highlight_names(&fresh, &edited), "after {halted:?} at {halted_at:?}");
+            let number = edited.find(" 0x7f ").unwrap() + 1;
+            assert!(
+                names.iter().any(|(range, _)| *range == (number..number + 4)),
+                "the number typed in a fence is not coloured: {names:?}"
+            );
+        }
+    }
+
+    /// The layers after each edit, which a keystroke looks for only where
+    /// its edits reach, are the ones a query over the whole text finds:
+    /// an edit of a fence's language, one that takes the language away or
+    /// opens or shuts a fence, front matter, an HTML block, a script's type.
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_layers_looked_for_where_an_edit_reaches_match_a_whole_query() {
+        fn layers(highlighter: &SyntaxHighlighter) -> Vec<(String, Vec<Range<usize>>)> {
+            highlighter
+                .injection_layers
+                .iter()
+                .map(|layer| {
+                    let ranges = layer.ranges.iter().map(|r| r.start_byte..r.end_byte);
+                    (layer.language_name.to_string(), ranges.collect())
+                })
+                .collect()
+        }
+        let markdown = concat!(
+            "---\ntitle: notes\n---\n\n",
+            "Prose before.\n\n",
+            "```rust\nfn first() {}\n```\n\n",
+            "<div class=\"note\">\nhi\n</div>\n\n",
+            "More prose.\n\n",
+            "```js\nconst second = 2;\n```\n\n",
+            "Prose after.\n",
+        );
+        // (what to find, where in it, what to put there: an empty find is
+        // the text's end)
+        let markdown_edits: &[(&str, usize, usize, &str)] = &[
+            ("```rust", 3, 7, "python"),
+            ("```python", 3, 9, ""),
+            ("```\nfn first", 3, 3, "rust"),
+            ("title", 0, 0, "x"),
+            ("Prose before.", 0, 0, "```json\n"),
+            ("```json\n", 8, 8, "{\"a\": 1}\n```\n\n"),
+            ("<div class", 1, 4, "span"),
+            ("hi\n", 0, 2, "<b>bold</b>"),
+            ("More prose.", 0, 0, "```"),
+            ("```More", 0, 3, ""),
+            ("const second", 6, 12, "third"),
+            ("```\n\nProse after", 0, 3, ""),
+            ("", 0, 0, "\n```\n"),
+            ("Prose after", 0, 5, "Text"),
+        ];
+        let html = concat!(
+            "<p>hi</p>\n",
+            "<script>\nconst first = 1;\n</script>\n",
+            "<style>\n.a { color: red; }\n</style>\n",
+            "<script>\nconst last = 2;\n</script>\n",
+        );
+        let html_edits: &[(&str, usize, usize, &str)] = &[
+            ("<p>hi", 3, 5, "hello"),
+            ("<style>", 1, 6, "script"),
+            ("</style>", 2, 7, "script"),
+            ("<script>\nconst last", 7, 7, " "),
+            ("const first", 0, 5, "let"),
+            ("</script>\n<script>", 0, 0, "<p>between</p>"),
+        ];
+        for (language, source, edits) in [
+            (markdown_blocks(), markdown, markdown_edits),
+            ("html", html, html_edits),
+        ] {
+            let mut source = source.to_string();
+            let mut highlighter = fresh_highlighter(language, &source);
+            for (find, from, to, put) in edits {
+                let at = if find.is_empty() {
+                    source.len()
+                } else {
+                    source.find(find).unwrap_or_else(|| panic!("{find:?} in {source:?}"))
+                };
+                let (edit, edited) = replace(&source, at + from..at + to, put);
+                source = edited;
+                highlighter.injection_parse_timeout = Duration::MAX;
+                assert!(highlighter.update(Some(edit), &Rope::from_str(&source), Some(Duration::MAX)));
+                let fresh = fresh_highlighter(language, &source);
+                assert_eq!(layers(&highlighter), layers(&fresh), "{language}, after {put:?} at {find:?}: {source:?}");
+                assert_eq!(
+                    highlight_names(&highlighter, &source),
+                    highlight_names(&fresh, &source),
+                    "{language}, after {put:?} at {find:?}: {source:?}"
+                );
+            }
+        }
     }
 
     /// The inline layer after an edit is what a fresh parse of the text
