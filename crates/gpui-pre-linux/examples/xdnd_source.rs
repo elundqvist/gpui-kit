@@ -93,7 +93,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(|name| intern(name))
         .collect::<Result<_, _>>()?;
 
-    // of any type: gpui gives it the type of an atom it names "XA_ATOM"
+    // of any type, as GTK and Qt read it: the published gpui-pre-linux
+    // gives it the type of an atom it names "XA_ATOM", not ATOM
     let aware = conn
         .get_property(false, target, atoms.aware, AtomEnum::ANY, 0, 1)?
         .reply()?;

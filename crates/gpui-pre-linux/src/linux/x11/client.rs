@@ -1857,13 +1857,17 @@ impl LinuxClient for X11Client {
             supports_xinput_gestures,
             is_bgr,
         )?;
+        // Changed in elundqvist/gpui-kit: of the type ATOM, as the XDND
+        // protocol has it, where it had that of an atom interned by the name
+        // "XA_ATOM", which a source that reads the property by its type
+        // would not find.
         check_reply(
             || "Failed to set XdndAware property",
             state.xcb_connection.change_property32(
                 xproto::PropMode::REPLACE,
                 x_window,
                 state.atoms.XdndAware,
-                state.atoms.XA_ATOM,
+                AtomEnum::ATOM,
                 &[5],
             ),
         )

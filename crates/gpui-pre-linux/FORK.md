@@ -49,6 +49,11 @@ asks (section 4(b)); each says so at its top:
   base" or "Failed turn … into a file path", so a drag of text, which
   gpui takes as well, or of a link filled the log with them. Tested
   with a listener for what is logged.
+
+  A window's `XdndAware` is of the type `ATOM`, as the XDND protocol
+  has it, where it had the type of an atom interned by the name
+  "XA_ATOM" (`xprop` showed `XdndAware(XA_ATOM)`), which a source that
+  reads the property by its type would not find.
 - `Cargo.toml`: an `[[example]]` entry for `examples/xdnd_source.rs`,
   which the fork adds (the published manifest names its targets and
   has no examples).
