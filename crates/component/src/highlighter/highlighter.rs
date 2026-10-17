@@ -142,6 +142,10 @@ pub(crate) struct InjectionParseData {
     /// whose match lies outside it is kept as it is. `None` queries the
     /// whole text.
     pub(crate) reach: Option<Range<usize>>,
+    /// The spans of a paragraph language (`injection_spans_are_paragraphs`)
+    /// have `parse_timeout` between them, not each: they are made on the UI
+    /// thread, by an update with a time limit.
+    pub(crate) paragraphs_share_timeout: bool,
 }
 
 pub(crate) struct ReusableInjectionLayer {
@@ -150,6 +154,9 @@ pub(crate) struct ReusableInjectionLayer {
     pub(crate) ranges: Vec<tree_sitter::Range>,
     pub(crate) tree: Tree,
     pub(crate) match_range: Option<tree_sitter::Range>,
+    /// No edit has reached the layer's text since its tree was parsed to
+    /// its end: the text it was parsed from is the text there now.
+    intact: bool,
 }
 
 struct TextProvider<'a>(&'a Rope);
@@ -369,6 +376,32 @@ fn match_range(
 /// the old tree), so this layer gains nothing by reuse but the wrong colour.
 /// Its old tree is still what a span keeps when a parse runs out of time.
 fn injection_parses_from_scratch(language_name: &str) -> bool {
+    language_name == "markdown_inline"
+}
+
+/// Whether a language's spans, where its pattern is not combined, are a
+/// document's paragraphs, a layer each: Markdown's inline syntax as
+/// tree-sitter-md's own query injects it, one layer to every paragraph,
+/// heading and table cell, so that a backtick or a `*` left open in one
+/// paragraph pairs with nothing in the next (elundqvist/kvist#54). A README
+/// has hundreds of them and a CHANGELOG thousands, each a few hundred bytes
+/// that parse in a fraction of a millisecond: the 373 of a README of 190 KB
+/// in 60 ms, the longest in 0.3.
+///
+/// - They are not counted against `MAX_NON_COMBINED_INJECTION_PARSES`, which
+///   bounds spans that may each take their 20 ms: counted, a README's
+///   paragraphs used it up, the fences after them went plain, and every
+///   keystroke looked for injections over the whole text.
+/// - On an update with a time limit they share one span's time limit
+///   between them (`InjectionParseData::paragraphs_share_timeout`): a
+///   keystroke that turns a fence back into prose would otherwise parse all
+///   the prose after it on the UI thread. What is left over keeps its old
+///   tree, stale, until the background parse.
+/// - One whose ranges are as they were and whose text no edit has reached
+///   since its parse keeps its tree and is not parsed again: parsed from
+///   scratch as they are (`injection_parses_from_scratch`), the whole query
+///   of the background parse parsed them all.
+fn injection_spans_are_paragraphs(language_name: &str) -> bool {
     language_name == "markdown_inline"
 }
 
@@ -919,7 +952,8 @@ impl SyntaxHighlighter {
         self.stale = false;
         self.text = text.clone();
         let reach = edited.then(|| self.reach(&old_tree, &new_tree)).flatten();
-        let injections_finished = self.parse_injection_layers(&new_tree, reach);
+        let injections_finished =
+            self.parse_injection_layers(&new_tree, reach, timeout.is_some());
         if injections_finished {
             self.edited.clear();
         }
@@ -963,12 +997,18 @@ impl SyntaxHighlighter {
                     ranges: layer.ranges.clone(),
                     tree: layer.tree.clone(),
                     match_range: layer.match_range,
+                    // the edits since the last finished parse hold every
+                    // edit a layer's tree has not seen, its edges included
+                    intact: !self.edited.iter().any(|r| {
+                        r.start <= layer.byte_range.end && layer.byte_range.start <= r.end
+                    }),
                 })
                 .collect(),
             parse_timeout: Some(self.injection_parse_timeout),
             cancel: None,
             roots: self.injection_roots.clone(),
             reach: None,
+            paragraphs_share_timeout: false,
         })
     }
 
@@ -992,7 +1032,13 @@ impl SyntaxHighlighter {
         if let Some((span, kept)) = Self::layers_beyond(&data) {
             let (mut layers, finished, parses) =
                 Self::query_injection_layers(&data, tree, text, Some(span));
-            let kept_count = kept.iter().filter(|kept| **kept).count();
+            let kept_count = kept
+                .iter()
+                .zip(&data.old_layers)
+                .filter(|(kept, layer)| {
+                    **kept && !injection_spans_are_paragraphs(&layer.language_name)
+                })
+                .count();
             // past the cap a whole query keeps only the first spans
             if parses + kept_count < MAX_NON_COMBINED_INJECTION_PARSES {
                 for (layer, _) in data.old_layers.into_iter().zip(kept).filter(|(_, kept)| *kept) {
@@ -1022,7 +1068,7 @@ impl SyntaxHighlighter {
     /// layer it touches, as that match is looked for again. `None` where
     /// the whole text must be queried: no reach, a combined pattern, whose
     /// one layer gathers spans from all over the text, an old layer whose
-    /// match is not known, or as many as the cap.
+    /// match is not known, or as many as the cap counts.
     fn layers_beyond(data: &InjectionParseData) -> Option<(Range<usize>, Vec<bool>)> {
         let mut span = data.reach.clone()?;
         let combined = (0..data.query.pattern_count()).any(|i| {
@@ -1031,7 +1077,12 @@ impl SyntaxHighlighter {
                 .iter()
                 .any(|prop| prop.key.as_ref() == "injection.combined")
         });
-        if combined || data.old_layers.len() >= MAX_NON_COMBINED_INJECTION_PARSES {
+        let counted = data
+            .old_layers
+            .iter()
+            .filter(|layer| !injection_spans_are_paragraphs(&layer.language_name))
+            .count();
+        if combined || counted >= MAX_NON_COMBINED_INJECTION_PARSES {
             return None;
         }
         let matched = data
@@ -1145,25 +1196,36 @@ impl SyntaxHighlighter {
 
         let root_node = tree.root_node();
         let mut cursor = QueryCursor::new();
-        if let Some(span) = span {
+        if let Some(span) = span.clone() {
             cursor.set_byte_range(span);
         }
         let mut matches = cursor.matches(&data.query, root_node, TextProvider(text));
 
         let mut combined_ranges: HashMap<SharedString, CombinedRanges> = HashMap::new();
+        // A span the query finds over `span` lies across it, and so does an
+        // old layer of the same ranges: the rest, a paragraph layer to every
+        // paragraph of a long document, are kept or gone and need no key
+        let within_span = |layer: &&ReusableInjectionLayer| {
+            span.as_ref().is_none_or(|span| {
+                bounding_byte_range(&layer.ranges)
+                    .is_some_and(|range| range.start <= span.end && span.start <= range.end)
+            })
+        };
         let old_layer_trees: HashMap<_, _> = data
             .old_layers
             .iter()
+            .filter(within_span)
             .map(|layer| {
                 (
                     (layer.language_name.clone(), ranges_cache_key(&layer.ranges)),
-                    &layer.tree,
+                    layer,
                 )
             })
             .collect();
         let front_moved_old_layer_trees: HashMap<_, _> = data
             .old_layers
             .iter()
+            .filter(within_span)
             .map(|layer| {
                 (
                     (layer.language_name.clone(), front_moved_key(&layer.ranges)),
@@ -1178,12 +1240,25 @@ impl SyntaxHighlighter {
             |language_name: &SharedString, ranges: &[tree_sitter::Range], combined: bool| {
                 let exact = old_layer_trees.get(&(language_name.clone(), ranges_cache_key(ranges)));
                 if exact.is_some() || combined {
-                    return exact.copied();
+                    return exact.map(|layer| &layer.tree);
                 }
                 front_moved_old_layer_trees
                     .get(&(language_name.clone(), front_moved_key(ranges)))
                     .copied()
             };
+        // a paragraph's old tree, where its ranges are as they were and no
+        // edit has reached its text: what a parse of it would give again
+        let intact_tree_for = |language_name: &SharedString, ranges: &[tree_sitter::Range]| {
+            old_layer_trees
+                .get(&(language_name.clone(), ranges_cache_key(ranges)))
+                .filter(|layer| layer.intact)
+                .map(|layer| layer.tree.clone())
+        };
+        // what is left of the time the paragraphs share, where they share it
+        let mut paragraphs_left = data
+            .paragraphs_share_timeout
+            .then_some(data.parse_timeout)
+            .flatten();
         let mut finished = true;
         // Query objects are relatively expensive. Reuse one Arc per language
         // from the previous parse and compile only languages present in this
@@ -1215,8 +1290,14 @@ impl SyntaxHighlighter {
                 }
             }
 
+            // a paragraph's span is not counted (`injection_spans_are_paragraphs`)
+            let paragraph = !combined
+                && language_name
+                    .as_ref()
+                    .is_some_and(|name| injection_spans_are_paragraphs(name));
             // Skip rather than break, so later combined ranges are still collected.
-            if !combined && non_combined_parses >= MAX_NON_COMBINED_INJECTION_PARSES {
+            if !combined && !paragraph && non_combined_parses >= MAX_NON_COMBINED_INJECTION_PARSES
+            {
                 continue;
             }
 
@@ -1274,19 +1355,65 @@ impl SyntaxHighlighter {
                     continue;
                 }
 
-                non_combined_parses += 1;
-                let old_tree = old_tree_for(&language_name, &ranges, false);
                 let root_kind = data.roots.get(query_match.pattern_index).cloned().flatten();
                 let match_range = match_range(root_node, query_match.captures, root_kind.as_deref());
-                if let Some(layer) = Self::parse_injection_layer(
-                    &language_name,
-                    highlight_query,
-                    ranges,
-                    old_tree,
-                    text,
-                    data,
-                    &mut finished,
-                ) {
+                if !paragraph {
+                    non_combined_parses += 1;
+                } else if let Some(tree) = intact_tree_for(&language_name, &ranges) {
+                    if let Some(byte_range) = bounding_byte_range(&ranges) {
+                        new_layers.push(InjectionLayer {
+                            language_name,
+                            highlight_query,
+                            ranges,
+                            byte_range,
+                            tree,
+                            stale: false,
+                            match_range,
+                        });
+                    }
+                    continue;
+                }
+                let old_tree = old_tree_for(&language_name, &ranges, false);
+                let timeout = if paragraph && paragraphs_left.is_some() {
+                    paragraphs_left
+                } else {
+                    data.parse_timeout
+                };
+                // the paragraphs' time is spent: the rest keep their old
+                // trees, stale, for the background parse, and are not
+                // begun, a parser made for nothing for each of thousands
+                let began = Instant::now();
+                let layer = if timeout.is_some_and(|timeout| timeout.is_zero()) && paragraph {
+                    finished = false;
+                    old_tree.cloned().and_then(|tree| {
+                        Some(InjectionLayer {
+                            language_name: language_name.clone(),
+                            highlight_query,
+                            byte_range: bounding_byte_range(&ranges)?,
+                            ranges,
+                            tree,
+                            stale: true,
+                            match_range: None,
+                        })
+                    })
+                } else {
+                    let (layer, done) = Self::parse_injection_layer(
+                        &language_name,
+                        highlight_query,
+                        ranges,
+                        old_tree,
+                        text,
+                        data,
+                        timeout,
+                    );
+                    finished &= done;
+                    layer
+                };
+                if paragraph {
+                    paragraphs_left =
+                        paragraphs_left.map(|left| left.saturating_sub(began.elapsed()));
+                }
+                if let Some(layer) = layer {
                     new_layers.push(InjectionLayer { match_range, ..layer });
                 }
             }
@@ -1306,15 +1433,17 @@ impl SyntaxHighlighter {
             let Some(highlight_query) = highlight_queries.get(&language_name).cloned() else {
                 continue;
             };
-            if let Some(layer) = Self::parse_injection_layer(
+            let (layer, done) = Self::parse_injection_layer(
                 &language_name,
                 highlight_query,
                 ranges,
                 old_tree,
                 text,
                 data,
-                &mut finished,
-            ) {
+                data.parse_timeout,
+            );
+            finished &= done;
+            if let Some(layer) = layer {
                 new_layers.push(layer);
             }
         }
@@ -1326,11 +1455,12 @@ impl SyntaxHighlighter {
     /// span's old tree (edited to the text) when there is one and the
     /// language's incremental parse can be trusted (`injection_parses_from_scratch`).
     ///
-    /// A parse that runs out of the data's `parse_timeout`, or is cancelled,
-    /// clears `finished` and keeps the old tree as a stale layer, so the span
-    /// keeps its last highlights where the edits did not touch it until a
-    /// parse of it finishes, instead of going plain; a span with no old tree
-    /// is left out.
+    /// A parse that runs out of `timeout` (the data's `parse_timeout`, or
+    /// what the paragraphs have left of it), or is cancelled, says so (the
+    /// second of what it returns is false) and keeps the old tree as a
+    /// stale layer, so the span keeps its last highlights where the edits
+    /// did not touch it until a parse of it finishes, instead of going
+    /// plain; a span with no old tree is left out.
     fn parse_injection_layer(
         language_name: &SharedString,
         highlight_query: Arc<Query>,
@@ -1338,20 +1468,25 @@ impl SyntaxHighlighter {
         old_tree: Option<&Tree>,
         text: &Rope,
         data: &InjectionParseData,
-        finished: &mut bool,
-    ) -> Option<InjectionLayer> {
-        let config = LanguageRegistry::singleton().language(language_name)?;
+        timeout: Option<Duration>,
+    ) -> (Option<InjectionLayer>, bool) {
+        let Some(config) = LanguageRegistry::singleton().language(language_name) else {
+            return (None, true);
+        };
         let mut parser = Parser::new();
-        parser.set_language(config.language.as_ref()?).ok()?;
-        parser.set_included_ranges(&ranges).ok()?;
+        let Some(language) = config.language.as_ref() else {
+            return (None, true);
+        };
+        if parser.set_language(language).is_err() || parser.set_included_ranges(&ranges).is_err()
+        {
+            return (None, true);
+        }
         #[cfg(test)]
         LAYER_PARSES.with(|parses| parses.set(parses.get() + 1));
         let parse_start = Instant::now();
         let mut timed_out = false;
         let mut progress = |_: &tree_sitter::ParseState| -> ControlFlow<()> {
-            if data
-                .parse_timeout
-                .is_some_and(|timeout| parse_start.elapsed() > timeout)
+            if timeout.is_some_and(|timeout| parse_start.elapsed() > timeout)
                 || data
                     .cancel
                     .as_ref()
@@ -1384,14 +1519,13 @@ impl SyntaxHighlighter {
         );
         let (tree, stale) = match new_tree {
             Some(tree) if !timed_out => (tree, false),
-            _ => {
-                *finished = false;
-                (old_tree?.clone(), true)
-            }
+            _ => match old_tree {
+                Some(tree) => (tree.clone(), true),
+                None => return (None, false),
+            },
         };
 
-        let byte_range = bounding_byte_range(&ranges)?;
-        Some(InjectionLayer {
+        let layer = bounding_byte_range(&ranges).map(|byte_range| InjectionLayer {
             language_name: language_name.clone(),
             highlight_query,
             ranges,
@@ -1399,7 +1533,8 @@ impl SyntaxHighlighter {
             tree,
             stale,
             match_range: None,
-        })
+        });
+        (layer, !stale)
     }
 
     /// Apply a tree that was parsed on a background thread.
@@ -1426,14 +1561,25 @@ impl SyntaxHighlighter {
 
     /// Parse injection layers after the main tree is updated, and return
     /// whether every span's parse finished in time. With a `reach`, only
-    /// what it reaches is queried again (`InjectionParseData::reach`).
+    /// what it reaches is queried again (`InjectionParseData::reach`), and
+    /// where the update has a time limit, the paragraphs share theirs
+    /// (`InjectionParseData::paragraphs_share_timeout`).
     /// pattern: parse once in update, query many times in render.
-    fn parse_injection_layers(&mut self, tree: &Tree, reach: Option<Range<usize>>) -> bool {
+    fn parse_injection_layers(
+        &mut self,
+        tree: &Tree,
+        reach: Option<Range<usize>>,
+        timed: bool,
+    ) -> bool {
         let Some(data) = self.injection_parse_data() else {
             self.injection_layers.clear();
             return true;
         };
-        let data = InjectionParseData { reach, ..data };
+        let data = InjectionParseData {
+            reach,
+            paragraphs_share_timeout: timed,
+            ..data
+        };
         let (layers, finished) = Self::compute_injection_layers(data, tree, &self.text.clone());
         self.injection_layers = layers;
         self.layers_whole = finished;
@@ -3353,6 +3499,207 @@ $x = 1;
         assert_eq!(
             highlight_names(&highlighter, &source),
             highlight_names(&fresh_highlighter("markdown", &source), &source)
+        );
+    }
+
+    /// Markdown as Kvist registers it (elundqvist/kvist#54): the blocks of
+    /// `markdown_blocks`, and the inline syntax of every paragraph, heading
+    /// and table cell a layer of its own, as tree-sitter-md's own query has
+    /// it, not one combined layer over them all.
+    #[cfg(feature = "tree-sitter-languages")]
+    fn markdown_by_paragraph() -> &'static str {
+        let registry = LanguageRegistry::singleton();
+        if registry.language("markdown-by-paragraph").is_none() {
+            let blocks = registry.language(markdown_blocks()).unwrap();
+            let injections = format!(
+                "{}{}",
+                blocks.injections,
+                r#"
+((inline) @injection.content
+  (#set! injection.language "markdown_inline")
+  (#set! injection.include-children))
+
+((pipe_table_cell) @injection.content
+  (#set! injection.language "markdown_inline")
+  (#set! injection.include-children))
+"#
+            );
+            registry.register(
+                "markdown-by-paragraph",
+                &crate::highlighter::LanguageConfig::new(
+                    "markdown-by-paragraph",
+                    blocks.language.clone().unwrap(),
+                    vec![],
+                    &blocks.highlights,
+                    &injections,
+                    "",
+                ),
+            );
+        }
+        "markdown-by-paragraph"
+    }
+
+    /// What the editor's background parse does with the edits a keystroke
+    /// left it: the host parsed again from its edited tree, then the
+    /// layers, each with all the time it needs.
+    #[cfg(feature = "tree-sitter-languages")]
+    fn parse_in_background(highlighter: &mut SyntaxHighlighter) -> bool {
+        let text = highlighter.text().clone();
+        let config = LanguageRegistry::singleton()
+            .language(highlighter.language())
+            .unwrap();
+        let mut parser = Parser::new();
+        parser.set_language(config.language.as_ref().unwrap()).unwrap();
+        let tree = parser
+            .parse(text.to_string(), highlighter.tree())
+            .unwrap();
+        let data = InjectionParseData {
+            parse_timeout: None,
+            ..highlighter.injection_parse_data().unwrap()
+        };
+        let (layers, finished) = SyntaxHighlighter::compute_injection_layers(data, &tree, &text);
+        highlighter.apply_background_tree(tree, &text, layers);
+        finished
+    }
+
+    /// A paragraph's inline syntax is read alone: a backtick or a `*` left
+    /// open in one pairs with nothing in the next, list items next to each
+    /// other are read apart, and a table's cells too. Combined into one
+    /// layer, the stray backtick took everything up to the next one in the
+    /// next paragraph for a code span, and the code spans after it were
+    /// read inside out (elundqvist/kvist#54).
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_a_paragraph_of_markdown_is_read_alone() {
+        let source = concat!(
+            "Press the ` key.\n\nThen run `foo` and `bar`, *one star.\n\nThen *em* here.\n\n",
+            "- `one`\n- `two`\n\nLater `four`\n\n",
+            "| `--jobs` | [x](http://y) |\n|---|---|\n| `8` | **z** |\n",
+        );
+        let highlighter = fresh_highlighter(markdown_by_paragraph(), source);
+        let highlights = highlighter.match_styles(0..source.len());
+        for (text, name) in [
+            ("`foo`", "text.code.span"),
+            ("`bar`", "text.code.span"),
+            ("*em*", "emphasis"),
+            ("`one`", "text.code.span"),
+            ("`two`", "text.code.span"),
+            ("`four`", "text.code.span"),
+            ("`--jobs`", "text.code.span"),
+            ("`8`", "text.code.span"),
+            ("x", "link_text"),
+            ("http://y", "link_uri"),
+            ("**z**", "emphasis.strong"),
+        ] {
+            assert!(
+                has_highlight_covering(&highlights, source, text, name),
+                "{text:?} is no {name}"
+            );
+        }
+        for text in ["key.", "Then run", ", *one", "Later"] {
+            let start = source.find(text).unwrap();
+            assert!(
+                !highlights.iter().any(|item| {
+                    item.range.start < start + text.len()
+                        && start < item.range.end
+                        && ["text.code.span", "emphasis"].contains(&item.name.as_ref())
+                }),
+                "{text:?} is read as part of a span or an emphasis"
+            );
+        }
+    }
+
+    /// Paragraphs are not counted against the cap on spans parsed: a
+    /// CHANGELOG's thousand items each have their layer, and so has the
+    /// fence after them, where the cap left all past the 512th plain. A
+    /// keystroke in one item looks only where it reaches and parses that
+    /// item's layer alone, and asks for no background parse.
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_paragraphs_are_not_counted_against_the_cap() {
+        const ITEMS: usize = MAX_NON_COMBINED_INJECTION_PARSES + 200;
+        let language = markdown_by_paragraph();
+        let source = format!(
+            "# Changelog\n\n{}\n```rust\nfn last() {{}}\n```\n",
+            (0..ITEMS)
+                .map(|i| format!("- fix `foo_{i}` in [#{i}](http://x/{i}) and *note*\n"))
+                .collect::<String>()
+        );
+        let mut highlighter = fresh_highlighter(language, &source);
+        assert_eq!(highlighter.injection_layers.len(), ITEMS + 1);
+        let highlights = highlighter.match_styles(0..source.len());
+        let last = format!("`foo_{}`", ITEMS - 1);
+        assert!(has_highlight_covering(&highlights, &source, &last, "text.code.span"));
+        assert!(has_highlight_covering(&highlights, &source, "last", "function"));
+
+        let parses = || LAYER_PARSES.with(|parses| parses.get());
+        let at = source.find("foo_300`").unwrap();
+        let (edit, source) = replace(&source, at..at, "x");
+        let before = parses();
+        assert!(highlighter.update(Some(edit), &Rope::from_str(&source), Some(Duration::MAX)));
+        assert_eq!(parses() - before, 1, "the item typed into is parsed, and it alone");
+        assert_eq!(
+            highlight_names(&highlighter, &source),
+            highlight_names(&fresh_highlighter(language, &source), &source)
+        );
+    }
+
+    /// On an update with a time limit the paragraphs share one span's time
+    /// between them, and once it is spent the rest are not begun: each keeps
+    /// its old tree, stale, its untouched colours with it, and the update
+    /// asks for the background parse. That parse parses only what an edit
+    /// reached and keeps every other paragraph's tree as it is: parsed from
+    /// scratch, all of them, it took a README's background parse 60 ms more.
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_paragraphs_share_a_keystrokes_time() {
+        let language = markdown_by_paragraph();
+        let source: String = (0..30)
+            .map(|i| format!("Paragraph {i} with *em{i}* and `c{i}`.\n\n"))
+            .collect();
+        let mut highlighter = fresh_highlighter(language, &source);
+        let parses = || LAYER_PARSES.with(|parses| parses.get());
+
+        // the time spent: the paragraph typed into keeps its old tree
+        let at = source.find("Paragraph 5 ").unwrap() + "Paragraph 5 ".len();
+        let (edit, source) = replace(&source, at..at, "x");
+        let before = parses();
+        assert!(!update_out_of_time(&mut highlighter, edit, &source));
+        assert_eq!(parses() - before, 0, "a paragraph was begun with no time left");
+        assert_eq!(highlighter.injection_layers.len(), 30);
+        let highlights = highlighter.match_styles(0..source.len());
+        for text in ["em4", "c5", "em6"] {
+            assert!(
+                highlights
+                    .iter()
+                    .any(|item| item.range.start <= source.find(text).unwrap()
+                        && source.find(text).unwrap() < item.range.end),
+                "{text:?} lost its colour"
+            );
+        }
+
+        // the background parse parses the one an edit reached
+        let before = parses();
+        assert!(parse_in_background(&mut highlighter));
+        assert_eq!(parses() - before, 1);
+        assert_eq!(
+            highlight_names(&highlighter, &source),
+            highlight_names(&fresh_highlighter(language, &source), &source)
+        );
+
+        // prose that was a fence: none has a layer to keep, and the
+        // background parse makes them all
+        let fenced = format!("~~~\n{source}~~~\n");
+        let mut highlighter = fresh_highlighter(language, &fenced);
+        assert_eq!(highlighter.injection_layers.len(), 0);
+        let (edit, source) = replace(&fenced, 0..4, "");
+        assert!(!update_out_of_time(&mut highlighter, edit, &source));
+        assert_eq!(highlighter.injection_layers.len(), 0);
+        assert!(parse_in_background(&mut highlighter));
+        assert_eq!(highlighter.injection_layers.len(), 30);
+        assert_eq!(
+            highlight_names(&highlighter, &source),
+            highlight_names(&fresh_highlighter(language, &source), &source)
         );
     }
 
