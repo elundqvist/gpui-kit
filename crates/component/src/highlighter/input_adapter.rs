@@ -213,6 +213,35 @@ impl InputHighlighter for TreeSitterInputHighlighter {
     }
 }
 
+/// `each` of the named children of `node` that `bytes` may reach: from
+/// the first that ends past its start, which the cursor finds down the
+/// tree's own balanced runs of siblings, to the last that begins before
+/// its end. Every child was walked to find them: a keystroke in a file of
+/// 35,000 functions walked all 35,000 for its fold candidates, 8 to 9 ms
+/// of every key (elundqvist/kvist#370).
+fn for_children_reached<'t>(
+    node: tree_sitter::Node<'t>,
+    bytes: &Range<usize>,
+    mut each: impl FnMut(tree_sitter::Node<'t>),
+) {
+    let mut cursor = node.walk();
+    if cursor.goto_first_child_for_byte(bytes.start).is_none() {
+        return;
+    }
+    loop {
+        let child = cursor.node();
+        if child.start_byte() >= bytes.end {
+            break;
+        }
+        if child.is_named() {
+            each(child);
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+}
+
 fn to_tree_sitter_edit(edit: BaseInputEdit) -> InputEdit {
     InputEdit {
         start_byte: edit.start_byte,
@@ -242,19 +271,88 @@ fn extract_fold_ranges_in_range(
             return;
         }
         ranges.push(FoldRange::new(start, end));
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            collect(child, bytes, ranges);
-        }
+        for_children_reached(node, bytes, |child| collect(child, bytes, ranges));
     }
 
     let root = tree.root_node();
     let mut ranges = Vec::new();
-    let mut cursor = root.walk();
-    for child in root.named_children(&mut cursor) {
-        collect(child, &byte_range, &mut ranges);
-    }
+    for_children_reached(root, &byte_range, |child| {
+        collect(child, &byte_range, &mut ranges)
+    });
     ranges.sort_by_key(|range| range.start_line);
     ranges.dedup_by_key(|range| range.start_line);
     ranges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What the whole walk found: every named child walked, and those the
+    /// range does not reach passed over.
+    #[cfg(feature = "tree-sitter-languages")]
+    fn walked_whole(tree: &tree_sitter::Tree, bytes: Range<usize>) -> Vec<FoldRange> {
+        fn collect(node: tree_sitter::Node, bytes: &Range<usize>, ranges: &mut Vec<FoldRange>) {
+            if node.end_byte() <= bytes.start || node.start_byte() >= bytes.end {
+                return;
+            }
+            let (start, end) = (node.start_position().row, node.end_position().row);
+            if end.saturating_sub(start) < 2 {
+                return;
+            }
+            ranges.push(FoldRange::new(start, end));
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect(child, bytes, ranges);
+            }
+        }
+        let root = tree.root_node();
+        let mut ranges = Vec::new();
+        let mut cursor = root.walk();
+        for child in root.named_children(&mut cursor) {
+            collect(child, &bytes, &mut ranges);
+        }
+        ranges.sort_by_key(|range| range.start_line);
+        ranges.dedup_by_key(|range| range.start_line);
+        ranges
+    }
+
+    /// An edit's fold candidates are those of the whole text it reaches,
+    /// found by looking at the children it reaches and no others: in a
+    /// file of 35,000 functions every one was walked at every key, 8 to
+    /// 9 ms of it (elundqvist/kvist#370).
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_an_edit_looks_only_at_the_children_it_reaches() {
+        let function = |i: usize| format!("fn f{i}() {{\n    if {i} > 1 {{\n        let v = {i};\n\n    }}\n}}\n");
+        let source: String = (0..5_000).map(function).collect();
+        let config = LanguageRegistry::singleton().language("rust").unwrap();
+        let mut parser = Parser::new();
+        parser.set_language(config.language.as_ref().unwrap()).unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        assert_eq!(extract_fold_ranges(&tree).len(), 10_000, "a function and its `if` each");
+
+        let at = (0..2_500).map(|i| function(i).len()).sum::<usize>() + "fn f2500() {\n    if".len();
+        let ranges = [
+            at..at,
+            at..at + 40,
+            at - 30..at + 300,
+            0..0,
+            0..source.len(),
+            source.len()..source.len(),
+            source.len() - 3..source.len(),
+        ];
+        for range in ranges {
+            assert_eq!(
+                extract_fold_ranges_in_range(&tree, range.clone()),
+                walked_whole(&tree, range.clone()),
+                "{range:?}"
+            );
+        }
+        let mut looked_at = Vec::new();
+        for_children_reached(tree.root_node(), &(at..at + 1), |child| {
+            looked_at.push(child.start_position().row)
+        });
+        assert_eq!(looked_at, [2_500 * 6], "the function typed in, of 5,000");
+    }
 }
