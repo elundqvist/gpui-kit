@@ -114,6 +114,10 @@ version = "1.10"
 [dependencies.wgpu]
 version = "29.0.4"
 
+[dev-dependencies.naga]
+version = "29.0.4"
+features = ["wgsl-in"]
+
 [target.'cfg(target_family = "wasm")'.dependencies.web-sys]
 version = "0.3"
 features = ["HtmlCanvasElement"]

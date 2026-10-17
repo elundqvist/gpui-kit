@@ -1533,6 +1533,7 @@ dependencies = [
  "gpui-pre-util",
  "itertools 0.14.0",
  "log",
+ "naga",
  "parking_lot",
  "profiling",
  "raw-window-handle",

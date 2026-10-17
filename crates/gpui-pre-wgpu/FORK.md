@@ -15,9 +15,13 @@ which asks for `=0.3.3`, takes it when an application patches it in.
 
 ## What is changed
 
-None yet. Each file changed from the published crate will say so at
-its top and be listed here, as the Apache License 2.0 asks (section
-4(b)).
+The files changed from the published crate, as the Apache License 2.0
+asks (section 4(b)):
+
+- `Cargo.toml` and `Cargo.lock`: `naga`, at the version wgpu already
+  brings, as a dev-dependency with `wgsl-in`. The renderer's tests
+  validate its shaders with it, and the published manifest, which
+  leaves out zed's dev-dependencies, did not let them build.
 
 ## Tests
 
