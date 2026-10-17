@@ -290,6 +290,10 @@ pub struct PopupMenu {
     /// own focus path (through the trigger element's ancestors).
     pub(crate) previous_focus_handle: Option<FocusHandle>,
     selected_index: Option<usize>,
+    /// Whether the pointer resting on it lit the highlighted item, not the
+    /// keyboard: `rebuild` keeps the one the keyboard lit by its label and
+    /// the one the pointer lit where the pointer is.
+    selected_by_pointer: bool,
     min_width: Option<Pixels>,
     max_width: Option<Pixels>,
     max_height: Option<Pixels>,
@@ -330,6 +334,7 @@ impl PopupMenu {
             parent_menu: None,
             menu_items: Vec::new(),
             selected_index: None,
+            selected_by_pointer: false,
             min_width: None,
             max_width: None,
             max_height: None,
@@ -724,17 +729,56 @@ impl PopupMenu {
     /// })
     /// .detach();
     /// ```
+    ///
+    /// An item the keyboard highlighted stays highlighted where the rebuilt
+    /// menu still has an item of its label that can be chosen, wherever it
+    /// now stands and scrolled into view, so a menu rebuilt while it is open
+    /// keeps the keyboard's place in it; where it has none, nothing is
+    /// highlighted. An item the pointer highlighted is the row under the
+    /// pointer, whatever it now says, as a click there would take it.
     pub fn rebuild(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
         f: impl FnOnce(Self, &mut Window, &mut Context<Self>) -> Self,
     ) {
+        let kept = self.selected_index.and_then(|ix| {
+            self.menu_items
+                .get(ix)
+                .and_then(|item| item.a11y_label())
+                .map(|label| (ix, label))
+        });
+        let by_pointer = self.selected_by_pointer;
         let mut menu = std::mem::replace(self, Self::new(cx));
         menu.menu_items.clear();
         menu.selected_index = None;
         *self = f(menu, window, cx);
+        self.selected_index = kept.and_then(|(ix, label)| {
+            if by_pointer {
+                self.menu_items
+                    .get(ix)
+                    .is_some_and(|item| item.is_clickable())
+                    .then_some(ix)
+            } else {
+                self.clickable_index_of(ix, &label)
+            }
+        });
+        self.selected_by_pointer = by_pointer && self.selected_index.is_some();
+        if let Some(ix) = self.selected_index.filter(|_| !by_pointer) {
+            self.scroll_handle.scroll_to_item(ix);
+        }
         cx.notify();
+    }
+
+    /// The index of an item labelled `label` that can be chosen: `was`, where
+    /// the item there is one, else the first.
+    fn clickable_index_of(&self, was: usize, label: &SharedString) -> Option<usize> {
+        let labelled =
+            |item: &PopupMenuItem| item.is_clickable() && item.a11y_label().as_ref() == Some(label);
+        if self.menu_items.get(was).is_some_and(labelled) {
+            return Some(was);
+        }
+        self.menu_items.iter().position(labelled)
     }
 
     fn add_menu_item(
@@ -876,7 +920,20 @@ impl PopupMenu {
         window.dispatch_action(action.boxed_clone(), cx);
     }
 
+    fn hover_item(&mut self, ix: usize, hovered: bool, is_submenu: bool, cx: &mut Context<Self>) {
+        if hovered {
+            self.selected_index = Some(ix);
+            self.selected_by_pointer = true;
+        } else if !is_submenu && self.selected_index == Some(ix) {
+            // TODO: Better handle the submenu unselection when hover out
+            self.selected_index = None;
+        }
+
+        cx.notify();
+    }
+
     fn set_selected_index(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.selected_by_pointer = false;
         if self.selected_index != Some(ix) {
             self.selected_index = Some(ix);
             self.scroll_handle.scroll_to_item(ix);
@@ -1198,14 +1255,7 @@ impl PopupMenu {
             .items_center()
             .selected(selected)
             .on_hover(cx.listener(move |this, hovered, _, cx| {
-                if *hovered {
-                    this.selected_index = Some(ix);
-                } else if !is_submenu && this.selected_index == Some(ix) {
-                    // TODO: Better handle the submenu unselection when hover out
-                    this.selected_index = None;
-                }
-
-                cx.notify();
+                this.hover_item(ix, *hovered, is_submenu, cx)
             }))
             .when_some(item.a11y_label(), |this, label| this.aria_label(label));
 
@@ -1494,5 +1544,81 @@ mod tests {
         );
         assert_eq!(PopupMenuItem::separator().a11y_label(), None);
         assert_eq!(PopupMenuItem::element(|_, _| div()).a11y_label(), None);
+    }
+
+    fn items(menu: PopupMenu, labels: &[&'static str]) -> PopupMenu {
+        labels.iter().fold(menu, |menu, label| match *label {
+            "-" => menu.separator(),
+            label if label.starts_with('~') => {
+                menu.item(PopupMenuItem::new(&label[1..]).disabled(true))
+            }
+            label => menu.item(PopupMenuItem::new(label)),
+        })
+    }
+
+    /// A menu rebuilt while it is open, because what it lists changed, kept
+    /// its items' identity but lost the highlighted one, so a user moving
+    /// through it with the arrow keys was put back before its first item
+    /// (elundqvist/kvist#316). The highlight follows the item's label to where
+    /// it now stands, and goes where no item of that label can be chosen.
+    #[gpui::test]
+    fn rebuild_keeps_the_highlighted_item_by_its_label(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::init);
+        let (menu, cx) =
+            cx.add_window_view(|_, cx| items(PopupMenu::new(cx), &["Alpha", "Beta", "Gamma"]));
+        let rebuild = |cx: &mut gpui::VisualTestContext, labels: &'static [&'static str]| {
+            cx.update(|window, cx| {
+                menu.update(cx, |menu, cx| {
+                    menu.rebuild(window, cx, |menu, _, _| items(menu, labels));
+                    menu.selected_index
+                })
+            })
+        };
+
+        menu.update(cx, |menu, cx| menu.set_selected_index(1, cx));
+        assert_eq!(rebuild(cx, &["Alpha", "-", "Gamma", "Beta"]), Some(3));
+        // a label twice: the one where it stood
+        assert_eq!(rebuild(cx, &["Beta", "Alpha", "-", "Beta"]), Some(3));
+        // one that can no longer be chosen, or is gone: nothing
+        assert_eq!(rebuild(cx, &["Alpha", "~Beta", "Gamma"]), None);
+        menu.update(cx, |menu, cx| menu.set_selected_index(2, cx));
+        assert_eq!(rebuild(cx, &["Alpha", "Beta"]), None);
+        // and with nothing highlighted, nothing is
+        assert_eq!(rebuild(cx, &["Alpha", "Beta", "Gamma"]), None);
+    }
+
+    /// The item the pointer rests on is the one a click takes, so where the
+    /// pointer lit it the highlight stays on the row under the pointer as the
+    /// items move, not on the label that moved away from it
+    /// (elundqvist/kvist#316), and the pointer leaving that row still puts it
+    /// out. Where the keyboard lit it last, the label is followed again.
+    #[gpui::test]
+    fn rebuild_keeps_the_pointer_s_highlight_where_the_pointer_is(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::init);
+        let (menu, cx) =
+            cx.add_window_view(|_, cx| items(PopupMenu::new(cx), &["Alpha", "Beta", "Gamma"]));
+        let rebuild = |cx: &mut gpui::VisualTestContext, labels: &'static [&'static str]| {
+            cx.update(|window, cx| {
+                menu.update(cx, |menu, cx| {
+                    menu.rebuild(window, cx, |menu, _, _| items(menu, labels));
+                    menu.selected_index
+                })
+            })
+        };
+
+        menu.update(cx, |menu, cx| menu.hover_item(1, true, false, cx));
+        assert_eq!(rebuild(cx, &["Restart", "Alpha", "Beta"]), Some(1));
+        menu.update(cx, |menu, cx| menu.hover_item(1, false, false, cx));
+        assert_eq!(menu.update(cx, |menu, _| menu.selected_index), None);
+        // a row under the pointer that can no longer be chosen: nothing
+        menu.update(cx, |menu, cx| menu.hover_item(1, true, false, cx));
+        assert_eq!(rebuild(cx, &["Restart", "-", "Beta"]), None);
+        // the pointer lit it, then the keyboard moved on: the label again
+        assert_eq!(rebuild(cx, &["Alpha", "Beta", "Gamma"]), None);
+        menu.update(cx, |menu, cx| {
+            menu.hover_item(0, true, false, cx);
+            menu.set_selected_index(1, cx);
+        });
+        assert_eq!(rebuild(cx, &["Restart", "Alpha", "Beta"]), Some(2));
     }
 }
