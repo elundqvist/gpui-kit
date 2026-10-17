@@ -566,8 +566,20 @@ impl<M: InputModeKind> TextElement<M> {
                     scroll_offset.y = if scroll_offset.y + cursor_pos.y
                         > bounds.size.height - top_bottom_margin
                     {
-                        // cursor is out of bottom
-                        scroll_offset.y - line_height
+                        // cursor is out of bottom: a line on, as a caret
+                        // a line past the edge takes; but one a line leaves
+                        // out of sight, as a key typed at a caret scrolled
+                        // far above, is gone to at once, as VS Code and
+                        // IntelliJ do. A line a key, the view crept towards
+                        // it and the caret never came into sight
+                        // (elundqvist/kvist#369). One above the view is
+                        // gone to at once below, as the selection's end.
+                        let step = scroll_offset.y - line_height;
+                        if step + cursor_pos.y + line_height > bounds.size.height {
+                            bounds.size.height - top_bottom_margin - cursor_pos.y
+                        } else {
+                            step
+                        }
                     } else if scroll_offset.y + cursor_pos.y < top_bottom_margin {
                         // cursor is out of top
                         (scroll_offset.y + line_height).min(px(0.))

@@ -1683,6 +1683,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             window,
             cx,
         );
+        self.reveal_typed_caret(cx);
         self.pause_blink_cursor(cx);
     }
 
@@ -1708,6 +1709,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             window,
             cx,
         );
+        self.reveal_typed_caret(cx);
         self.pause_blink_cursor(cx);
     }
 
@@ -1730,6 +1732,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             window,
             cx,
         );
+        self.reveal_typed_caret(cx);
         self.pause_blink_cursor(cx);
     }
 
@@ -1752,6 +1755,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             window,
             cx,
         );
+        self.reveal_typed_caret(cx);
         self.pause_blink_cursor(cx);
     }
 
@@ -1782,6 +1786,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             // Add newline and indent
             let new_line_text = format!("\n{}", indent);
             self.replace_text_in_range_silent(None, &new_line_text, window, cx);
+            self.reveal_typed_caret(cx);
             self.pause_blink_cursor(cx);
         } else {
             // Single line input or submit-on-enter: just emit the event
@@ -2129,6 +2134,26 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.deferred_scroll_follows_caret = self.deferred_scroll_offset.is_some();
     }
 
+    /// Bring the caret into view where a key typed at it left it out of
+    /// the lines laid out, before the next layout chooses its lines, as
+    /// VS Code and IntelliJ scroll to the caret at the first key typed.
+    /// Left to the layout's follow of the caret, the view went a line a
+    /// key towards a caret scrolled far out of sight, as after the find
+    /// bar had shown a match, and the caret never came into view
+    /// (elundqvist/kvist#369). Text typed, Enter, a cut and the deletes
+    /// and indents at the caret bring it here; left to the follow, which
+    /// now goes to it at once, the frame laid out the lines at the old
+    /// place and painted them at the new, blank for a frame.
+    pub(crate) fn reveal_typed_caret(&mut self, cx: &mut Context<Self>) {
+        let Some(rows) = self.visible_row_range() else {
+            return;
+        };
+        let row = self.text.offset_to_point(self.cursor()).row;
+        if !rows.contains(&row) {
+            self.scroll_to_edited(self.cursor(), cx);
+        }
+    }
+
     /// How far the text as it is now scrolls, as the next layout will
     /// measure it: its rows on screen, without those a fold hides, and the
     /// room kept below the last one. `scroll_size` is the last layout's,
@@ -2172,6 +2197,7 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         self.undo_manager.pending_intent = Some(EditIntent::Atomic);
         self.replace_text_in_range_silent(None, "", window, cx);
+        self.reveal_typed_caret(cx);
     }
 
     pub(super) fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
@@ -3154,6 +3180,9 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         self.update_search(cx);
         if self.is_multi_line() {
             self.mode.update_auto_grow(&self.display_map);
+            if !self.silent_replace_text {
+                self.reveal_typed_caret(cx);
+            }
         }
         if !self.silent_replace_text {
             M::on_text_typed(self, &range, &new_text, window, cx);
@@ -3236,6 +3265,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         }
         if self.is_multi_line() {
             self.mode.update_auto_grow(&self.display_map);
+            self.reveal_typed_caret(cx);
         }
         self.push_history(
             &old_text,
@@ -4148,6 +4178,80 @@ mod tests {
                 );
             })
         });
+    }
+
+    /// A key typed at a caret out of sight below brings the caret's line
+    /// into view at once, as VS Code and IntelliJ do. The layout's follow
+    /// of the caret moved the view a line a key, so with the view at the
+    /// top, where the find bar's first match had taken it, and the caret
+    /// thousands of lines below, the view crept down a line a key and the
+    /// caret never came into sight (elundqvist/kvist#369).
+    #[gpui::test]
+    fn test_a_key_typed_at_a_caret_out_of_sight_brings_it_into_view(cx: &mut TestAppContext) {
+        let (input, mut cx) = needles(cx, 330);
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| state.set_scroll_offset(point(px(0.), px(0.)), cx))
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                let rows = state.visible_row_range().unwrap();
+                assert!(!rows.contains(&330), "the caret is out of sight, {rows:?}");
+            })
+        });
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| state.replace_text_in_range(None, "x", window, cx))
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| input.read_with(cx, |state, _| assert_caret_in_view(state, "below")));
+
+        // and above, the view far below it
+        let (input, mut cx) = needles(&mut cx.cx, 20);
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                let line_height = state.last_layout.as_ref().unwrap().line_height;
+                state.set_scroll_offset(point(px(0.), -line_height * 300usize), cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| state.replace_text_in_range(None, "x", window, cx))
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| input.read_with(cx, |state, _| assert_caret_in_view(state, "above")));
+
+        // Enter, and a word deleted, in the frame after them, as a key:
+        // left to the layout's follow of the caret, which goes to it, the
+        // frame laid out the lines at the old place and painted them at
+        // the new, and the caret's line came a frame later
+        let (input, mut cx) = needles(&mut cx.cx, 330);
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| state.set_scroll_offset(point(px(0.), px(0.)), cx))
+        });
+        cx.run_until_parked();
+        let enter = Enter {
+            secondary: false,
+            shift: false,
+        };
+        cx.update(|window, cx| input.update(cx, |state, cx| state.enter(&enter, window, cx)));
+        cx.run_until_parked();
+        cx.update(|_, cx| input.read_with(cx, |state, _| assert_caret_in_view(state, "Enter")));
+        let (input, mut cx) = needles(&mut cx.cx, 330);
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                let at = state.text.line_end_offset(330);
+                state.move_to(at, None, cx);
+                state.set_scroll_offset(point(px(0.), px(0.)), cx)
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.delete_previous_word(&DeleteToPreviousWordStart, window, cx)
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| input.read_with(cx, |state, _| assert_caret_in_view(state, "a word deleted")));
     }
 
     /// Counts what an editor hands its highlighter: the edit of each update.

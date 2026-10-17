@@ -3488,7 +3488,7 @@ $x = 1;
             "a", "b", " ", "\n", "*", "**", "_", "`", "[", "]", "(", ")", "\\", "!", "<", ">", "~",
             "\n\n", "- ",
         ];
-        let mut text = |len: usize, next: &mut dyn FnMut(usize) -> usize| -> String {
+        let text = |len: usize, next: &mut dyn FnMut(usize) -> usize| -> String {
             (0..len).map(|_| PIECES[next(PIECES.len())]).collect()
         };
         for _ in 0..300 {

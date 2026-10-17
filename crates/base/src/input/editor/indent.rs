@@ -286,6 +286,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             self.selected_range =
                 (selected_range.start + added_len..selected_range.end + added_len).into();
         }
+        self.reveal_typed_caret(cx);
     }
 
     pub(super) fn outdent(&mut self, block: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -361,6 +362,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                 self.selected_range = (new_offset..new_offset).into();
             }
         }
+        self.reveal_typed_caret(cx);
     }
 }
 
