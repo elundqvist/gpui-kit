@@ -13,9 +13,35 @@ which asks for `=0.3.3`, takes it when an application patches it in.
 
 ## What is changed
 
-None yet. Each file changed from the published crate will say so at
-its top and be listed here, as the Apache License 2.0 asks (section
-4(b)).
+The files changed from the published crate, as the Apache License 2.0
+asks (section 4(b)); each says so at its top:
+
+- `src/linux/x11/client.rs`: the X11 client kept one XDND drag for all
+  its windows, set its type at an `XdndEnter` only when the drag offered
+  one gpui takes, and cleared it only at an `XdndLeave` or `XdndDrop`. A
+  drag that offered none, or an `XdndPosition` with no `XdndEnter`
+  before it, had its selection asked for in the type 0, which the X
+  server answers with BadAtom ("Failed to convert selection for drag and
+  drop", logged as an error), and was told the drop was accepted
+  (elundqvist/kvist#218). Now each `XdndEnter` begins a drag of its own
+  over its window (`XdndDrags`); a drag that offers no type gpui takes,
+  or a message about a drag the window never saw enter, is answered
+  `XdndStatus` not accepted and `XdndFinished` not accepted, its data is
+  never asked for, gpui hears nothing of it, and nothing is logged. An
+  `XdndEnter` that names no source begins no drag and has no type list
+  read, where window 0's was, a BadWindow logged as a warning. One that
+  takes the place of a drag gpui heard of, whose source went without an
+  `XdndLeave`, tells gpui that drag has gone, as the leave would have.
+  A drag's data is asked for once, at its first position, and an answer
+  is taken only as the one to that request, by its type and time: a
+  late answer for a drag that has gone is no other drag's; a request the
+  source refused gives gpui nothing, where the client read the previous
+  drag's data, still in the property; and the data is read whole and the
+  property deleted, as ICCCM has the requestor do, where the first 4 KB
+  were read and the property kept. The
+  answers go to the source the message names, where they went to the
+  last `XdndEnter`'s, which is window 0, the pointer's window, when
+  there was none. Tests of the drag state.
 
 ## Tests
 

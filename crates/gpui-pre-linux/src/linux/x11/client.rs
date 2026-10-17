@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre-linux 0.3.3 as published to crates.io: FORK.md at
+// the crate's root lists the changes.
 use anyhow::{Context as _, anyhow};
 use ashpd::WindowIdentifier;
 use calloop::{
@@ -140,12 +142,166 @@ impl From<xim::ClientError> for EventHandlerError {
     }
 }
 
+/// An XDND drag over one of the client's windows, from its `XdndEnter` to
+/// its `XdndLeave` or `XdndDrop`.
 #[derive(Debug, Default)]
 pub struct Xdnd {
+    /// The drag's source window, which sent its `XdndEnter`.
     other_window: xproto::Window,
+    /// The type gpui asks for the drag's data in, or 0 when the drag offers
+    /// none it takes.
     drag_type: u32,
+    /// The time of the `XdndPosition` at which the drag's data was asked
+    /// for, which the answer carries.
+    asked: Option<u32>,
+    /// Whether the answer came, with the data or without.
     retrieved: bool,
     position: Point<Pixels>,
+}
+
+/// The XDND drags over the client's windows, one per window.
+///
+/// Changed in elundqvist/gpui-kit (elundqvist/kvist#218): the client kept
+/// one drag for all its windows, set its type at an `XdndEnter` only when
+/// the drag offered one gpui takes, and cleared it only at an `XdndLeave`
+/// or `XdndDrop`; so at an `XdndPosition` of a drag that offered none, or
+/// one with no `XdndEnter` before it, it asked the X server to convert the
+/// selection to the target 0, which the server answers with BadAtom, and
+/// told the source the drop was accepted. Now each `XdndEnter` begins a
+/// drag of its own over its window, a drag gpui cannot take is refused and
+/// never asked for its data, and an answer is taken only as the one to the
+/// drag's own request.
+#[derive(Debug, Default)]
+pub(crate) struct XdndDrags(HashMap<xproto::Window, Xdnd>);
+
+/// What the client answers an `XdndPosition` with.
+#[derive(Debug, PartialEq)]
+enum XdndReply {
+    /// The drop is refused: the source is told so, nothing is asked of its
+    /// selection, and gpui hears nothing of the drag.
+    Refuse,
+    /// The drop is welcome: the source is told so, gpui is told where the
+    /// drag is, and the drag's data is asked for in `convert`, the first
+    /// time only.
+    Accept {
+        convert: Option<u32>,
+        position: Point<Pixels>,
+    },
+}
+
+impl XdndDrags {
+    /// An `XdndEnter` from `source` over `window`: a drag begins there
+    /// afresh, offering `drag_type`, 0 when it offers no type gpui takes.
+    /// The drag it takes the place of, one whose source went without an
+    /// `XdndLeave`, is given back when gpui heard of it, to be told it has
+    /// gone. A message that names no source begins no drag, and leaves the
+    /// one over the window be.
+    fn enter(
+        &mut self,
+        window: xproto::Window,
+        source: xproto::Window,
+        drag_type: u32,
+    ) -> Option<Xdnd> {
+        if source == 0 {
+            return None;
+        }
+        self.0
+            .insert(
+                window,
+                Xdnd {
+                    other_window: source,
+                    drag_type,
+                    ..Xdnd::default()
+                },
+            )
+            .filter(|drag| drag.drag_type != 0)
+    }
+
+    /// The drag over `window` a message from `source` is about, when gpui
+    /// takes it: one an `XdndEnter` from the same source began over the
+    /// same window, offering a type gpui takes.
+    fn accepted(&mut self, window: xproto::Window, source: xproto::Window) -> Option<&mut Xdnd> {
+        self.0
+            .get_mut(&window)
+            .filter(|drag| drag.drag_type != 0 && source != 0 && drag.other_window == source)
+    }
+
+    /// An `XdndPosition` from `source` over `window` at `time`: welcome
+    /// for a drag gpui takes, at the pointer `pointer` gives, which is
+    /// asked only then; refused for one that offers no type gpui takes,
+    /// one the window never saw enter and one another source began.
+    fn position(
+        &mut self,
+        window: xproto::Window,
+        source: xproto::Window,
+        time: u32,
+        pointer: impl FnOnce() -> Option<Point<Pixels>>,
+    ) -> XdndReply {
+        let Some(drag) = self.accepted(window, source) else {
+            return XdndReply::Refuse;
+        };
+        if let Some(position) = pointer() {
+            drag.position = position;
+        }
+        let convert = drag.asked.is_none().then(|| {
+            drag.asked = Some(time);
+            drag.drag_type
+        });
+        XdndReply::Accept {
+            convert,
+            position: drag.position,
+        }
+    }
+
+    /// An answer to a request for the data of a drag over `window`, in
+    /// `target`, asked for at `time`: the drag's position when it is the
+    /// answer to that drag's request and the first, which is then taken.
+    /// An answer that comes after its drag left, or that another drag's
+    /// request asked for, is no drag's.
+    fn answer(&mut self, window: xproto::Window, target: u32, time: u32) -> Option<Point<Pixels>> {
+        let drag = self.0.get_mut(&window).filter(|drag| {
+            drag.drag_type == target && drag.asked == Some(time) && !drag.retrieved
+        })?;
+        drag.retrieved = true;
+        Some(drag.position)
+    }
+
+    /// An `XdndLeave` or `XdndDrop` from `source` over `window`: ends the
+    /// drag `source` began there, taken or not, and gives it back when
+    /// gpui took it; a message from another source leaves it be.
+    fn end(&mut self, window: xproto::Window, source: xproto::Window) -> Option<Xdnd> {
+        if self
+            .0
+            .get(&window)
+            .is_some_and(|drag| source != 0 && drag.other_window == source)
+        {
+            self.0.remove(&window).filter(|drag| drag.drag_type != 0)
+        } else {
+            None
+        }
+    }
+
+    fn forget(&mut self, window: xproto::Window) {
+        self.0.remove(&window);
+    }
+}
+
+/// The type gpui asks an XDND drag's data in: the first of the types the
+/// drag offers that gpui takes, or 0 when it offers none. `offered` gives
+/// the types, from the `XdndEnter` or from the source's `XdndTypeList`; a
+/// message that names no source is not asked.
+fn xdnd_drag_type(
+    source: xproto::Window,
+    offered: impl FnOnce() -> Vec<u32>,
+    supported: impl Fn(u32) -> bool,
+) -> u32 {
+    if source == 0 {
+        return 0;
+    }
+    offered()
+        .into_iter()
+        .find(|atom| *atom != 0 && supported(*atom))
+        .unwrap_or(0)
 }
 
 #[derive(Debug)]
@@ -221,7 +377,7 @@ pub struct X11ClientState {
     pub(crate) common: LinuxCommon,
     pub(crate) clipboard: Clipboard,
     pub(crate) clipboard_item: Option<ClipboardItem>,
-    pub(crate) xdnd_state: Xdnd,
+    pub(crate) xdnd_drags: XdndDrags,
 }
 
 #[derive(Clone)]
@@ -255,6 +411,7 @@ impl X11ClientStatePtr {
             state.cursor_hidden_window = None;
         }
         state.cursor_styles.remove(&x_window);
+        state.xdnd_drags.forget(x_window);
     }
 
     pub fn update_ime_position(&self, bounds: Bounds<Pixels>) {
@@ -561,7 +718,7 @@ impl X11Client {
 
             clipboard,
             clipboard_item: None,
-            xdnd_state: Xdnd::default(),
+            xdnd_drags: XdndDrags::default(),
         }))))
     }
 
@@ -840,87 +997,152 @@ impl X11Client {
                         })
                 }
 
+                // `atom`, the first word of every XDND message to a target,
+                // names the drag's source window.
                 if event.type_ == state.atoms.XdndEnter {
-                    state.xdnd_state.other_window = atom;
-                    if (arg1 & 0x1) == 0x1 {
-                        state.xdnd_state.drag_type = xdnd_get_supported_atom(
+                    let drag_type = {
+                        let state = &*state;
+                        xdnd_drag_type(
+                            atom,
+                            || {
+                                if (arg1 & 0x1) == 0x1 {
+                                    xdnd_type_list(&state.xcb_connection, &state.atoms, atom)
+                                } else {
+                                    vec![arg2, arg3, arg4]
+                                }
+                            },
+                            |atom| xdnd_is_atom_supported(atom, &state.atoms),
+                        )
+                    };
+                    // a drag gpui heard of whose source went without an
+                    // `XdndLeave`, as a source that dies mid-drag does, has
+                    // gone all the same
+                    let Some(gone) = state.xdnd_drags.enter(event.window, atom, drag_type) else {
+                        return Some(());
+                    };
+                    drop(state);
+                    window.handle_input(PlatformInput::FileDrop(FileDropEvent::Pending {
+                        position: gone.position,
+                    }));
+                    window.handle_input(PlatformInput::FileDrop(FileDropEvent::Exited {}));
+                } else if event.type_ == state.atoms.XdndLeave {
+                    // gpui heard nothing of a drag it refused
+                    let Some(drag) = state.xdnd_drags.end(event.window, atom) else {
+                        return Some(());
+                    };
+                    drop(state);
+                    window.handle_input(PlatformInput::FileDrop(FileDropEvent::Pending {
+                        position: drag.position,
+                    }));
+                    window.handle_input(PlatformInput::FileDrop(FileDropEvent::Exited {}));
+                } else if event.type_ == state.atoms.XdndPosition {
+                    let position = {
+                        let state = &mut *state;
+                        let connection = &state.xcb_connection;
+                        let reply = state.xdnd_drags.position(event.window, atom, arg3, || {
+                            get_reply(
+                                || "Failed to query pointer position",
+                                connection.query_pointer(event.window),
+                            )
+                            .ok()
+                            .map(|pos| Point::new(px(pos.win_x as f32), px(pos.win_y as f32)))
+                        });
+                        match reply {
+                            XdndReply::Accept { convert, position } => {
+                                if let Some(drag_type) = convert {
+                                    check_reply(
+                                        || "Failed to convert selection for drag and drop",
+                                        state.xcb_connection.convert_selection(
+                                            event.window,
+                                            state.atoms.XdndSelection,
+                                            drag_type,
+                                            state.atoms.XDND_DATA,
+                                            arg3,
+                                        ),
+                                    )
+                                    .log_err();
+                                }
+                                xdnd_send_status(
+                                    &state.xcb_connection,
+                                    &state.atoms,
+                                    event.window,
+                                    atom,
+                                    Some(arg4),
+                                );
+                                Some(position)
+                            }
+                            // A drag that offers no type gpui takes, or one it
+                            // never saw enter: refused, and nothing asked of
+                            // its selection. Nothing failed, so nothing is
+                            // logged.
+                            XdndReply::Refuse => {
+                                if atom != 0 {
+                                    xdnd_send_status(
+                                        &state.xcb_connection,
+                                        &state.atoms,
+                                        event.window,
+                                        atom,
+                                        None,
+                                    );
+                                }
+                                None
+                            }
+                        }
+                    };
+                    drop(state);
+                    if let Some(position) = position {
+                        window.handle_input(PlatformInput::FileDrop(FileDropEvent::Pending {
+                            position,
+                        }));
+                    }
+                } else if event.type_ == state.atoms.XdndDrop {
+                    let drag = state.xdnd_drags.end(event.window, atom);
+                    if atom != 0 {
+                        xdnd_send_finished(
                             &state.xcb_connection,
                             &state.atoms,
-                            state.xdnd_state.other_window,
+                            event.window,
+                            atom,
+                            drag.is_some(),
                         );
-                    } else {
-                        if let Some(atom) = [arg2, arg3, arg4]
-                            .into_iter()
-                            .find(|atom| xdnd_is_atom_supported(*atom, &state.atoms))
-                        {
-                            state.xdnd_state.drag_type = atom;
-                        }
                     }
-                } else if event.type_ == state.atoms.XdndLeave {
-                    let position = state.xdnd_state.position;
+                    let Some(drag) = drag else {
+                        return Some(());
+                    };
                     drop(state);
-                    window
-                        .handle_input(PlatformInput::FileDrop(FileDropEvent::Pending { position }));
-                    window.handle_input(PlatformInput::FileDrop(FileDropEvent::Exited {}));
-                    self.0.borrow_mut().xdnd_state = Xdnd::default();
-                } else if event.type_ == state.atoms.XdndPosition {
-                    if let Ok(pos) = get_reply(
-                        || "Failed to query pointer position",
-                        state.xcb_connection.query_pointer(event.window),
-                    ) {
-                        state.xdnd_state.position =
-                            Point::new(px(pos.win_x as f32), px(pos.win_y as f32));
-                    }
-                    if !state.xdnd_state.retrieved {
-                        check_reply(
-                            || "Failed to convert selection for drag and drop",
-                            state.xcb_connection.convert_selection(
-                                event.window,
-                                state.atoms.XdndSelection,
-                                state.xdnd_state.drag_type,
-                                state.atoms.XDND_DATA,
-                                arg3,
-                            ),
-                        )
-                        .log_err();
-                    }
-                    xdnd_send_status(
-                        &state.xcb_connection,
-                        &state.atoms,
-                        event.window,
-                        state.xdnd_state.other_window,
-                        arg4,
-                    );
-                    let position = state.xdnd_state.position;
-                    drop(state);
-                    window
-                        .handle_input(PlatformInput::FileDrop(FileDropEvent::Pending { position }));
-                } else if event.type_ == state.atoms.XdndDrop {
-                    xdnd_send_finished(
-                        &state.xcb_connection,
-                        &state.atoms,
-                        event.window,
-                        state.xdnd_state.other_window,
-                    );
-                    let position = state.xdnd_state.position;
-                    drop(state);
-                    window
-                        .handle_input(PlatformInput::FileDrop(FileDropEvent::Submit { position }));
-                    self.0.borrow_mut().xdnd_state = Xdnd::default();
+                    window.handle_input(PlatformInput::FileDrop(FileDropEvent::Submit {
+                        position: drag.position,
+                    }));
                 }
             }
             Event::SelectionNotify(event) => {
                 let window = self.get_window(event.requestor)?;
-                let state = self.0.borrow_mut();
+                let mut state = self.0.borrow_mut();
+                if event.selection != state.atoms.XdndSelection {
+                    return Some(());
+                }
+                // the answer to the request for a drag's data made at its
+                // first `XdndPosition`, if the drag is still over the window:
+                // not a late one to a drag that has gone, nor another's
+                let position =
+                    state
+                        .xdnd_drags
+                        .answer(event.requestor, event.target, event.time)?;
+                // The source would not give its data in that type, so there
+                // is none, and what the property still holds is another's.
+                if event.property == x11rb::NONE {
+                    return Some(());
+                }
+                // read whole and deleted, as ICCCM has the requestor do
                 let reply = get_reply(
                     || "Failed to get XDND_DATA",
                     state.xcb_connection.get_property(
-                        false,
+                        true,
                         event.requestor,
-                        state.atoms.XDND_DATA,
+                        event.property,
                         AtomEnum::ANY,
                         0,
-                        1024,
+                        u32::MAX / 4,
                     ),
                 )
                 .log_err();
@@ -940,12 +1162,11 @@ impl X11Client {
                         })
                         .collect();
                     let input = PlatformInput::FileDrop(FileDropEvent::Entered {
-                        position: state.xdnd_state.position,
+                        position,
                         paths: gpui::ExternalPaths(paths),
                     });
                     drop(state);
                     window.handle_input(input);
-                    self.0.borrow_mut().xdnd_state.retrieved = true;
                 }
             }
             Event::ConfigureNotify(event) => {
@@ -2297,45 +2518,42 @@ fn xdnd_is_atom_supported(atom: u32, atoms: &XcbAtoms) -> bool {
         || atom == atoms.TextUriList
 }
 
-fn xdnd_get_supported_atom(
+/// The types the drag from `source` offers in its `XdndTypeList`, none when
+/// they cannot be read: a source that has gone, or a message that names no
+/// window, is no failure of gpui's, so that is logged at debug level only.
+fn xdnd_type_list(
     xcb_connection: &XCBConnection,
-    supported_atoms: &XcbAtoms,
-    target: xproto::Window,
-) -> u32 {
-    if let Some(reply) = get_reply(
+    atoms: &XcbAtoms,
+    source: xproto::Window,
+) -> Vec<u32> {
+    get_reply(
         || "Failed to get XDnD supported atoms",
-        xcb_connection.get_property(
-            false,
-            target,
-            supported_atoms.XdndTypeList,
-            AtomEnum::ANY,
-            0,
-            1024,
-        ),
+        xcb_connection.get_property(false, source, atoms.XdndTypeList, AtomEnum::ANY, 0, 1024),
     )
-    .log_with_level(Level::Warn)
-        && let Some(atoms) = reply.value32()
-    {
-        for atom in atoms {
-            if xdnd_is_atom_supported(atom, supported_atoms) {
-                return atom;
-            }
-        }
-    }
-    0
+    .log_with_level(Level::Debug)
+    .and_then(|reply| Some(reply.value32()?.collect()))
+    .unwrap_or_default()
 }
 
+/// Tells the drag's source, `target`, that the drop on `source` is done:
+/// taken and copied when `accepted`, refused otherwise.
 fn xdnd_send_finished(
     xcb_connection: &XCBConnection,
     atoms: &XcbAtoms,
     source: xproto::Window,
     target: xproto::Window,
+    accepted: bool,
 ) {
+    let data = if accepted {
+        [source, 1, atoms.XdndActionCopy, 0, 0]
+    } else {
+        [source, 0, 0, 0, 0]
+    };
     let message = ClientMessageEvent {
         format: 32,
         window: target,
         type_: atoms.XdndFinished,
-        data: ClientMessageData::from([source, 1, atoms.XdndActionCopy, 0, 0]),
+        data: ClientMessageData::from(data),
         sequence: 0,
         response_type: xproto::CLIENT_MESSAGE_EVENT,
     };
@@ -2343,22 +2561,29 @@ fn xdnd_send_finished(
         || "Failed to send XDnD finished event",
         xcb_connection.send_event(false, target, EventMask::default(), message),
     )
-    .log_err();
+    .log_with_level(if accepted { Level::Error } else { Level::Debug });
     xcb_connection.flush().log_err();
 }
 
+/// Tells the drag's source, `target`, whether `source` would take a drop:
+/// with the action it takes, or refused with `None`. The source of a
+/// refused drag may be gone, or may never have been a window at all.
 fn xdnd_send_status(
     xcb_connection: &XCBConnection,
     atoms: &XcbAtoms,
     source: xproto::Window,
     target: xproto::Window,
-    action: u32,
+    action: Option<u32>,
 ) {
+    let data = match action {
+        Some(action) => [source, 1, 0, 0, action],
+        None => [source, 0, 0, 0, 0],
+    };
     let message = ClientMessageEvent {
         format: 32,
         window: target,
         type_: atoms.XdndStatus,
-        data: ClientMessageData::from([source, 1, 0, 0, action]),
+        data: ClientMessageData::from(data),
         sequence: 0,
         response_type: xproto::CLIENT_MESSAGE_EVENT,
     };
@@ -2366,7 +2591,11 @@ fn xdnd_send_status(
         || "Failed to send XDnD status event",
         xcb_connection.send_event(false, target, EventMask::default(), message),
     )
-    .log_err();
+    .log_with_level(if action.is_some() {
+        Level::Error
+    } else {
+        Level::Debug
+    });
     xcb_connection.flush().log_err();
 }
 
@@ -3125,5 +3354,217 @@ mod tests {
 
         // Assert pressing space while on the Czech layout still types a space.
         assert_eq!(key_event_state.key_get_utf8(space), " ");
+    }
+}
+
+#[cfg(test)]
+mod xdnd_tests {
+    use super::{XdndDrags, XdndReply, xdnd_drag_type};
+    use gpui::{Pixels, Point, point, px};
+
+    const WINDOW: u32 = 0x0400_0001;
+    const OTHER_WINDOW: u32 = 0x0400_0002;
+    const SOURCE: u32 = 0x0600_0001;
+    const OTHER_SOURCE: u32 = 0x0600_0002;
+    const URI_LIST: u32 = 401;
+    const PNG: u32 = 402;
+    const TEXT: u32 = 403;
+
+    fn pointer() -> Option<Point<Pixels>> {
+        Some(point(px(10.), px(20.)))
+    }
+
+    /// The answer to a position at `time` that gpui takes, its data asked
+    /// for in `convert`.
+    fn accept(convert: Option<u32>) -> XdndReply {
+        XdndReply::Accept {
+            convert,
+            position: point(px(10.), px(20.)),
+        }
+    }
+
+    /// A drag that offers no type gpui takes is refused, its data never
+    /// asked for and the pointer not even looked up: its data was asked
+    /// for in the type 0, which the X server answers with BadAtom
+    /// (elundqvist/kvist#218). It ends all the same, with nothing for gpui.
+    #[test]
+    fn a_drag_with_no_type_gpui_takes_is_refused() {
+        let mut drags = XdndDrags::default();
+        assert!(drags.enter(WINDOW, SOURCE, 0).is_none());
+        let reply = drags.position(WINDOW, SOURCE, 1, || panic!("the pointer was looked up"));
+        assert_eq!(reply, XdndReply::Refuse);
+        assert!(drags.answer(WINDOW, 0, 1).is_none());
+        assert!(drags.end(WINDOW, SOURCE).is_none());
+        assert!(drags.0.is_empty(), "the refused drag did not end");
+    }
+
+    /// A drag of a type gpui takes is welcome; its data is asked for at
+    /// its first position only, and taken from the one answer to that.
+    #[test]
+    fn a_drag_of_a_type_gpui_takes_has_its_data_asked_for_once() {
+        let mut drags = XdndDrags::default();
+        assert!(drags.enter(WINDOW, SOURCE, URI_LIST).is_none());
+        assert_eq!(
+            drags.position(WINDOW, SOURCE, 5, pointer),
+            accept(Some(URI_LIST))
+        );
+        assert_eq!(drags.position(WINDOW, SOURCE, 6, pointer), accept(None));
+        assert_eq!(drags.answer(WINDOW, URI_LIST, 5), pointer());
+        assert!(drags.answer(WINDOW, URI_LIST, 5).is_none());
+        assert_eq!(drags.position(WINDOW, SOURCE, 7, pointer), accept(None));
+        assert_eq!(
+            drags.end(WINDOW, SOURCE).map(|drag| drag.drag_type),
+            Some(URI_LIST)
+        );
+        assert_eq!(
+            drags.position(WINDOW, SOURCE, 8, pointer),
+            XdndReply::Refuse
+        );
+    }
+
+    /// Each `XdndEnter` begins a drag afresh: the type an earlier drag
+    /// offered does not carry over to one that offers none, as it did
+    /// when the type was set only when one was found and cleared only at
+    /// an `XdndLeave` or `XdndDrop`, and its data is asked for again.
+    #[test]
+    fn a_drag_begins_afresh_at_its_enter() {
+        let mut drags = XdndDrags::default();
+        drags.enter(WINDOW, SOURCE, URI_LIST);
+        drags.position(WINDOW, SOURCE, 1, pointer);
+        drags.answer(WINDOW, URI_LIST, 1);
+        // no XdndLeave between them
+        drags.enter(WINDOW, OTHER_SOURCE, 0);
+        assert_eq!(
+            drags.position(WINDOW, OTHER_SOURCE, 2, pointer),
+            XdndReply::Refuse
+        );
+        assert_eq!(
+            drags.position(WINDOW, SOURCE, 2, pointer),
+            XdndReply::Refuse
+        );
+        drags.enter(WINDOW, SOURCE, URI_LIST);
+        assert_eq!(
+            drags.position(WINDOW, SOURCE, 3, pointer),
+            accept(Some(URI_LIST))
+        );
+    }
+
+    /// A drag gpui heard of, whose source went without an `XdndLeave`, is
+    /// given back when another enters in its place, so gpui is told it
+    /// has gone: else gpui kept it, and every hover in the window was dead
+    /// until the next click. One gpui refused is not.
+    #[test]
+    fn an_enter_gives_back_the_drag_gpui_heard_of_that_it_takes_the_place_of() {
+        let mut drags = XdndDrags::default();
+        drags.enter(WINDOW, SOURCE, URI_LIST);
+        drags.position(WINDOW, SOURCE, 1, pointer);
+        let gone = drags.enter(WINDOW, OTHER_SOURCE, 0);
+        assert_eq!(gone.as_ref().map(|drag| drag.drag_type), Some(URI_LIST));
+        assert_eq!(gone.map(|drag| drag.position), pointer());
+        assert!(drags.enter(WINDOW, SOURCE, URI_LIST).is_none());
+        assert!(drags.enter(OTHER_WINDOW, SOURCE, URI_LIST).is_none());
+    }
+
+    /// An answer is taken only as the one to its drag's own request: one
+    /// that comes after its drag left, whether another drag has entered or
+    /// asked since or not, or that is in another type, is no drag's.
+    #[test]
+    fn an_answer_is_taken_only_for_its_own_drags_request() {
+        let mut drags = XdndDrags::default();
+        drags.enter(WINDOW, SOURCE, URI_LIST);
+        assert_eq!(
+            drags.position(WINDOW, SOURCE, 10, pointer),
+            accept(Some(URI_LIST))
+        );
+        assert!(drags.end(WINDOW, SOURCE).is_some());
+        assert!(drags.answer(WINDOW, URI_LIST, 10).is_none());
+        drags.enter(WINDOW, OTHER_SOURCE, URI_LIST);
+        assert!(drags.answer(WINDOW, URI_LIST, 10).is_none());
+        assert_eq!(
+            drags.position(WINDOW, OTHER_SOURCE, 20, pointer),
+            accept(Some(URI_LIST))
+        );
+        assert!(drags.answer(WINDOW, URI_LIST, 10).is_none());
+        assert!(drags.answer(WINDOW, TEXT, 20).is_none());
+        assert!(drags.answer(OTHER_WINDOW, URI_LIST, 20).is_none());
+        assert_eq!(drags.answer(WINDOW, URI_LIST, 20), pointer());
+    }
+
+    /// An `XdndPosition` with no `XdndEnter` before it is refused, as is
+    /// a message that names no source, and an `XdndEnter` that names none
+    /// leaves the drag over the window be.
+    #[test]
+    fn a_position_with_no_enter_is_refused() {
+        let mut drags = XdndDrags::default();
+        drags.enter(WINDOW, SOURCE, URI_LIST);
+        assert!(drags.enter(WINDOW, 0, 0).is_none());
+        assert_eq!(
+            drags.position(WINDOW, SOURCE, 1, pointer),
+            accept(Some(URI_LIST))
+        );
+        drags.forget(WINDOW);
+        assert_eq!(
+            drags.position(WINDOW, SOURCE, 1, pointer),
+            XdndReply::Refuse
+        );
+        drags.enter(WINDOW, 0, URI_LIST);
+        assert_eq!(drags.position(WINDOW, 0, 1, pointer), XdndReply::Refuse);
+        assert!(drags.answer(WINDOW, URI_LIST, 1).is_none());
+        assert!(drags.end(WINDOW, 0).is_none());
+    }
+
+    /// One window's drag is not another's: an `XdndPosition` over a
+    /// window the drag did not enter is refused, and a message from
+    /// another source neither takes nor ends it.
+    #[test]
+    fn each_window_has_a_drag_of_its_own() {
+        let mut drags = XdndDrags::default();
+        drags.enter(WINDOW, SOURCE, URI_LIST);
+        assert_eq!(
+            drags.position(OTHER_WINDOW, SOURCE, 1, pointer),
+            XdndReply::Refuse
+        );
+        assert!(drags.end(OTHER_WINDOW, SOURCE).is_none());
+        assert_eq!(
+            drags.position(WINDOW, OTHER_SOURCE, 1, pointer),
+            XdndReply::Refuse
+        );
+        assert!(drags.end(WINDOW, OTHER_SOURCE).is_none());
+        assert_eq!(
+            drags.position(WINDOW, SOURCE, 1, pointer),
+            accept(Some(URI_LIST))
+        );
+        assert!(drags.answer(OTHER_WINDOW, URI_LIST, 1).is_none());
+        drags.enter(OTHER_WINDOW, OTHER_SOURCE, URI_LIST);
+        assert_eq!(drags.position(WINDOW, SOURCE, 2, pointer), accept(None));
+        drags.forget(WINDOW);
+        assert_eq!(
+            drags.position(WINDOW, SOURCE, 3, pointer),
+            XdndReply::Refuse
+        );
+        assert_eq!(
+            drags.position(OTHER_WINDOW, OTHER_SOURCE, 3, pointer),
+            accept(Some(URI_LIST))
+        );
+    }
+
+    /// The type a drag's data is asked for in is the first it offers that
+    /// gpui takes; a message that names no source, as a stray one can, is
+    /// not asked for its types at all, where reading the type list of
+    /// window 0 logged a BadWindow.
+    #[test]
+    fn the_type_is_the_first_offered_that_gpui_takes() {
+        let takes = |atom: u32| atom == URI_LIST || atom == TEXT;
+        assert_eq!(
+            xdnd_drag_type(SOURCE, || vec![0, PNG, URI_LIST, TEXT], takes),
+            URI_LIST
+        );
+        assert_eq!(xdnd_drag_type(SOURCE, || vec![PNG, 0, 0], takes), 0);
+        assert_eq!(xdnd_drag_type(SOURCE, Vec::new, takes), 0);
+        assert_eq!(xdnd_drag_type(SOURCE, || vec![0, PNG], |_| true), PNG);
+        assert_eq!(
+            xdnd_drag_type(0, || panic!("the types of window 0 were asked for"), takes),
+            0
+        );
     }
 }
