@@ -3069,11 +3069,20 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         };
 
-        // The new byte range in the updated text after the edit
-        let new_end = edit_range.start + new_text.len();
+        // The new byte range in the updated text after the edit, on the
+        // whole of the lines it begins and ends on: the folds an edit's
+        // lines touch were taken (`adjust_folds_for_edit`), and one that
+        // begins on its last line or ends on its first is found again
+        // only here. Looked for in the edit's bytes alone, a function
+        // that began where a cut ended, or where a paste began, lost its
+        // chevron until the file was read again.
+        let new_end = (edit_range.start + new_text.len()).min(self.text.len());
+        let first = self.text.offset_to_point(edit_range.start.min(new_end)).row;
+        let last = self.text.offset_to_point(new_end).row;
+        let lines = self.text.line_start_offset(first)..self.text.line_end_offset(last);
         self.display_map.update_fold_candidates_for_edit(
             |range, text| highlighter.fold_ranges_for_edit(range, text),
-            edit_range.start..new_end,
+            lines,
             &self.text,
         );
     }
@@ -4438,6 +4447,105 @@ mod tests {
                 mark(state);
                 state.replace_all("select a;\nselect bb;\n", window, cx);
                 assert_eq!(state.diagnostics().unwrap().len(), 0, "replace_all");
+            })
+        });
+    }
+
+    /// Finds folds as a syntax tree does: each `fn` line to the `}` line
+    /// after it, and for an edit those whose bytes it reaches.
+    struct Blocks;
+
+    impl Blocks {
+        fn all(text: &Rope) -> Vec<(Range<usize>, crate::input::FoldRange)> {
+            let mut blocks = Vec::new();
+            let mut open = None;
+            for row in 0..text.lines_len() {
+                let line = text.slice_line(row).to_string();
+                if line.starts_with("fn ") {
+                    open = Some(row);
+                } else if line.starts_with('}') {
+                    if let Some(start) = open.take() {
+                        let bytes = text.line_start_offset(start)..text.line_start_offset(row) + 1;
+                        blocks.push((bytes, crate::input::FoldRange::new(start, row)));
+                    }
+                }
+            }
+            blocks
+        }
+    }
+
+    impl crate::input::InputHighlighter for Blocks {
+        fn language(&self) -> SharedString {
+            "rust".into()
+        }
+
+        fn update(&mut self, _: Option<crate::input::InputEdit>, _: &Rope, _: bool, _: &mut Window, _: &mut Context<crate::input::EditorState>) {}
+
+        fn styles(&self, range: &Range<usize>, _: &dyn crate::input::HighlightStyleResolver) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
+            vec![(range.clone(), gpui::HighlightStyle::default())]
+        }
+
+        fn fold_ranges(&self, text: &Rope) -> Vec<crate::input::FoldRange> {
+            Self::all(text).into_iter().map(|(_, fold)| fold).collect()
+        }
+
+        fn fold_ranges_for_edit(&self, range: Range<usize>, text: &Rope) -> Vec<crate::input::FoldRange> {
+            Self::all(text)
+                .into_iter()
+                .filter(|(bytes, _)| bytes.start < range.end && bytes.end > range.start)
+                .map(|(_, fold)| fold)
+                .collect()
+        }
+    }
+
+    /// Functions cut and pasted elsewhere leave every function with its
+    /// fold: the one a cut ended at, and the one a paste began at, are
+    /// found again with those the edit reached. Their folds were taken
+    /// with the edit's lines and looked for in its bytes alone, so the
+    /// two lost their chevrons until the file was read again.
+    #[gpui::test]
+    fn test_functions_cut_and_pasted_keep_their_folds(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        // five functions of nine lines each
+        let text: String = (0..5)
+            .map(|k| format!("fn k{k}(x: i32) -> i32 {{\n    if x > {k} {{\n        x + 1\n    }} else {{\n        x - 1\n    }}\n    // k{k}\n    // end\n}}\n"))
+            .collect();
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_highlighter_factory(
+                    Rc::new(|_: &str| Some(Box::new(Blocks) as Box<dyn crate::input::InputHighlighter>)),
+                    cx,
+                );
+                state.set_value(text.clone(), window, cx);
+            })
+        });
+        cx.run_until_parked();
+        let folds_of_each = |state: &InputBaseState<EditorMode>| -> Vec<(usize, bool)> {
+            Blocks::all(&state.text)
+                .into_iter()
+                .map(|(_, fold)| (fold.start_line, state.display_map.is_fold_candidate(fold.start_line)))
+                .collect()
+        };
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert!(folds_of_each(state).iter().all(|(_, has)| *has), "as read: {:?}", folds_of_each(state));
+            })
+        });
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                // k1 to k3 cut, from the start of k1's line to that of k4's
+                let cut = state.text.line_start_offset(9)..state.text.line_start_offset(36);
+                let taken = state.text.slice(cut.clone()).to_string();
+                let range = state.range_to_utf16(&cut);
+                state.replace_text_in_range(Some(range), "", window, cx);
+                assert_eq!(folds_of_each(state), [(0, true), (9, true)], "after the cut");
+                // and pasted at the top
+                state.replace_text_in_range(Some(0..0), &taken, window, cx);
+                let all = folds_of_each(state);
+                assert_eq!(all.len(), 5);
+                assert!(all.iter().all(|(_, has)| *has), "after the paste: {all:?}");
             })
         });
     }
