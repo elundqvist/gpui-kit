@@ -1,12 +1,12 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     ops::Range,
     rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use gpui::{HighlightStyle, SharedString, Task};
@@ -31,6 +31,44 @@ pub(crate) fn input_highlighter_factory() -> InputHighlighterFactory {
 struct TreeSitterInputHighlighter {
     inner: Rc<RefCell<SyntaxHighlighter>>,
     parse_task: Rc<RefCell<Option<Task<()>>>>,
+    /// The last parse a keystroke made took more than its share of the
+    /// key (`PARSE_SHARE`): the keys after it edit the trees alone, until
+    /// the parse once the typing pauses lands (`parsed_at_the_key`).
+    slow: Rc<Cell<bool>>,
+}
+
+/// The largest text a keystroke parses on the drawing thread: a larger
+/// one has its trees edited there, what the edit touched left plain, and
+/// is parsed off it once the typing pauses, as the largest always were.
+/// The parse grows with the text, some 1 ms for each 50 KB of Rust, and
+/// the frame after a key takes 2 to 3 ms of the 4 ms a keystroke has
+/// (Kvist's ARCHITECTURE.md §9): parsed up to 256 KB, a key in a 150 KB
+/// file took 4.6 to 5.5 ms, its parse 1.8 to 2.2 (elundqvist/kvist#370).
+const SYNC_PARSE_MAX_BYTES: usize = 48 * 1024;
+
+/// The largest Markdown text a keystroke parses there, every text's
+/// limit before: whether a Markdown paragraph waits for the pause for its
+/// colours is elundqvist/kvist#376's to settle, by what tree-sitter-md
+/// costs a key, and an emphasis is coloured as it is typed in a README
+/// of 190 KB (#54).
+const MARKDOWN_SYNC_PARSE_MAX_BYTES: usize = 256 * 1024;
+
+/// What of a keystroke's 4 ms its parse may take, what is left once the
+/// frame has its 2 to 3: a parse that took longer leaves the keys after
+/// it to edit the trees alone until the typing pauses. On a machine
+/// busy with builds, a key in a 47 KB file took 4.6 to 5.7 ms, its parse
+/// some 1 to 1.4 of it, every one of 31 over (elundqvist/kvist#370).
+const PARSE_SHARE: Duration = Duration::from_millis(1);
+
+/// Whether a keystroke in a text of `len` bytes in `language` parses it
+/// then: one within its language's limit, where the last a key parsed
+/// took its share of the key and no more (`slow`). A Markdown text goes
+/// by its old limit alone (`MARKDOWN_SYNC_PARSE_MAX_BYTES`).
+fn parsed_at_the_key(language: &str, len: usize, slow: bool) -> bool {
+    if language == "markdown" {
+        return len <= MARKDOWN_SYNC_PARSE_MAX_BYTES;
+    }
+    len <= SYNC_PARSE_MAX_BYTES && !slow
 }
 
 /// A text above this size has its trees freed on a thread of their own
@@ -54,6 +92,7 @@ impl TreeSitterInputHighlighter {
         Self {
             inner: Rc::new(RefCell::new(SyntaxHighlighter::new(language))),
             parse_task: Rc::new(RefCell::new(None)),
+            slow: Rc::new(Cell::new(false)),
         }
     }
 }
@@ -83,17 +122,19 @@ impl InputHighlighter for TreeSitterInputHighlighter {
         cx: &mut gpui::Context<EditorState>,
     ) {
         const SYNC_PARSE_TIMEOUT: Duration = Duration::from_millis(2);
-        const SYNC_PARSE_MAX_BYTES: usize = 256 * 1024;
         const PARSE_DEBOUNCE: Duration = Duration::from_millis(150);
 
         let edit = edit.map(to_tree_sitter_edit);
         let completed = {
             let mut highlighter = self.inner.borrow_mut();
-            if text.len() > SYNC_PARSE_MAX_BYTES {
+            if !parsed_at_the_key(highlighter.language(), text.len(), self.slow.get()) {
                 highlighter.edit_tree(edit, text);
                 false
             } else {
-                highlighter.update(edit, text, Some(SYNC_PARSE_TIMEOUT))
+                let began = Instant::now();
+                let completed = highlighter.update(edit, text, Some(SYNC_PARSE_TIMEOUT));
+                self.slow.set(began.elapsed() > PARSE_SHARE);
+                completed
             }
         };
         if completed {
@@ -103,6 +144,7 @@ impl InputHighlighter for TreeSitterInputHighlighter {
 
         let highlighter = self.inner.clone();
         let parse_task = self.parse_task.clone();
+        let slow = self.slow.clone();
         let language = highlighter.borrow().language().clone();
         let old_tree = highlighter.borrow().tree().cloned();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -181,6 +223,8 @@ impl InputHighlighter for TreeSitterInputHighlighter {
                 highlighter
                     .borrow_mut()
                     .apply_background_tree(tree, &text_for_apply, injections);
+                // the typing paused: the next key tries a parse again
+                slow.set(false);
                 let _ = entity.update(cx, |state, cx| {
                     state.apply_highlighter_fold_candidates(folds, cx);
                 });
@@ -315,6 +359,24 @@ mod tests {
         ranges.sort_by_key(|range| range.start_line);
         ranges.dedup_by_key(|range| range.start_line);
         ranges
+    }
+
+    /// A keystroke parses a text on the drawing thread only where the
+    /// parse leaves the frame its share of the 4 ms a key has: a file of
+    /// 150 KB took 4.6 to 5.5 ms a key, 1.8 to 2.2 of it the parse, and
+    /// one of 47 KB on a busy machine 4.6 to 5.7, 1 to 1.4 of it the parse
+    /// (elundqvist/kvist#370). A Markdown text keeps its old limit, which
+    /// elundqvist/kvist#376 is to settle.
+    #[test]
+    fn test_a_keystroke_parses_only_a_small_text() {
+        assert!(parsed_at_the_key("rust", 25_000, false));
+        assert!(parsed_at_the_key("rust", 48 * 1024, false));
+        assert!(!parsed_at_the_key("rust", 100_000, false), "100 KB took 1.3 to 1.6 ms to parse");
+        assert!(!parsed_at_the_key("rust", 150_000, false));
+        assert!(!parsed_at_the_key("rust", 25_000, true), "the last key's parse took more than its share");
+        assert!(parsed_at_the_key("markdown", 190_000, false), "#54's README");
+        assert!(parsed_at_the_key("markdown", 190_000, true));
+        assert!(!parsed_at_the_key("markdown", 300_000, false));
     }
 
     /// An edit's fold candidates are those of the whole text it reaches,
