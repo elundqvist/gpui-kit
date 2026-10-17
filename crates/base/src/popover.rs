@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::{cell::Cell, rc::Rc};
 
 use gpui::{
     Anchor, AnyElement, App, Context, DismissEvent, ElementId, EventEmitter, FocusHandle,
@@ -285,6 +285,16 @@ impl RenderOnce for Popover {
             return div().id("empty").into_any_element();
         };
         let parent_view_id = window.current_view();
+        // A press on the trigger toggles the popover unless something in that
+        // same press closed it already, as the content's outside press does
+        // before the trigger hears it. That is decided by what the state was
+        // as the press began, which the capture phase sees before the
+        // content's handlers run: the `open` the trigger was drawn with is a
+        // frame old, and where a dismiss and the next press on the trigger
+        // came in one batch, with no frame drawn between them (a busy main
+        // thread), it said open of a closed popover and the press did
+        // nothing (elundqvist/kvist#306).
+        let open_at_press = Rc::new(Cell::new(None));
         let popup = Popup::new(self.id, trigger(open, window, cx))
             .anchor(self.anchor)
             .key_context(CONTEXT)
@@ -295,12 +305,18 @@ impl RenderOnce for Popover {
                     cx.notify(parent_view_id);
                 }
             })
+            .capture_any_mouse_down({
+                let state = state.clone();
+                let open_at_press = open_at_press.clone();
+                move |_, _, cx| open_at_press.set(Some(state.read(cx).is_open()))
+            })
             .on_mouse_down(self.mouse_button, {
                 let state = state.clone();
                 move |_, window, cx| {
                     cx.stop_propagation();
+                    let was_open = open_at_press.take().unwrap_or(open);
                     state.update(cx, |state, cx| {
-                        if state.is_open() == open {
+                        if state.is_open() == was_open {
                             state.toggle_open(window, cx);
                         }
                     });
@@ -439,6 +455,61 @@ mod tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(cx.debug_bounds("base-popover-content").is_none());
         assert_eq!(&*changes.borrow(), &[true, false]);
+    }
+
+    /// A platform hands a busy main thread what came in meanwhile as one
+    /// batch, and a frame is drawn only after it: a press outside that
+    /// dismissed the popover and a press on its trigger then met a trigger
+    /// drawn open, which did nothing with the closed popover, so the menu
+    /// took two clicks to open again (elundqvist/kvist#306). A press on the
+    /// trigger of an open popover still only closes it.
+    #[gpui::test]
+    fn a_press_on_the_trigger_no_frame_since_the_dismiss_has_drawn_opens_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::init);
+        let changes = Rc::new(RefCell::new(Vec::new()));
+        let (_, cx) = cx.add_window_view({
+            let changes = changes.clone();
+            move |_, _| PopoverHarness {
+                changes,
+                default_open: false,
+            }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let trigger = point(px(20.), px(10.));
+
+        cx.simulate_click(trigger, Default::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("base-popover-content").is_some());
+
+        cx.update(|window, cx| {
+            for position in [point(px(300.), px(300.)), trigger] {
+                let press = gpui::MouseDownEvent {
+                    button: MouseButton::Left,
+                    position,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                };
+                window.dispatch_event(gpui::PlatformInput::MouseDown(press), cx);
+                let release = gpui::MouseUpEvent {
+                    button: MouseButton::Left,
+                    position,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                };
+                window.dispatch_event(gpui::PlatformInput::MouseUp(release), cx);
+            }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("base-popover-content").is_some());
+        assert_eq!(&*changes.borrow(), &[true, false, true]);
+
+        cx.simulate_click(trigger, Default::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("base-popover-content").is_none());
+        assert_eq!(&*changes.borrow(), &[true, false, true, false]);
     }
 
     #[gpui::test]
