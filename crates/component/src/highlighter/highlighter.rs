@@ -777,6 +777,14 @@ impl SyntaxHighlighter {
         {
             self.edited.push(start..new_end);
         }
+        // and one kept already is kept once: a point was kept again for
+        // every point at its place, so the points doubled at each deletion
+        // made before a parse, and a held Backspace or an undo of 28 keys
+        // in a text too large to parse at each key kept 268 million of
+        // them, seconds and gigabytes to make and to look through
+        // (elundqvist/kvist#368)
+        self.edited.sort_unstable_by_key(|r| (r.start, r.end));
+        self.edited.dedup();
     }
 
     /// Whether an edit since the last finished parse reached the node: a
@@ -3075,6 +3083,42 @@ $x = 1;
         let mut highlighter = fresh_highlighter("javascript", source);
         highlighter.edit_tree(None, &Rope::from_str("const other = 1;\n"));
         assert!(highlighter.match_styles(0..17).is_empty());
+    }
+
+    /// Characters deleted one after another with no parse between them, as
+    /// a held Backspace or an undo of typing does in a text too large to
+    /// parse at each key, are one point where the last went, kept once.
+    /// A point was kept again for every point at its place, so the points
+    /// doubled at each deletion: 28 of them were 268 million, which took
+    /// seconds and some 6 GB (elundqvist/kvist#368).
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_deletions_before_a_parse_keep_one_point_each() {
+        let mut text = format!("let typed = \"{}\";\n{}", "x".repeat(40), statements(0..50));
+        let mut highlighter = fresh_highlighter("javascript", &text);
+        let end = text.find("\";").unwrap();
+        // a held Backspace, from the end of the string back
+        for at in (end - 24..end).rev() {
+            let (edit, edited) = replace(&text, at..at + 1, "");
+            highlighter.edit_tree(Some(edit), &Rope::from_str(&edited));
+            text = edited;
+        }
+        let at = end - 24;
+        assert_eq!(highlighter.edited.len(), 1, "one point");
+        assert_eq!(highlighter.edited, vec![at..at], "where the last went");
+        // a held Delete there, then a character typed: still one point a place
+        for _ in 0..24 {
+            let (edit, edited) = replace(&text, at..at + 1, "");
+            highlighter.edit_tree(Some(edit), &Rope::from_str(&edited));
+            text = edited;
+        }
+        let (edit, edited) = replace(&text, at..at, "y");
+        highlighter.edit_tree(Some(edit), &Rope::from_str(&edited));
+        assert_eq!(
+            highlighter.edited,
+            vec![at..at, at..at + 1, at + 1..at + 1],
+            "the point, what was typed at it, and the point moved past it"
+        );
     }
 
     /// A keystroke whose parse of the host runs out of time keeps the host's

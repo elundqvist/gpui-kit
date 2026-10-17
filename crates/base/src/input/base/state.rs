@@ -2238,10 +2238,11 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.undo_manager.set_ignoring(true);
         if let Some(changes) = self.undo_manager.undo() {
             let selection = changes.last().unwrap().selection_before;
-            for change in &changes {
-                let range_utf16 = self.range_to_utf16(&change.new_range.into());
-                self.replace_text_in_range_silent(Some(range_utf16), &change.old_text, window, cx);
-            }
+            let steps: Vec<(Range<usize>, &str)> = changes
+                .iter()
+                .map(|change| (change.new_range.into(), change.old_text.as_str()))
+                .collect();
+            self.replay(&steps, window, cx);
             self.selected_range = selection;
             // before the next layout chooses its lines: left to the
             // caret's follow in the layout, the lines were those at the
@@ -2256,14 +2257,63 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.undo_manager.set_ignoring(true);
         if let Some(changes) = self.undo_manager.redo() {
             let selection = changes.last().unwrap().selection_after;
-            for change in &changes {
-                let range_utf16 = self.range_to_utf16(&change.old_range.into());
-                self.replace_text_in_range_silent(Some(range_utf16), &change.new_text, window, cx);
-            }
+            let steps: Vec<(Range<usize>, &str)> = changes
+                .iter()
+                .map(|change| (change.old_range.into(), change.new_text.as_str()))
+                .collect();
+            self.replay(&steps, window, cx);
             self.selected_range = selection;
             self.scroll_to_edited(self.cursor(), cx);
         }
         self.undo_manager.set_ignoring(false);
+    }
+
+    /// Make a step of undo or redo, `steps` its changes in turn, each a
+    /// range of the text as the ones before it left it and what goes
+    /// there, as one edit, as VS Code and IntelliJ take an undo: the text
+    /// takes each, and what follows the text (`follow_edit`) is handed one
+    /// edit, from where the first begins to where the last ends, and one
+    /// `Change`. Each was made as an edit of its own, so 28 keys typed in
+    /// a large file and undone were parsed, folded and marked 28 times
+    /// over, and the view answered 28 changes (elundqvist/kvist#368). A
+    /// single line goes as typed, through its mask and its check of what
+    /// it holds, as it is short.
+    fn replay(&mut self, steps: &[(Range<usize>, &str)], window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_multi_line() {
+            for (range, text) in steps {
+                let range_utf16 = self.range_to_utf16(range);
+                self.replace_text_in_range_silent(Some(range_utf16), text, window, cx);
+            }
+            return;
+        }
+        if steps.is_empty() {
+            return;
+        }
+        if self.blink_cursor.read(cx).visible() {
+            self.pause_blink_cursor(cx);
+        }
+        let old_text = self.text.clone();
+        // what is alike before the first change and after the last
+        let (mut head, mut tail) = (usize::MAX, usize::MAX);
+        for (range, text) in steps {
+            let range = self.text.clip_offset(range.start, Bias::Left)
+                ..self.text.clip_offset(range.end, Bias::Right);
+            head = head.min(range.start);
+            tail = tail.min(self.text.len() - range.end);
+            self.text.replace(range, text);
+        }
+        let range = head..old_text.len() - tail;
+        let new_text = self.text.slice(head..self.text.len() - tail).to_string();
+        M::adjust_annotations(self, &range, new_text.len());
+        self.follow_edit(&old_text, &range, &new_text, window, cx);
+        self.ime_marked_range.take();
+        self.preferred_column = None;
+        self.update_search(cx);
+        self.mode.update_auto_grow(&self.display_map);
+        if self.emit_events {
+            cx.emit(InputEvent::Change);
+        }
+        cx.notify();
     }
 
     /// Get byte offset of the cursor.
@@ -2853,6 +2903,44 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.silent_replace_text = false;
     }
 
+    /// What follows the text through an edit, once the text has it:
+    /// `range` of `old_text`, the text before it, is `new_text` now. The
+    /// problems, the folds and the lines laid out are moved with it, and
+    /// the highlighter, the fold candidates and the language features take
+    /// it in.
+    fn follow_edit(
+        &mut self,
+        old_text: &Rope,
+        range: &Range<usize>,
+        new_text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(diagnostics) = self.mode.diagnostics_mut() {
+            diagnostics.reset(&self.text)
+        }
+        // Adjust folds before updating wrap map: remove overlapping folds and shift others
+        self.display_map
+            .adjust_folds_for_edit(old_text, range, new_text);
+        self.display_map
+            .on_text_changed(&self.text, range, &Rope::from(new_text), cx);
+
+        self.mode.update_highlighter::<M>(
+            super::mode::HighlighterUpdate {
+                selected_range: range,
+                old_text,
+                new_text: &self.text,
+                change_text: new_text,
+                force: true,
+            },
+            window,
+            cx,
+        );
+
+        self.update_fold_candidates_incremental(range, new_text);
+        M::refresh_language_features(self, window, cx);
+    }
+
     /// Update fold candidates from tree-sitter syntax tree (full extraction).
     /// Used only on initial load or language changes.
     fn update_fold_candidates(&mut self) {
@@ -3056,29 +3144,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         // edit into the same change, which then carries the text and selection
         // of the first composition.
         self.undo_manager.commit_transaction();
-        if let Some(diagnostics) = self.mode.diagnostics_mut() {
-            diagnostics.reset(&self.text)
-        }
-        // Adjust folds before updating wrap map: remove overlapping folds and shift others
-        self.display_map
-            .adjust_folds_for_edit(&old_text, &range, new_text);
-        self.display_map
-            .on_text_changed(&self.text, &range, &Rope::from(new_text), cx);
-
-        self.mode.update_highlighter::<M>(
-            super::mode::HighlighterUpdate {
-                selected_range: &range,
-                old_text: &old_text,
-                new_text: &self.text,
-                change_text: &new_text,
-                force: true,
-            },
-            window,
-            cx,
-        );
-
-        self.update_fold_candidates_incremental(&range, new_text);
-        M::refresh_language_features(self, window, cx);
+        self.follow_edit(&old_text, &range, new_text, window, cx);
         self.selected_range = (new_offset..new_offset).into();
         self.ime_marked_range.take();
         // The layout is older than the text now, so the caret's place in it
@@ -3151,29 +3217,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         }
 
         M::adjust_annotations(self, &range, new_text.len());
-        if let Some(diagnostics) = self.mode.diagnostics_mut() {
-            diagnostics.reset(&self.text)
-        }
-        // Adjust folds before updating wrap map: remove overlapping folds and shift others
-        self.display_map
-            .adjust_folds_for_edit(&old_text, &range, new_text);
-        self.display_map
-            .on_text_changed(&self.text, &range, &Rope::from(new_text), cx);
-
-        self.mode.update_highlighter::<M>(
-            super::mode::HighlighterUpdate {
-                selected_range: &range,
-                old_text: &old_text,
-                new_text: &self.text,
-                change_text: &new_text,
-                force: true,
-            },
-            window,
-            cx,
-        );
-
-        self.update_fold_candidates_incremental(&range, new_text);
-        M::refresh_language_features(self, window, cx);
+        self.follow_edit(&old_text, &range, new_text, window, cx);
         if new_text.is_empty() {
             // Cancel selection, when cancel IME input.
             self.selected_range = (range.start..range.start).into();
@@ -4104,6 +4148,122 @@ mod tests {
                 );
             })
         });
+    }
+
+    /// Counts what an editor hands its highlighter: the edit of each update.
+    struct Edits(Rc<std::cell::RefCell<Vec<Option<crate::input::InputEdit>>>>);
+
+    impl crate::input::InputHighlighter for Edits {
+        fn language(&self) -> SharedString {
+            "sql".into()
+        }
+
+        fn update(
+            &mut self,
+            edit: Option<crate::input::InputEdit>,
+            _: &Rope,
+            _: bool,
+            _: &mut Window,
+            _: &mut Context<crate::input::EditorState>,
+        ) {
+            self.0.borrow_mut().push(edit);
+        }
+
+        fn styles(
+            &self,
+            range: &Range<usize>,
+            _: &dyn crate::input::HighlightStyleResolver,
+        ) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
+            vec![(range.clone(), gpui::HighlightStyle::default())]
+        }
+
+        fn fold_ranges(&self, _: &Rope) -> Vec<crate::input::FoldRange> {
+            Vec::new()
+        }
+    }
+
+    /// An undo, and the redo after it, is one edit to what follows the
+    /// text, as VS Code and IntelliJ take it: the highlighter, the folds
+    /// and the problems are handed one edit from where the first change
+    /// begins to where the last ends. Each change of the step was made
+    /// again as an edit of its own, so 28 keys typed in a large file and
+    /// undone parsed, folded and marked the text 28 times over, and the
+    /// highlighter's own work grew with each (elundqvist/kvist#368).
+    #[gpui::test]
+    fn test_an_undo_of_many_keys_is_one_edit(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let edits = Rc::new(std::cell::RefCell::new(Vec::new()));
+        // a megabyte of text
+        let text = numbered_lines(0..100_000);
+        assert!(text.len() > 1_000_000);
+        let factory_edits = edits.clone();
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_highlighter_factory(
+                    Rc::new(move |_: &str| {
+                        Some(Box::new(Edits(factory_edits.clone()))
+                            as Box<dyn crate::input::InputHighlighter>)
+                    }),
+                    cx,
+                );
+                state.set_value(text.clone(), window, cx);
+            })
+        });
+        cx.run_until_parked();
+        let at = cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                let at = state.text.line_start_offset(50_000) + "line".len();
+                state.move_to(at, None, cx);
+                at
+            })
+        });
+        cx.run_until_parked();
+        // 50 keys, one step of undo
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                for _ in 0..50 {
+                    state.replace_text_in_range(None, "y", window, cx);
+                }
+            })
+        });
+        cx.run_until_parked();
+        let typed = cx.update(|_, cx| input.read_with(cx, |state, _| state.text.to_string()));
+        edits.borrow_mut().clear();
+
+        let began = std::time::Instant::now();
+        cx.update(|window, cx| input.update(cx, |state, cx| state.undo(&Undo, window, cx)));
+        let took = began.elapsed();
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.text.to_string(), text, "the keys taken back");
+                assert_eq!(state.cursor(), at);
+            })
+        });
+        let undone: Vec<_> = edits.borrow_mut().drain(..).collect();
+        assert_eq!(undone.len(), 1, "one edit for the undo");
+        let edit = undone[0].clone().expect("an edit");
+        assert_eq!(
+            (edit.start_byte, edit.old_end_byte, edit.new_end_byte),
+            (at, at + 50, at),
+            "from where the first change begins to where the last ends"
+        );
+        assert!(took < std::time::Duration::from_secs(1), "the undo took {took:?}");
+
+        cx.update(|window, cx| input.update(cx, |state, cx| state.redo(&Redo, window, cx)));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.text.to_string(), typed, "the keys again");
+                assert_eq!(state.cursor(), at + 50);
+            })
+        });
+        let redone: Vec<_> = edits.borrow_mut().drain(..).collect();
+        assert_eq!(redone.len(), 1, "one edit for the redo");
+        let edit = redone[0].clone().expect("an edit");
+        assert_eq!((edit.start_byte, edit.old_end_byte, edit.new_end_byte), (at, at, at + 50));
     }
 
     /// A match in a fold opens it when it is gone to, by typing or by
