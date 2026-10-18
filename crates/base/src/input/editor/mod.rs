@@ -144,6 +144,7 @@ impl InputModeKind for EditorMode {
     fn drive_highlighter(
         highlighter: &std::rc::Rc<std::cell::RefCell<Option<Box<dyn super::InputHighlighter>>>>,
         edit: Option<super::InputEdit>,
+        steps: &[super::InputEdit],
         text: &ropey::Rope,
         folding: bool,
         window: &mut Window,
@@ -153,7 +154,10 @@ impl InputModeKind for EditorMode {
         let Some(highlighter) = highlighter.as_mut() else {
             return;
         };
-        highlighter.update(edit, text, folding, window, cx);
+        match edit {
+            Some(edit) if !steps.is_empty() => highlighter.update_steps(steps, edit, text, folding, window, cx),
+            _ => highlighter.update(edit, text, folding, window, cx),
+        }
     }
 
     fn register_actions(

@@ -121,6 +121,61 @@ impl InputHighlighter for TreeSitterInputHighlighter {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<EditorState>,
     ) {
+        self.take_edit(&[], edit, text, folding, window, cx);
+    }
+
+    fn update_steps(
+        &mut self,
+        edits: &[BaseInputEdit],
+        edit: BaseInputEdit,
+        text: &Rope,
+        folding: bool,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<EditorState>,
+    ) {
+        let steps: Vec<InputEdit> = edits.iter().copied().map(to_tree_sitter_edit).collect();
+        self.take_edit(&steps, Some(edit), text, folding, window, cx);
+    }
+
+    fn styles(
+        &self,
+        range: &Range<usize>,
+        resolver: &dyn HighlightStyleResolver,
+    ) -> Vec<(Range<usize>, HighlightStyle)> {
+        self.inner.borrow().styles(range, resolver)
+    }
+    fn fold_ranges(&self, _: &Rope) -> Vec<FoldRange> {
+        self.inner
+            .borrow()
+            .tree_of_text()
+            .map(extract_fold_ranges)
+            .unwrap_or_default()
+    }
+
+    fn fold_ranges_for_edit(&self, range: Range<usize>, _: &Rope) -> Vec<FoldRange> {
+        self.inner
+            .borrow()
+            .tree_of_text()
+            .map(|tree| extract_fold_ranges_in_range(tree, range))
+            .unwrap_or_default()
+    }
+}
+
+impl TreeSitterInputHighlighter {
+    /// Take the text `edit` made, or the text made anew where there is no
+    /// edit, and `steps`, the changes `edit` covers one by one where there
+    /// are any (`InputHighlighter::update_steps`): parsed at the key where
+    /// the text is small enough, else the trees moved with it and the
+    /// parse left to the pause.
+    fn take_edit(
+        &mut self,
+        steps: &[InputEdit],
+        edit: Option<BaseInputEdit>,
+        text: &Rope,
+        folding: bool,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<EditorState>,
+    ) {
         const SYNC_PARSE_TIMEOUT: Duration = Duration::from_millis(2);
         const PARSE_DEBOUNCE: Duration = Duration::from_millis(150);
 
@@ -145,7 +200,7 @@ impl InputHighlighter for TreeSitterInputHighlighter {
                 highlighter.keep_colours_through(text);
                 false
             } else if !at_the_key {
-                highlighter.edit_tree(edit, text);
+                highlighter.edit_tree_in_steps(steps, edit, text);
                 false
             } else {
                 // a text made anew, parsed now: the trees are of none of
@@ -158,7 +213,7 @@ impl InputHighlighter for TreeSitterInputHighlighter {
                     }
                 }
                 let began = Instant::now();
-                let completed = highlighter.update(edit, text, Some(SYNC_PARSE_TIMEOUT));
+                let completed = highlighter.update_in_steps(steps, edit, text, Some(SYNC_PARSE_TIMEOUT));
                 self.slow.set(began.elapsed() > PARSE_SHARE);
                 completed
             }
@@ -271,29 +326,6 @@ impl InputHighlighter for TreeSitterInputHighlighter {
             }
         });
         parse_task.borrow_mut().replace(task);
-    }
-
-    fn styles(
-        &self,
-        range: &Range<usize>,
-        resolver: &dyn HighlightStyleResolver,
-    ) -> Vec<(Range<usize>, HighlightStyle)> {
-        self.inner.borrow().styles(range, resolver)
-    }
-    fn fold_ranges(&self, _: &Rope) -> Vec<FoldRange> {
-        self.inner
-            .borrow()
-            .tree_of_text()
-            .map(extract_fold_ranges)
-            .unwrap_or_default()
-    }
-
-    fn fold_ranges_for_edit(&self, range: Range<usize>, _: &Rope) -> Vec<FoldRange> {
-        self.inner
-            .borrow()
-            .tree_of_text()
-            .map(|tree| extract_fold_ranges_in_range(tree, range))
-            .unwrap_or_default()
     }
 }
 
@@ -603,6 +635,67 @@ mod tests {
         let line = at..at + function(1000).len();
         assert_eq!(h.fold_ranges_for_edit(line, &other_rope).len(), 2, "a function and its `if`");
         assert_eq!(h.fold_ranges(&other_rope).len(), 4_000);
+    }
+
+    /// A rename's changes in a text too large to parse at the key, handed
+    /// one by one, move the tree its folds are found in as they moved the
+    /// text: the candidates an edit's lines find are those a parse of the
+    /// new text finds, so a fold a change lies within is found again and
+    /// stays shut. Moved by the one edit from the first change to the last,
+    /// every function between was taken into it, its candidates went, and
+    /// the folds it held opened (elundqvist/kvist#404).
+    #[gpui::test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_changes_one_by_one_keep_a_large_texts_fold_candidates(cx: &mut gpui::TestAppContext) {
+        use gpui_base::input::{Point as BasePoint, RopeExt as _};
+
+        cx.update(crate::init);
+        let (editor, cx) = cx.add_window_view(|window, cx| EditorState::new(window, cx));
+        let function = |i: usize| format!("fn f{i}(sum: u32) -> u32 {{\n    if sum > {i} {{\n        sum + 1\n    }} else {{\n        0\n    }}\n}}\n\n");
+        let old: String = (0..1_500).map(function).collect();
+        assert!(!parsed_at_the_key("rust", old.len(), false));
+        let mut h = TreeSitterInputHighlighter::new("rust");
+        let old_rope = Rope::from(old.as_str());
+        assert!(h.inner.borrow_mut().update(None, &old_rope, None));
+        // `sum` renamed `total` in every function, the last first, each
+        // change where it is in the text the ones before it left
+        let places: Vec<usize> = old.rmatch_indices("sum").map(|(at, _)| at).collect();
+        let steps: Vec<BaseInputEdit> = places
+            .iter()
+            .map(|&at| {
+                let start = old_rope.offset_to_point(at);
+                BaseInputEdit {
+                    start_byte: at,
+                    old_end_byte: at + 3,
+                    new_end_byte: at + 5,
+                    start_position: start,
+                    old_end_position: BasePoint::new(start.row, start.column + 3),
+                    new_end_position: BasePoint::new(start.row, start.column + 5),
+                }
+            })
+            .collect();
+        let new = old.replace("sum", "total");
+        let new_rope = Rope::from(new.as_str());
+        let (first, last) = (*places.last().unwrap(), places[0]);
+        let new_last = last + 3 + (new.len() - old.len());
+        let covering = BaseInputEdit {
+            start_byte: first,
+            old_end_byte: last + 3,
+            new_end_byte: new_last,
+            start_position: old_rope.offset_to_point(first),
+            old_end_position: old_rope.offset_to_point(last + 3),
+            new_end_position: new_rope.offset_to_point(new_last),
+        };
+        cx.update(|window, cx| editor.update(cx, |_, cx| h.update_steps(&steps, covering, &new_rope, true, window, cx)));
+        assert!(h.parse_task.borrow().is_some(), "moved, its parse left to the pause");
+        let config = LanguageRegistry::singleton().language("rust").unwrap();
+        let mut parser = Parser::new();
+        parser.set_language(config.language.as_ref().unwrap()).unwrap();
+        let fresh = parser.parse(&new, None).unwrap();
+        let lines = 0..new.len();
+        let found = h.fold_ranges_for_edit(lines.clone(), &new_rope);
+        assert_eq!(found.len(), 4_500, "a function, its `if` and its `else` each");
+        assert_eq!(found, extract_fold_ranges_in_range(&fresh, lines));
     }
 
     /// An edit's fold candidates are those of the whole text it reaches,

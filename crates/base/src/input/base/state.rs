@@ -3087,6 +3087,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                 old_text,
                 new_text: &self.text,
                 change_text: new_text,
+                steps,
                 force: true,
             },
             window,
@@ -3538,6 +3539,7 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
                     old_text: &self.text,
                     new_text: &self.text,
                     change_text: "",
+                    steps: &[],
                     force: false,
                 },
                 window,
@@ -4963,6 +4965,92 @@ mod tests {
         fn fold_ranges(&self, _: &Rope) -> Vec<crate::input::FoldRange> {
             Vec::new()
         }
+    }
+
+    /// Counts how many changes an editor hands its highlighter one by one
+    /// at each update (`InputHighlighter::update_steps`), none for one edit.
+    struct Steps(Rc<std::cell::RefCell<Vec<usize>>>);
+
+    impl crate::input::InputHighlighter for Steps {
+        fn language(&self) -> SharedString {
+            "sql".into()
+        }
+
+        fn update(
+            &mut self,
+            edit: Option<crate::input::InputEdit>,
+            _: &Rope,
+            _: bool,
+            _: &mut Window,
+            _: &mut Context<crate::input::EditorState>,
+        ) {
+            if edit.is_some() {
+                self.0.borrow_mut().push(0);
+            }
+        }
+
+        fn update_steps(
+            &mut self,
+            edits: &[crate::input::InputEdit],
+            _: crate::input::InputEdit,
+            _: &Rope,
+            _: bool,
+            _: &mut Window,
+            _: &mut Context<crate::input::EditorState>,
+        ) {
+            self.0.borrow_mut().push(edits.len());
+        }
+
+        fn styles(
+            &self,
+            range: &Range<usize>,
+            _: &dyn crate::input::HighlightStyleResolver,
+        ) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
+            vec![(range.clone(), gpui::HighlightStyle::default())]
+        }
+
+        fn fold_ranges(&self, _: &Rope) -> Vec<crate::input::FoldRange> {
+            Vec::new()
+        }
+    }
+
+    /// An application's changes, their undo and their redo are handed to
+    /// the highlighter one by one, as well as the one edit that covers
+    /// them, so that a tree it moves with an edit keeps what lies between
+    /// them in its place; a key is one edit (elundqvist/kvist#404).
+    #[gpui::test]
+    fn test_changes_are_handed_to_the_highlighter_one_by_one(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let steps = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let factory_steps = steps.clone();
+        let text = "fn sum(sum: u32) -> u32 {\n    sum\n}\n";
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_highlighter_factory(
+                    Rc::new(move |_: &str| {
+                        Some(Box::new(Steps(factory_steps.clone())) as Box<dyn crate::input::InputHighlighter>)
+                    }),
+                    cx,
+                );
+                state.set_value(text, window, cx);
+            })
+        });
+        cx.run_until_parked();
+        steps.borrow_mut().clear();
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                let edits: Vec<(Range<usize>, &str)> =
+                    text.rmatch_indices("sum").map(|(at, _)| (at..at + 3, "total")).collect();
+                state.replace_steps(&edits, window, cx);
+                state.undo(&Undo, window, cx);
+                state.redo(&Redo, window, cx);
+                state.move_to(0, None, cx);
+                state.replace_text_in_range(None, "x", window, cx);
+            })
+        });
+        assert_eq!(*steps.borrow(), [3, 3, 3, 0], "the changes, their undo, their redo, and a key");
     }
 
     /// An undo, and the redo after it, is one edit to what follows the

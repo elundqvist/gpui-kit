@@ -784,7 +784,7 @@ impl SyntaxHighlighter {
                 new_end_position: point(text, new_len - tail),
             };
             self.edited.clear();
-            self.move_trees(&edit);
+            self.move_trees(&[], &edit);
         } else {
             self.edited.clear();
             self.coloured_to = Some(self.coloured_to.map_or(head, |end| end.min(head)));
@@ -801,8 +801,14 @@ impl SyntaxHighlighter {
     /// a token an edit lands in grows over all it inserts, and the rest
     /// keeps its colours, moved with the text.
     pub fn edit_tree(&mut self, edit: Option<InputEdit>, text: &Rope) {
+        self.edit_tree_in_steps(&[], edit, text)
+    }
+
+    /// `edit_tree` for changes made one after another, `steps`, which
+    /// `edit` covers (`move_trees`).
+    pub(crate) fn edit_tree_in_steps(&mut self, steps: &[InputEdit], edit: Option<InputEdit>, text: &Rope) {
         match edit {
-            Some(edit) => self.move_trees(&edit),
+            Some(edit) => self.move_trees(steps, &edit),
             // the whole text is new, and the tree knows none of it: it is
             // plain until the parse, which starts afresh, rather than
             // coloured as the old text was where the old tree's nodes
@@ -825,10 +831,18 @@ impl SyntaxHighlighter {
     /// keep where it lies: what it touched is left plain until a parse.
     /// The end of what trees kept through a text made anew colour moves
     /// with it, and an edit that reaches past it ends it at the edit's
-    /// start.
-    fn move_trees(&mut self, edit: &InputEdit) {
+    /// start. Where `edit` covers changes made one after another, `steps`
+    /// (`InputHighlighter::update_steps`), the tree is moved by each in
+    /// turn, so that what lies between them keeps its place in it, and a
+    /// fold one lies within is found again as long as it was: moved by the
+    /// one edit, every node between the first change and the last was
+    /// taken into it, and in a text too large to parse at the key a rename
+    /// or a Replace All opened every fold a change lay within
+    /// (elundqvist/kvist#404). The layers are moved by the one edit, and
+    /// what it reaches of them looked at again, as before.
+    fn move_trees(&mut self, steps: &[InputEdit], edit: &InputEdit) {
         if let Some(tree) = self.tree.as_mut() {
-            tree.edit(edit);
+            edit_by_steps(tree, steps, edit);
         }
         self.edit_injection_layers(edit);
         self.note_edit(edit);
@@ -996,6 +1010,19 @@ impl SyntaxHighlighter {
         text: &Rope,
         timeout: Option<Duration>,
     ) -> bool {
+        self.update_in_steps(&[], edit, text, timeout)
+    }
+
+    /// `update` for changes made one after another, `steps`, which `edit`
+    /// covers: the tree is moved by each in turn before it is parsed
+    /// (`move_trees`).
+    pub(crate) fn update_in_steps(
+        &mut self,
+        steps: &[InputEdit],
+        edit: Option<InputEdit>,
+        text: &Rope,
+        timeout: Option<Duration>,
+    ) -> bool {
         // the trees kept through a text made anew are not of it, however
         // alike the texts
         if self.text.eq(text) && !self.anew {
@@ -1026,6 +1053,8 @@ impl SyntaxHighlighter {
         // and left no tree, stood plain until it was opened again
         // (elundqvist/kvist#376).
         let edit = if self.tree.is_none() { None } else { edit };
+        let key_steps = steps;
+        let steps = if edit.is_some() { steps } else { &[] };
 
         // An edit of a text parsed before: what it reaches is all the
         // injections need looked at again.
@@ -1048,7 +1077,7 @@ impl SyntaxHighlighter {
             Some(tree) => tree,
             None => self.parser.parse("", None).unwrap(),
         };
-        old_tree.edit(&edit);
+        edit_by_steps(&mut old_tree, steps, &edit);
         if kept.is_none() {
             self.edit_injection_layers(&edit);
             self.note_edit(&edit);
@@ -1099,7 +1128,7 @@ impl SyntaxHighlighter {
                     self.injection_layers = kept.injection_layers;
                     // moved with the key, as `edit_tree` moves them
                     if let Some(key_edit) = key_edit {
-                        self.move_trees(&key_edit);
+                        self.move_trees(key_steps, &key_edit);
                     }
                 }
                 // the tree of the empty text, edited to this one, colours
@@ -2032,6 +2061,17 @@ impl SyntaxHighlighter {
         // println!("--------------------------------");
 
         styles
+    }
+}
+
+/// Move `tree` by `steps`, the changes `edit` covers one by one, where
+/// there are any, else by `edit` (`SyntaxHighlighter::move_trees`).
+fn edit_by_steps(tree: &mut Tree, steps: &[InputEdit], edit: &InputEdit) {
+    if steps.is_empty() {
+        tree.edit(edit);
+    }
+    for step in steps {
+        tree.edit(step);
     }
 }
 

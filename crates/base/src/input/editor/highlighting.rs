@@ -39,6 +39,29 @@ pub trait InputHighlighter {
         cx: &mut Context<EditorState>,
     );
 
+    /// The text made by changes made one after another, as a rename, a
+    /// replace of every match and their undo make them: `edits`, each an
+    /// edit of the text the ones before it left, the last of the text first
+    /// (`apart`), which `edit` covers as one. By default the one edit. A
+    /// highlighter that keeps a tree it moves with an edit until it parses
+    /// again takes them one by one, so that what lies between two changes
+    /// keeps its place in it: moved by the one edit, every node from the
+    /// first change to the last was taken into it, and a fold a change lay
+    /// within, looked for again in the tree, was not found and opened
+    /// (elundqvist/kvist#404).
+    fn update_steps(
+        &mut self,
+        edits: &[InputEdit],
+        edit: InputEdit,
+        text: &Rope,
+        folding: bool,
+        window: &mut Window,
+        cx: &mut Context<EditorState>,
+    ) {
+        let _ = edits;
+        self.update(Some(edit), text, folding, window, cx);
+    }
+
     /// Return ordered, non-overlapping style runs that fully cover `range`.
     /// Use [`HighlightStyle::default`] for text without a semantic style.
     fn styles(
