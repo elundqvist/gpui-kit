@@ -39,6 +39,8 @@ const KEEP_ANEW_EDIT_BYTES: usize = 64 * 1024;
 thread_local! {
     /// How many injection layers this thread has parsed, for the tests.
     static LAYER_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many layers' trees this thread has moved with an edit.
+    static LAYER_TREE_EDITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A syntax highlighter that supports incremental parsing, multiline text,
@@ -72,7 +74,10 @@ pub struct SyntaxHighlighter {
 
     /// Parsed injection trees.
     /// These are built once in update() and queried multiple times in match_styles().
-    injection_layers: Vec<InjectionLayer>,
+    /// Shared with a parse off the UI thread, which makes its own of them
+    /// there (`InjectionParseSource`): copied here, the 3,000 of a
+    /// CHANGELOG took 0.2 to 0.6 ms of every key (elundqvist/kvist#376).
+    injection_layers: Arc<Vec<InjectionLayer>>,
     /// The layers are every span the last query over the whole text found,
     /// each parsed to its end, and moved with the edits since: an edit
     /// that reaches none of them leaves them as they are.
@@ -106,7 +111,7 @@ pub struct SyntaxHighlighter {
 /// elsewhere ([`SyntaxHighlighter::take_parse`]).
 pub(crate) struct Parse {
     tree: Option<Tree>,
-    injection_layers: Vec<InjectionLayer>,
+    injection_layers: Arc<Vec<InjectionLayer>>,
 }
 
 impl Parse {
@@ -118,6 +123,7 @@ impl Parse {
 
 /// A parsed injection layer.
 /// Stores the parsed tree and the ranges it covers.
+#[derive(Clone)]
 pub(crate) struct InjectionLayer {
     pub(crate) language_name: SharedString,
     highlight_query: Arc<Query>,
@@ -134,6 +140,46 @@ pub(crate) struct InjectionLayer {
     /// unmake it, and one outside it cannot. `None` where the pattern's
     /// node could not be told.
     pub(crate) match_range: Option<tree_sitter::Range>,
+    /// Where the tree has the first of `ranges` start, where the edits
+    /// since it was parsed or last moved all lay before the layer, and
+    /// moved its ranges but not the tree (`edit_injection_layers`).
+    moved_from: Option<(usize, Point)>,
+}
+
+impl InjectionLayer {
+    /// How far the layer's text lies past where its tree has it: what the
+    /// edits before it since the tree last moved put in, less what they
+    /// took out (`moved_from`).
+    fn shift(&self) -> isize {
+        match (self.moved_from, self.ranges.first()) {
+            (Some((from, _)), Some(first)) => first.start_byte as isize - from as isize,
+            _ => 0,
+        }
+    }
+
+    /// Move the tree to where the layer's text is now, by the one edit
+    /// that every edit before it since comes to (`moved_from`).
+    fn catch_up(&mut self) {
+        catch_up(&mut self.tree, self.moved_from.take(), &self.ranges);
+    }
+}
+
+/// Move `tree`, of `ranges`, from where it has the first of them start,
+/// `from`, to where that is now: the edits before a layer's text, put
+/// together, are one edit of what lies before it. tree-sitter moves a tree
+/// by such an edit as by each of them in turn, a node's columns included,
+/// as it moves `ranges` (`InputEdit::edit_range`).
+fn catch_up(tree: &mut Tree, from: Option<(usize, Point)>, ranges: &[tree_sitter::Range]) {
+    if let (Some((byte, point)), Some(first)) = (from, ranges.first()) {
+        tree.edit(&InputEdit {
+            start_byte: 0,
+            old_end_byte: byte,
+            new_end_byte: first.start_byte,
+            start_position: Point::new(0, 0),
+            old_end_position: point,
+            new_end_position: first.start_point,
+        });
+    }
 }
 
 /// Data needed to compute injection layers on a background thread.
@@ -173,9 +219,80 @@ pub(crate) struct ReusableInjectionLayer {
     /// No edit has reached the layer's text since its tree was parsed to
     /// its end: the text it was parsed from is the text there now.
     intact: bool,
+    /// `InjectionLayer::moved_from`: the tree is moved where it is reused,
+    /// and a layer kept as it is keeps it.
+    moved_from: Option<(usize, Point)>,
 }
 
-struct TextProvider<'a>(&'a Rope);
+impl ReusableInjectionLayer {
+    /// `layer`, intact where none of `edited`, the edits since the last
+    /// finished parse, reaches it, its edges included.
+    fn of(layer: InjectionLayer, edited: &[Range<usize>]) -> Self {
+        let intact = !edited
+            .iter()
+            .any(|r| r.start <= layer.byte_range.end && layer.byte_range.start <= r.end);
+        Self {
+            language_name: layer.language_name,
+            highlight_query: layer.highlight_query,
+            ranges: layer.ranges,
+            tree: layer.tree,
+            match_range: layer.match_range,
+            intact,
+            moved_from: layer.moved_from,
+        }
+    }
+
+    fn catch_up(&mut self) {
+        catch_up(&mut self.tree, self.moved_from.take(), &self.ranges);
+    }
+}
+
+/// What a parse of the injections off the UI thread needs of the
+/// highlighter, taken there for next to nothing: the layers are shared,
+/// not copied, and made the parse's own on its thread (`into_data`).
+/// Copied on the UI thread, with every tree, the 3,000 of a CHANGELOG took
+/// 0.2 to 0.6 ms of every key typed into it (elundqvist/kvist#376).
+pub(crate) struct InjectionParseSource {
+    query: Arc<Query>,
+    content_capture_index: Option<u32>,
+    language_capture_index: Option<u32>,
+    layers: Arc<Vec<InjectionLayer>>,
+    /// The edits since the last finished parse.
+    edited: Vec<Range<usize>>,
+    parse_timeout: Duration,
+    roots: Arc<[Option<SharedString>]>,
+}
+
+impl InjectionParseSource {
+    /// The data a parse of the whole text's injections takes, the old
+    /// layers its own.
+    pub(crate) fn into_data(self) -> InjectionParseData {
+        let old_layers = self
+            .layers
+            .iter()
+            .map(|layer| ReusableInjectionLayer::of(layer.clone(), &self.edited))
+            .collect();
+        InjectionParseData {
+            query: self.query,
+            content_capture_index: self.content_capture_index,
+            language_capture_index: self.language_capture_index,
+            old_layers,
+            parse_timeout: Some(self.parse_timeout),
+            cancel: None,
+            roots: self.roots,
+            reach: None,
+            paragraphs_share_timeout: false,
+        }
+    }
+}
+
+/// The text a query's predicates (`#match?`, `#eq?`) test a node against,
+/// for a tree that has it `shift` bytes back (`InjectionLayer::shift`):
+/// a layer's tree the edits before it have not moved yet. Read where the
+/// tree has the node, it was as many bytes off as the edits put in or took
+/// out, and past the text's end where they took out more than lies after
+/// the node, which panicked (elundqvist/kvist#376).
+struct TextProvider<'a>(&'a Rope, isize);
 struct ByteChunks<'a> {
     cursor: ChunkCursor<'a>,
     node_start: usize,
@@ -186,8 +303,10 @@ impl<'a> tree_sitter::TextProvider<&'a [u8]> for TextProvider<'a> {
     type I = ByteChunks<'a>;
 
     fn text(&mut self, node: tree_sitter::Node) -> Self::I {
-        let range = node.byte_range();
-        let cursor = self.0.chunk_cursor_at(range.start);
+        let TextProvider(text, shift) = *self;
+        let at = |byte: usize| byte.saturating_add_signed(shift).min(text.len());
+        let range = at(node.start_byte())..at(node.end_byte());
+        let cursor = text.chunk_cursor_at(range.start);
 
         ByteChunks {
             cursor,
@@ -584,7 +703,7 @@ impl SyntaxHighlighter {
             text: Rope::new(),
             parser: Parser::new(),
             tree: None,
-            injection_layers: Vec::new(),
+            injection_layers: Arc::default(),
             layers_whole: false,
             injection_parse_timeout: INJECTION_PARSE_TIMEOUT,
             stale: false,
@@ -715,7 +834,7 @@ impl SyntaxHighlighter {
             text: Rope::new(),
             parser,
             tree: None,
-            injection_layers: Vec::new(),
+            injection_layers: Arc::default(),
             layers_whole: false,
             injection_parse_timeout: INJECTION_PARSE_TIMEOUT,
             stale: false,
@@ -816,7 +935,7 @@ impl SyntaxHighlighter {
             // the change
             None => {
                 self.tree = None;
-                self.injection_layers.clear();
+                self.injection_layers = Arc::default();
                 self.layers_whole = false;
                 self.edited.clear();
                 self.anew = false;
@@ -859,7 +978,10 @@ impl SyntaxHighlighter {
     /// again.
     fn mark_stale(&mut self) {
         self.stale = true;
-        for layer in &mut self.injection_layers {
+        if self.injection_layers.is_empty() {
+            return;
+        }
+        for layer in Arc::make_mut(&mut self.injection_layers) {
             layer.stale = true;
         }
     }
@@ -926,7 +1048,14 @@ impl SyntaxHighlighter {
     /// edge may have taken the `/*` that opened it, so the node beside a
     /// deletion goes plain too.
     fn touched(&self, node: &tree_sitter::Node) -> bool {
-        let (start, end) = (node.start_byte(), node.end_byte());
+        self.touched_at(node, 0)
+    }
+
+    /// `touched`, for a node of a tree that has the text `shift` bytes
+    /// before where it is now (`InjectionLayer::shift`).
+    fn touched_at(&self, node: &tree_sitter::Node, shift: isize) -> bool {
+        let at = |byte: usize| byte.saturating_add_signed(shift);
+        let (start, end) = (at(node.start_byte()), at(node.end_byte()));
         node.has_changes()
             && self.edited.iter().any(|r| {
                 if r.is_empty() {
@@ -948,14 +1077,35 @@ impl SyntaxHighlighter {
             .any(|l| l.byte_range.start < range.end && range.start < l.byte_range.end)
     }
 
-    /// Apply `edit` to every injection layer as to the main tree: its tree is
-    /// edited and its ranges move with the text. A layer is then found again
+    /// Apply `edit` to the injection layers: every layer's ranges move with
+    /// the text, and the tree of a layer the edit reaches, its edges
+    /// included, is edited as the main tree is. A layer is then found again
     /// at its new place and parsed again only as far as the edit reaches, and
     /// an edit that leaves a span's length as it was (an overtype) is parsed
     /// again rather than hidden by an old tree that never saw it.
+    ///
+    /// The tree of a layer after the edit is not moved until it is used for
+    /// a parse (`InjectionLayer::catch_up`), and is read, its predicates'
+    /// text too, where its text is now (`InjectionLayer::shift`); one before
+    /// the edit is as it was. Every tree edited, a key in a CHANGELOG of 3,000 items, each
+    /// a layer, took 1.4 to 2.6 ms of the drawing thread to move the trees,
+    /// on screen, where the key is to take 4 in all (elundqvist/kvist#376).
+    /// What is left is arithmetic on each layer's ranges, 0.04 ms for the
+    /// 3,000.
     fn edit_injection_layers(&mut self, edit: &InputEdit) {
-        for layer in &mut self.injection_layers {
-            layer.tree.edit(edit);
+        if self.injection_layers.is_empty() {
+            return;
+        }
+        for layer in Arc::make_mut(&mut self.injection_layers) {
+            if edit.start_byte <= layer.byte_range.end && layer.byte_range.start <= edit.old_end_byte
+            {
+                layer.catch_up();
+                layer.tree.edit(edit);
+                #[cfg(test)]
+                LAYER_TREE_EDITS.with(|edits| edits.set(edits.get() + 1));
+            } else if edit.old_end_byte < layer.byte_range.start && layer.moved_from.is_none() {
+                layer.moved_from = layer.ranges.first().map(|r| (r.start_byte, r.start_point));
+            }
             for range in &mut layer.ranges {
                 edit.edit_range(range);
             }
@@ -1212,35 +1362,27 @@ impl SyntaxHighlighter {
 
     /// Returns the data needed to compute injection layers on a background thread.
     /// Returns `None` if this language has no injections.
+    #[cfg(test)]
     pub(crate) fn injection_parse_data(&self) -> Option<InjectionParseData> {
+        self.injection_parse_source().map(InjectionParseSource::into_data)
+    }
+
+    /// What a parse of the injections off the UI thread needs, the layers
+    /// shared rather than copied (`InjectionParseSource`). Returns `None`
+    /// if this language has no injections.
+    pub(crate) fn injection_parse_source(&self) -> Option<InjectionParseSource> {
         let query = self.injections_query.clone()?;
-        Some(InjectionParseData {
+        Some(InjectionParseSource {
             query,
             content_capture_index: self.injection_content_capture_index,
             language_capture_index: self.injection_language_capture_index,
             // a text made anew shares nothing with the old layers' trees
-            old_layers: self
-                .injection_layers
-                .iter()
-                .filter(|_| !self.anew)
-                .map(|layer| ReusableInjectionLayer {
-                    language_name: layer.language_name.clone(),
-                    highlight_query: layer.highlight_query.clone(),
-                    ranges: layer.ranges.clone(),
-                    tree: layer.tree.clone(),
-                    match_range: layer.match_range,
-                    // the edits since the last finished parse hold every
-                    // edit a layer's tree has not seen, its edges included
-                    intact: !self.edited.iter().any(|r| {
-                        r.start <= layer.byte_range.end && layer.byte_range.start <= r.end
-                    }),
-                })
-                .collect(),
-            parse_timeout: Some(self.injection_parse_timeout),
-            cancel: None,
+            layers: if self.anew { Arc::default() } else { self.injection_layers.clone() },
+            // the edits since the last finished parse hold every edit a
+            // layer's tree has not seen, its edges included
+            edited: self.edited.clone(),
+            parse_timeout: self.injection_parse_timeout,
             roots: self.injection_roots.clone(),
-            reach: None,
-            paragraphs_share_timeout: false,
         })
     }
 
@@ -1257,11 +1399,16 @@ impl SyntaxHighlighter {
     /// KB it was nearly all of the keystroke: 9 ms of 10, the parse of the
     /// host and of the layers the rest.
     pub(crate) fn compute_injection_layers(
-        data: InjectionParseData,
+        mut data: InjectionParseData,
         tree: &Tree,
         text: &Rope,
     ) -> (Vec<InjectionLayer>, bool) {
         if let Some((span, kept)) = Self::layers_beyond(&data) {
+            // the layers the query looks at again are reused moved to
+            // where their text is
+            for (layer, _) in data.old_layers.iter_mut().zip(&kept).filter(|(_, kept)| !**kept) {
+                layer.catch_up();
+            }
             let (mut layers, finished, parses) =
                 Self::query_injection_layers(&data, tree, text, Some(span));
             let kept_count = kept
@@ -1285,11 +1432,15 @@ impl SyntaxHighlighter {
                         tree: layer.tree,
                         stale: false,
                         match_range: layer.match_range,
+                        moved_from: layer.moved_from,
                     });
                 }
                 layers.sort_by_key(|layer| layer.byte_range.start);
                 return (layers, finished);
             }
+        }
+        for layer in &mut data.old_layers {
+            layer.catch_up();
         }
         let (layers, finished, _) = Self::query_injection_layers(&data, tree, text, None);
         (layers, finished)
@@ -1431,7 +1582,7 @@ impl SyntaxHighlighter {
         if let Some(span) = span.clone() {
             cursor.set_byte_range(span);
         }
-        let mut matches = cursor.matches(&data.query, root_node, TextProvider(text));
+        let mut matches = cursor.matches(&data.query, root_node, TextProvider(text, 0));
 
         let mut combined_ranges: HashMap<SharedString, CombinedRanges> = HashMap::new();
         // A span the query finds over `span` lies across it, and so does an
@@ -1495,11 +1646,18 @@ impl SyntaxHighlighter {
         // Query objects are relatively expensive. Reuse one Arc per language
         // from the previous parse and compile only languages present in this
         // document, rather than eagerly retaining every registered grammar.
-        let mut highlight_queries: HashMap<SharedString, Arc<Query>> = data
-            .old_layers
-            .iter()
-            .map(|layer| (layer.language_name.clone(), layer.highlight_query.clone()))
-            .collect();
+        let mut highlight_queries: HashMap<SharedString, Arc<Query>> = HashMap::new();
+        // a run of layers of one language, the paragraphs between two
+        // fences, is that language once
+        let mut last_language: Option<&SharedString> = None;
+        for layer in &data.old_layers {
+            if last_language != Some(&layer.language_name) {
+                highlight_queries
+                    .entry(layer.language_name.clone())
+                    .or_insert_with(|| layer.highlight_query.clone());
+                last_language = Some(&layer.language_name);
+            }
+        }
         // Cache raw names as well as canonical queries. Otherwise every fence with the
         // same info string would lock the registry and clone its language configuration.
         let mut resolved_languages: HashMap<SharedString, Option<(SharedString, Arc<Query>)>> =
@@ -1601,6 +1759,7 @@ impl SyntaxHighlighter {
                             tree,
                             stale: false,
                             match_range,
+                            moved_from: None,
                         });
                     }
                     continue;
@@ -1626,6 +1785,7 @@ impl SyntaxHighlighter {
                             tree,
                             stale: true,
                             match_range: None,
+                            moved_from: None,
                         })
                     })
                 } else {
@@ -1765,6 +1925,7 @@ impl SyntaxHighlighter {
             tree,
             stale,
             match_range: None,
+            moved_from: None,
         });
         (layer, !stale)
     }
@@ -1792,7 +1953,10 @@ impl SyntaxHighlighter {
 
         let replaced = Parse {
             tree: self.tree.replace(tree),
-            injection_layers: std::mem::replace(&mut self.injection_layers, injection_layers),
+            injection_layers: std::mem::replace(
+                &mut self.injection_layers,
+                Arc::new(injection_layers),
+            ),
         };
         self.stale = false;
         self.layers_whole = true;
@@ -1819,17 +1983,31 @@ impl SyntaxHighlighter {
         reach: Option<Range<usize>>,
         timed: bool,
     ) -> bool {
-        let Some(data) = self.injection_parse_data() else {
-            self.injection_layers.clear();
+        let Some(query) = self.injections_query.clone() else {
+            self.injection_layers = Arc::default();
             return true;
         };
+        // the old layers are moved into the parse, not copied: the parse
+        // after the pause makes its own of them as it begins, and holds
+        // them no longer (`InjectionParseSource`)
+        let layers = Arc::try_unwrap(std::mem::take(&mut self.injection_layers))
+            .unwrap_or_else(|shared| (*shared).clone());
         let data = InjectionParseData {
+            query,
+            content_capture_index: self.injection_content_capture_index,
+            language_capture_index: self.injection_language_capture_index,
+            old_layers: layers
+                .into_iter()
+                .map(|layer| ReusableInjectionLayer::of(layer, &self.edited))
+                .collect(),
+            parse_timeout: Some(self.injection_parse_timeout),
+            cancel: None,
+            roots: self.injection_roots.clone(),
             reach,
             paragraphs_share_timeout: timed,
-            ..data
         };
         let (layers, finished) = Self::compute_injection_layers(data, tree, &self.text.clone());
-        self.injection_layers = layers;
+        self.injection_layers = Arc::new(layers);
         self.layers_whole = finished;
         finished
     }
@@ -1858,7 +2036,7 @@ impl SyntaxHighlighter {
 
         // Query pre-parsed injection layers.
         let mut last_layer_start = 0;
-        for layer in &self.injection_layers {
+        for layer in self.injection_layers.iter() {
             debug_assert!(layer.byte_range.start >= last_layer_start);
             last_layer_start = layer.byte_range.start;
 
@@ -1872,15 +2050,21 @@ impl SyntaxHighlighter {
             }
 
             let query = &layer.highlight_query;
+            // a tree the edits before its text have not moved yet has it
+            // `shift` bytes back, the text its predicates test included
+            let shift = layer.shift();
+            let in_tree = |byte: usize| byte.saturating_add_signed(-shift);
+            let in_text = |byte: usize| byte.saturating_add_signed(shift);
 
             // A layer's tree has nothing to say outside the layer's span.
             let mut query_cursor = QueryCursor::new();
             query_cursor.set_byte_range(
-                range.start.max(layer.byte_range.start)..range.end.min(layer.byte_range.end),
+                in_tree(range.start.max(layer.byte_range.start))
+                    ..in_tree(range.end.min(layer.byte_range.end)),
             );
 
             let mut matches =
-                query_cursor.matches(query, layer.tree.root_node(), TextProvider(&self.text));
+                query_cursor.matches(query, layer.tree.root_node(), TextProvider(&self.text, shift));
 
             let mut last_end = 0usize;
             while let Some(m) = matches.next() {
@@ -1894,11 +2078,11 @@ impl SyntaxHighlighter {
                     // or shrinks with whatever the edit did, and says nothing
                     // true about what is there now: a token grown over a paste
                     // would colour all of it.
-                    if layer.stale && self.touched(&cap.node) {
+                    if layer.stale && self.touched_at(&cap.node, shift) {
                         continue;
                     }
 
-                    let node_range = cap.node.start_byte()..cap.node.end_byte();
+                    let node_range = in_text(cap.node.start_byte())..in_text(cap.node.end_byte());
 
                     if !allow_overlapping_captures && node_range.start < last_end {
                         continue;
@@ -1929,7 +2113,7 @@ impl SyntaxHighlighter {
             query_cursor.set_byte_range(range.clone());
             query_cursor.set_max_start_depth(max_start_depth);
 
-            let mut matches = query_cursor.matches(&query, *query_node, TextProvider(&source));
+            let mut matches = query_cursor.matches(&query, *query_node, TextProvider(source, 0));
 
             while let Some(query_match) = matches.next() {
                 for cap in query_match.captures {
@@ -3104,7 +3288,10 @@ console.log(answer);
                 !has_highlight_covering(&highlights, &source, "tail_word", "variable"),
                 "{language}: text after a span closed early should not be coloured as the span"
             );
-            for layer in &highlighter.injection_layers {
+            for layer in highlighter.injection_layers.iter() {
+                // moved to where its text is, as a parse would take it
+                let mut layer = layer.clone();
+                layer.catch_up();
                 let root = layer.tree.root_node();
                 assert!(
                     layer.byte_range.start <= root.start_byte()
@@ -3806,6 +3993,197 @@ $x = 1;
             );
         }
         "markdown-blocks"
+    }
+
+    /// Each layer's language and ranges.
+    #[cfg(feature = "tree-sitter-languages")]
+    fn layer_ranges(highlighter: &SyntaxHighlighter) -> Vec<(String, Vec<Range<usize>>)> {
+        highlighter
+            .injection_layers
+            .iter()
+            .map(|layer| {
+                let ranges = layer.ranges.iter().map(|r| r.start_byte..r.end_byte);
+                (layer.language_name.to_string(), ranges.collect())
+            })
+            .collect()
+    }
+
+    /// An edit moves the trees of the layers it reaches and no others: a
+    /// layer after it keeps its tree where it was until the tree is used
+    /// for a parse, and its colours are read where its text is now; one
+    /// before it is as it was. Each tree moved, a key in a CHANGELOG of
+    /// 3,000 items moved 3,000 trees, and the layers were copied for the
+    /// parse after the pause, some 1 ms of every key (elundqvist/kvist#376):
+    /// they are shared with it now, and copied only where an edit comes
+    /// while it holds them. A tree moved late, by the edits before it put
+    /// together, is the tree moved by each, line breaks among them.
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_an_edit_moves_only_the_layer_trees_it_reaches() {
+        const ITEMS: usize = 300;
+        let language = markdown_by_paragraph();
+        let items: String = (0..ITEMS)
+            .map(|i| format!("- fix `foo_{i}` in [#{i}](http://x/{i}) and *note*\n"))
+            .collect();
+        let source = format!("```rust\nfn first() {{}}\n```\n\n# Changelog\n\n{items}\n```rust\nfn last() {{\n    let x = 1;\n}}\n```\n");
+        let mut highlighter = fresh_highlighter(language, &source);
+        assert_eq!(highlighter.injection_layers.len(), ITEMS + 2);
+        let fence = |highlighter: &SyntaxHighlighter| {
+            highlighter.injection_layers.iter().find(|l| l.language_name.as_ref() == "rust" && l.byte_range.start > 100).unwrap().clone()
+        };
+        let mut by_each = fence(&highlighter).tree;
+        let edits = || LAYER_TREE_EDITS.with(|edits| edits.get());
+
+        // keys in item 150, a line put in between two items, which reaches
+        // neither, and a word taken out of item 10, and how many trees each
+        // moves
+        let mut text = source.clone();
+        let changes: [(&str, usize, usize, &str, usize); 4] = [
+            ("foo_150`", 7, 0, "x", 1),
+            ("foo_150x`", 8, 0, "yz", 1),
+            ("- fix `foo_200`", 0, 0, "- a new item\n", 0),
+            ("- fix `foo_10`", 2, 4, "", 1),
+        ];
+        for (find, into, out, put, moved) in changes {
+            let at = text.find(find).unwrap() + into;
+            let (edit, edited) = replace(&text, at..at + out, put);
+            text = edited;
+            by_each.edit(&edit);
+            let before = edits();
+            highlighter.edit_tree(Some(edit), &Rope::from_str(&text));
+            assert_eq!(edits() - before, moved, "{put:?} at {find:?}: the item's tree alone");
+        }
+        let last = fence(&highlighter);
+        assert!(last.moved_from.is_some(), "after every edit, and not moved");
+        assert!(highlighter.injection_layers[0].moved_from.is_none(), "before every edit");
+        // read where its text is now, as a fresh parse colours it
+        let fresh = fresh_highlighter(language, &text);
+        let from = text.find("fn last").unwrap();
+        let names = |h: &SyntaxHighlighter| {
+            highlight_names(h, &text).into_iter().filter(|(r, _)| r.start >= from).collect::<Vec<_>>()
+        };
+        assert_eq!(names(&highlighter), names(&fresh));
+        // moved by the edits put together as by each in turn, every node
+        let mut caught_up = last.clone();
+        caught_up.catch_up();
+        fn nodes(tree: &Tree) -> Vec<(tree_sitter::Range, String)> {
+            let mut out = Vec::new();
+            let mut cursor = tree.walk();
+            'walk: loop {
+                out.push((cursor.node().range(), cursor.node().kind().to_string()));
+                if cursor.goto_first_child() || cursor.goto_next_sibling() {
+                    continue;
+                }
+                while cursor.goto_parent() {
+                    if cursor.goto_next_sibling() {
+                        continue 'walk;
+                    }
+                }
+                break;
+            }
+            out
+        }
+        assert_eq!(nodes(&caught_up.tree), nodes(&by_each));
+
+        // shared with the parse after the pause, not copied; an edit while
+        // it holds them copies them, and leaves the parse's as they were
+        let source_data = highlighter.injection_parse_source().unwrap();
+        assert!(Arc::ptr_eq(&source_data.layers, &highlighter.injection_layers));
+        let at = text.find("foo_20`").unwrap();
+        let (edit, edited) = replace(&text, at..at, "w");
+        highlighter.edit_tree(Some(edit), &Rope::from_str(&edited));
+        assert!(!Arc::ptr_eq(&source_data.layers, &highlighter.injection_layers));
+        let old_starts: Vec<usize> = source_data.layers.iter().map(|l| l.byte_range.start).collect();
+        let new_starts: Vec<usize> = highlighter.injection_layers.iter().map(|l| l.byte_range.start).collect();
+        assert_ne!(old_starts, new_starts);
+        drop(source_data);
+        let layers = Arc::as_ptr(&highlighter.injection_layers);
+        let at = edited.find("foo_30`").unwrap();
+        let (edit, edited) = replace(&edited, at..at, "v");
+        highlighter.edit_tree(Some(edit), &Rope::from_str(&edited));
+        assert_eq!(Arc::as_ptr(&highlighter.injection_layers), layers, "held by none, moved in place");
+
+        // the parse after the pause, which reuses the trees moved late,
+        // colours the text as a fresh parse does, and so does a key after it
+        assert!(parse_in_background(&mut highlighter));
+        let fresh = fresh_highlighter(language, &edited);
+        assert_eq!(highlight_names(&highlighter, &edited), highlight_names(&fresh, &edited));
+        assert_eq!(layer_ranges(&highlighter), layer_ranges(&fresh));
+        let at = edited.find("let x").unwrap();
+        let (edit, edited) = replace(&edited, at..at + 3, "const");
+        assert!(highlighter.update(Some(edit), &Rope::from_str(&edited), None));
+        let fresh = fresh_highlighter(language, &edited);
+        assert_eq!(highlight_names(&highlighter, &edited), highlight_names(&fresh, &edited));
+    }
+
+    /// A layer's tree that the edits before it have not moved yet
+    /// (`InjectionLayer::moved_from`) is read where its text is now, and so
+    /// is the text its highlight query's predicates test: read where the
+    /// tree has it, `#match?` and `#eq?` looked as many bytes off as the
+    /// edits put in or took out, so `Vec`, `MAX`, `Foo`, `console` and
+    /// `require` lost their colours or gave them to the text beside them,
+    /// and a deletion before a fence or a script at the end of the text had
+    /// them read past its end, which panicked on the drawing thread
+    /// (elundqvist/kvist#376). Through an edit not parsed, as a text too
+    /// large to parse at a key has it, and through a key's parse, which
+    /// keeps the layers its edit does not reach as they are.
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_a_layer_not_moved_yet_is_read_where_its_text_is() {
+        let prose = "Prose, a sentence that is taken out, and more of it, longer than all that follows it.";
+        let markdown = format!(
+            "# Notes\n\n{prose}\n\n```rust\nlet v = Vec::new();\nconst MAX: u32 = Foo::BAR;\n```\n"
+        );
+        let html = format!("<p>{prose}</p>\n<script>console.log(Foo, MAX); require(x);</script>\n");
+        let cases = [
+            (markdown_blocks(), markdown, "let v", ["Vec", "MAX", "Foo"]),
+            ("html", html, "console", ["console", "Foo", "require"]),
+        ];
+        for (language, source, layer_start, coloured) in cases {
+            let fresh = fresh_highlighter(language, &source);
+            let names = highlight_names(&fresh, &source);
+            for word in coloured {
+                let at = source.find(word).unwrap();
+                assert!(
+                    names.iter().any(|(r, _)| *r == (at..at + word.len())),
+                    "{word:?} is coloured by a predicate in {language}: {names:?}"
+                );
+            }
+            let start = source.find("a sentence").unwrap();
+            let end = source.find("follows it").unwrap() + "follows it".len();
+            assert!(end - start > source.len() - source.find(layer_start).unwrap());
+            for (range, put) in [(start..start, "word, "), (start..end, "")] {
+                let (edit, edited) = replace(&source, range.clone(), put);
+                let fresh = fresh_highlighter(language, &edited);
+                let from = edited.find(layer_start).unwrap();
+                let after = |highlighter: &SyntaxHighlighter| {
+                    highlight_names(highlighter, &edited)
+                        .into_iter()
+                        .filter(|(r, _)| r.start >= from)
+                        .collect::<Vec<_>>()
+                };
+                let not_moved = |highlighter: &SyntaxHighlighter| {
+                    highlighter.injection_layers.iter().any(|layer| layer.moved_from.is_some())
+                };
+
+                // moved, not parsed: the host's tree is stale where the edit
+                // lies, and its colours there are left out
+                let mut highlighter = fresh_highlighter(language, &source);
+                highlighter.edit_tree(Some(edit), &Rope::from_str(&edited));
+                assert!(not_moved(&highlighter), "{language}, {range:?}");
+                assert_eq!(after(&highlighter), after(&fresh), "{language}, {range:?}, not parsed");
+
+                // a key's parse that keeps the layer as it is
+                let mut highlighter = fresh_highlighter(language, &source);
+                assert!(highlighter.update(Some(edit), &Rope::from_str(&edited), Some(Duration::MAX)));
+                assert!(not_moved(&highlighter), "{language}, {range:?}");
+                assert_eq!(
+                    highlight_names(&highlighter, &edited),
+                    highlight_names(&fresh, &edited),
+                    "{language}, {range:?}, parsed at the key"
+                );
+            }
+        }
     }
 
     #[test]

@@ -17,7 +17,7 @@ use gpui_base::input::{
 use ropey::Rope;
 use tree_sitter::{InputEdit, ParseOptions, Parser, Point};
 
-use super::{InjectionParseData, LanguageRegistry, SyntaxHighlighter};
+use super::{InjectionParseData, InjectionParseSource, LanguageRegistry, SyntaxHighlighter};
 
 pub(crate) fn input_highlighter_factory() -> InputHighlighterFactory {
     Rc::new(|language| {
@@ -227,21 +227,7 @@ impl TreeSitterInputHighlighter {
         let parse_task = self.parse_task.clone();
         let slow = self.slow.clone();
         let language = highlighter.borrow().language().clone();
-        // trees kept from a text made anew are no start for its parse
-        let old_tree = highlighter.borrow().tree_of_text().cloned();
         let cancel = Arc::new(AtomicBool::new(false));
-        // Off the UI thread an injected span may take as long as it needs,
-        // until the next edit cancels it: a span too large to parse in the
-        // time a keystroke gives it is finished here.
-        let injection_data =
-            highlighter
-                .borrow()
-                .injection_parse_data()
-                .map(|data| InjectionParseData {
-                    parse_timeout: None,
-                    cancel: Some(cancel.clone()),
-                    ..data
-                });
         let text = text.clone();
         let text_for_apply = text.clone();
 
@@ -254,11 +240,27 @@ impl TreeSitterInputHighlighter {
             }
             let _cancel_guard = CancelOnDrop(cancel.clone());
             cx.background_executor().timer(PARSE_DEBOUNCE).await;
+            // the tree and the layers, taken once the typing has paused,
+            // shared and made the parse's own on its thread
+            // (`InjectionParseSource`): taken at the key, they were held
+            // until the next key let go of the task, which the executor
+            // does after the key, so the next key's edit copied the layers
+            // to move them, and the tree's nodes it went through, a list of
+            // 3,000 items' 3,000 children with them (elundqvist/kvist#376).
+            // Trees kept from a text made anew are no start for its parse.
+            let (old_tree, injection_source) = {
+                let highlighter = highlighter.borrow();
+                (highlighter.tree_of_text().cloned(), highlighter.injection_parse_source())
+            };
 
             let parse_cancel = cancel.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
+                    // the layers made the parse's own first, so that a key
+                    // typed during the host's parse finds them held by its
+                    // highlighter alone, and moves them in place
+                    let injection_data = injection_source.map(InjectionParseSource::into_data);
                     let config = LanguageRegistry::singleton().language(&language)?;
                     let grammar = config.language.as_ref()?;
                     let mut parser = Parser::new();
@@ -292,7 +294,16 @@ impl TreeSitterInputHighlighter {
                     if parse_cancel.load(Ordering::Relaxed) {
                         return None;
                     }
+                    // Off the UI thread an injected span may take as long as
+                    // it needs, until the next edit cancels it: a span too
+                    // large to parse in the time a keystroke gives it is
+                    // finished here.
                     let injections = injection_data.map_or_else(Default::default, |data| {
+                        let data = InjectionParseData {
+                            parse_timeout: None,
+                            cancel: Some(parse_cancel.clone()),
+                            ..data
+                        };
                         SyntaxHighlighter::compute_injection_layers(data, &tree, &text).0
                     });
                     if parse_cancel.load(Ordering::Relaxed) {
