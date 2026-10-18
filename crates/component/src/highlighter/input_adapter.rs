@@ -136,19 +136,27 @@ impl InputHighlighter for TreeSitterInputHighlighter {
             if edit.is_none() && highlighter.text().eq(text) {
                 return;
             }
-            // a text made anew: the trees are of none of it, and a large
-            // text's are freed on a thread of their own, as when the
-            // highlighter goes
-            if edit.is_none() {
-                let (parse, bytes) = highlighter.take_parse();
-                if bytes > FREE_ELSEWHERE_BYTES && !parse.is_empty() {
-                    std::thread::spawn(move || drop(parse));
-                }
-            }
-            if !parsed_at_the_key(highlighter.language(), text.len(), self.slow.get()) {
+            let at_the_key = parsed_at_the_key(highlighter.language(), text.len(), self.slow.get());
+            // a text made anew that waits for the parse after the pause:
+            // the old text's trees colour it until then, as VS Code and
+            // IntelliJ keep the old colours, where it stood plain
+            // (elundqvist/kvist#401)
+            if edit.is_none() && !at_the_key {
+                highlighter.keep_colours_through(text);
+                false
+            } else if !at_the_key {
                 highlighter.edit_tree(edit, text);
                 false
             } else {
+                // a text made anew, parsed now: the trees are of none of
+                // it, and a large text's are freed on a thread of their
+                // own, as when the highlighter goes
+                if edit.is_none() {
+                    let (parse, bytes) = highlighter.take_parse();
+                    if bytes > FREE_ELSEWHERE_BYTES && !parse.is_empty() {
+                        std::thread::spawn(move || drop(parse));
+                    }
+                }
                 let began = Instant::now();
                 let completed = highlighter.update(edit, text, Some(SYNC_PARSE_TIMEOUT));
                 self.slow.set(began.elapsed() > PARSE_SHARE);
@@ -164,7 +172,8 @@ impl InputHighlighter for TreeSitterInputHighlighter {
         let parse_task = self.parse_task.clone();
         let slow = self.slow.clone();
         let language = highlighter.borrow().language().clone();
-        let old_tree = highlighter.borrow().tree().cloned();
+        // trees kept from a text made anew are no start for its parse
+        let old_tree = highlighter.borrow().tree_of_text().cloned();
         let cancel = Arc::new(AtomicBool::new(false));
         // Off the UI thread an injected span may take as long as it needs,
         // until the next edit cancels it: a span too large to parse in the
@@ -238,9 +247,16 @@ impl InputHighlighter for TreeSitterInputHighlighter {
                 .await;
 
             if let Some((tree, injections, folds)) = result {
-                highlighter
+                let replaced = highlighter
                     .borrow_mut()
                     .apply_background_tree(tree, &text_for_apply, injections);
+                // the trees kept through a text made anew to colour it,
+                // the old text's whole trees, which share nothing with
+                // the new ones, are freed on a thread of their own, as
+                // when the highlighter goes
+                if let Some(replaced) = replaced.filter(|parse| !parse.is_empty()) {
+                    std::thread::spawn(move || drop(replaced));
+                }
                 // the typing paused: the next key tries a parse again
                 slow.set(false);
                 let _ = entity.update(cx, |state, cx| {
@@ -261,7 +277,7 @@ impl InputHighlighter for TreeSitterInputHighlighter {
     fn fold_ranges(&self, _: &Rope) -> Vec<FoldRange> {
         self.inner
             .borrow()
-            .tree()
+            .tree_of_text()
             .map(extract_fold_ranges)
             .unwrap_or_default()
     }
@@ -269,7 +285,7 @@ impl InputHighlighter for TreeSitterInputHighlighter {
     fn fold_ranges_for_edit(&self, range: Range<usize>, _: &Rope) -> Vec<FoldRange> {
         self.inner
             .borrow()
-            .tree()
+            .tree_of_text()
             .map(|tree| extract_fold_ranges_in_range(tree, range))
             .unwrap_or_default()
     }
@@ -400,9 +416,10 @@ mod tests {
     /// A text made anew that is the text it was, a paste of the whole text
     /// over itself, keeps its colours, its fold candidates and the parse
     /// on its way, at a size a keystroke parses and a larger one; a text
-    /// made anew that differs is parsed afresh. The trees taken, the small
-    /// text was taken for parsed, as it was the same, and stood plain and
-    /// without its chevrons until the next edit (elundqvist/kvist#384).
+    /// made anew that differs is parsed afresh, a larger one coloured as
+    /// the old was until then. The trees taken, the small text was taken
+    /// for parsed, as it was the same, and stood plain and without its
+    /// chevrons until the next edit (elundqvist/kvist#384).
     #[gpui::test]
     #[cfg(feature = "tree-sitter-languages")]
     fn test_a_text_made_anew_as_it_was_keeps_its_colours(cx: &mut gpui::TestAppContext) {
@@ -434,14 +451,48 @@ mod tests {
             assert!(coloured(&h, &source), "the same text, {} bytes", source.len());
             assert_eq!(h.fold_ranges(&rope), folds);
             assert!(h.parse_task.borrow().is_none(), "nothing to parse");
-            // another text is the trees' no longer
+            // another text is the trees' no longer: one the keystroke
+            // parses is parsed afresh, and a larger one keeps the old
+            // colours until the parse after the pause, where it stood
+            // plain (elundqvist/kvist#401)
             let other = source.replace("let v", "let w");
             let other_rope = Rope::from(other.as_str());
             handed(&mut h, &other_rope);
             let parsed_now = parsed_at_the_key("rust", other.len(), false);
-            assert_eq!(coloured(&h, &other), parsed_now, "{} bytes", other.len());
+            assert!(coloured(&h, &other), "{} bytes", other.len());
+            assert_eq!(h.inner.borrow().tree_of_text().is_some(), parsed_now);
             assert_eq!(h.parse_task.borrow().is_none(), parsed_now);
         }
+    }
+
+    /// A large text made anew is kept coloured by the old text's trees
+    /// until the parse after the pause lands, and from then on the trees
+    /// are of it: the next key's parse starts from them and an edit's lines
+    /// find their folds. Left marked as kept, every key's parse after a
+    /// paste over a large file started from nothing, and an edit found no
+    /// folds on its lines, so a rename after it opened every fold between
+    /// its first and last change (elundqvist/kvist#401, #404).
+    #[gpui::test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_a_large_text_made_anew_is_the_trees_once_its_parse_lands(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::init);
+        let (editor, cx) = cx.add_window_view(|window, cx| EditorState::new(window, cx));
+        let function = |i: usize| format!("fn f{i}() {{\n    if {i} > 1 {{\n        let v = {i};\n    }}\n}}\n");
+        let source: String = (0..2_000).map(function).collect();
+        let other = source.replace("let v", "let w");
+        assert!(!parsed_at_the_key("rust", other.len(), false));
+        let mut h = TreeSitterInputHighlighter::new("rust");
+        assert!(h.inner.borrow_mut().update(None, &Rope::from(source.as_str()), None));
+        let other_rope = Rope::from(other.as_str());
+        cx.update(|window, cx| editor.update(cx, |_, cx| h.update(None, &other_rope, true, window, cx)));
+        assert!(h.inner.borrow().tree_of_text().is_none(), "kept, not of the text");
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(h.inner.borrow().tree_of_text().is_some(), "of the text once its parse lands");
+        let at = other.find("fn f1000()").unwrap();
+        let line = at..at + function(1000).len();
+        assert_eq!(h.fold_ranges_for_edit(line, &other_rope).len(), 2, "a function and its `if`");
+        assert_eq!(h.fold_ranges(&other_rope).len(), 4_000);
     }
 
     /// An edit's fold candidates are those of the whole text it reaches,

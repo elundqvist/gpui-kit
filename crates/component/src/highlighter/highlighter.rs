@@ -29,6 +29,11 @@ const MAX_INJECTION_LANGUAGE_BYTES: usize = 64;
 /// Matches past it keep host highlighting but get no injected tokens.
 const MAX_NON_COMBINED_INJECTION_PARSES: usize = 512;
 const INJECTION_PARSE_TIMEOUT: Duration = Duration::from_millis(20);
+/// The most a text made anew may differ from the old between what the
+/// two share at their start and their end for the old trees to be moved
+/// over it as an edit (`SyntaxHighlighter::keep_colours_through`): an edit
+/// of the trees costs what it reaches, 33 ms for all of 1.4 MB.
+const KEEP_ANEW_EDIT_BYTES: usize = 64 * 1024;
 
 #[cfg(test)]
 thread_local! {
@@ -84,6 +89,17 @@ pub struct SyntaxHighlighter {
     /// an edit in the space before it, which the edit did not touch: only
     /// a node one of these reaches is left plain.
     edited: Vec<Range<usize>>,
+    /// `tree` and the layers are of a text that was made anew since, a
+    /// paste over all of it (`keep_colours_through`): they colour the new
+    /// text as they coloured the old, where nothing the two do not share
+    /// reaches, until a parse of the new text, which starts afresh rather
+    /// than from them, takes their place.
+    anew: bool,
+    /// Where the trees kept through a text made anew stop colouring it:
+    /// the end of what the two texts share at their start, where the
+    /// trees were not moved over what differs (`keep_colours_through`).
+    /// Past it a node of the old text says nothing of what is there now.
+    coloured_to: Option<usize>,
 }
 
 /// The trees a highlighter's parse left, taken out of it to be freed
@@ -554,6 +570,8 @@ impl SyntaxHighlighter {
             injection_parse_timeout: INJECTION_PARSE_TIMEOUT,
             stale: false,
             edited: Vec::new(),
+            anew: false,
+            coloured_to: None,
         }
     }
 
@@ -683,6 +701,8 @@ impl SyntaxHighlighter {
             injection_parse_timeout: INJECTION_PARSE_TIMEOUT,
             stale: false,
             edited: Vec::new(),
+            anew: false,
+            coloured_to: None,
         })
     }
 
@@ -695,6 +715,67 @@ impl SyntaxHighlighter {
         self.tree.as_ref()
     }
 
+    /// The tree, where it is of the text, edited to it or parsed from it:
+    /// none where the text was made anew since and the tree only keeps
+    /// the old text's colours (`keep_colours_through`), whose nodes say
+    /// nothing of the new text's folds, and which a parse must not start
+    /// from.
+    pub(crate) fn tree_of_text(&self) -> Option<&Tree> {
+        self.tree.as_ref().filter(|_| !self.anew)
+    }
+
+    /// Take `text`, made anew, a paste over all of the old, and keep the
+    /// old text's trees to colour it until a parse of it lands, as VS Code
+    /// and IntelliJ keep the old colours meanwhile: the text a paste put
+    /// over a file too large to parse at the key stood plain until the
+    /// parse after it, a few hundred milliseconds for 1.4 MB
+    /// (elundqvist/kvist#401). Where the two texts differ only between what
+    /// they share at their start and at their end, by no more than
+    /// `KEEP_ANEW_EDIT_BYTES`, the trees are moved over that as an edit
+    /// moves them, so what is alike keeps its colours where it is now and
+    /// what went in between is plain, where an edit's nodes are. Else the
+    /// trees stand as they are and colour only what the two share at their
+    /// start, where they are of the text still, and the rest is plain
+    /// (`coloured_to`): an edit of the trees costs what it reaches, and
+    /// over the whole of a text it took 33 ms of the paste's 35 to 62
+    /// (elundqvist/kvist#384), and the old colours where they stood, over
+    /// a text shifted by many small changes, gave its plain words the
+    /// colours of keywords. VS Code and IntelliJ never colour text with
+    /// tokens found for other text.
+    pub(crate) fn keep_colours_through(&mut self, text: &Rope) {
+        if self.tree.is_none() && self.injection_layers.is_empty() {
+            self.text = text.clone();
+            return;
+        }
+        let old = &self.text;
+        let (old_len, new_len) = (old.len(), text.len());
+        let head = common_prefix(old, text);
+        let tail = common_suffix(old, text, old_len.min(new_len) - head);
+        if old_len - tail - head <= KEEP_ANEW_EDIT_BYTES {
+            let point = |text: &Rope, at: usize| {
+                let p = text.offset_to_point(at);
+                Point::new(p.row, p.column)
+            };
+            let edit = InputEdit {
+                start_byte: head,
+                old_end_byte: old_len - tail,
+                new_end_byte: new_len - tail,
+                start_position: point(text, head),
+                old_end_position: point(old, old_len - tail),
+                new_end_position: point(text, new_len - tail),
+            };
+            self.edited.clear();
+            self.move_trees(&edit);
+        } else {
+            self.edited.clear();
+            self.coloured_to = Some(self.coloured_to.map_or(head, |end| end.min(head)));
+        }
+        self.anew = true;
+        self.layers_whole = false;
+        self.mark_stale();
+        self.text = text.clone();
+    }
+
     /// Apply only the structural `edit` to the existing tree and update the stored text,
     /// without re-parsing. The tree and every layer are then stale: what
     /// the edit touched in them is left plain until a parse finishes, since
@@ -702,13 +783,7 @@ impl SyntaxHighlighter {
     /// keeps its colours, moved with the text.
     pub fn edit_tree(&mut self, edit: Option<InputEdit>, text: &Rope) {
         match edit {
-            Some(edit) => {
-                if let Some(tree) = self.tree.as_mut() {
-                    tree.edit(&edit);
-                }
-                self.edit_injection_layers(&edit);
-                self.note_edit(&edit);
-            }
+            Some(edit) => self.move_trees(&edit),
             // the whole text is new, and the tree knows none of it: it is
             // plain until the parse, which starts afresh, rather than
             // coloured as the old text was where the old tree's nodes
@@ -719,10 +794,32 @@ impl SyntaxHighlighter {
                 self.injection_layers.clear();
                 self.layers_whole = false;
                 self.edited.clear();
+                self.anew = false;
+                self.coloured_to = None;
             }
         }
         self.mark_stale();
         self.text = text.clone();
+    }
+
+    /// Move the tree and every layer with `edit`, not parsed again, and
+    /// keep where it lies: what it touched is left plain until a parse.
+    /// The end of what trees kept through a text made anew colour moves
+    /// with it, and an edit that reaches past it ends it at the edit's
+    /// start.
+    fn move_trees(&mut self, edit: &InputEdit) {
+        if let Some(tree) = self.tree.as_mut() {
+            tree.edit(edit);
+        }
+        self.edit_injection_layers(edit);
+        self.note_edit(edit);
+        if let Some(end) = self.coloured_to.as_mut() {
+            if edit.old_end_byte <= *end {
+                *end = *end - edit.old_end_byte + edit.new_end_byte;
+            } else if edit.start_byte < *end {
+                *end = edit.start_byte;
+            }
+        }
     }
 
     /// The tree and every layer were edited to the text and not parsed
@@ -853,6 +950,8 @@ impl SyntaxHighlighter {
     /// 80 ms for 20 MB of HTML, which the UI thread stood still for when an
     /// editor's text or language was replaced.
     pub(crate) fn take_parse(&mut self) -> (Parse, usize) {
+        self.anew = false;
+        self.coloured_to = None;
         let parse = Parse {
             tree: self.tree.take(),
             injection_layers: std::mem::take(&mut self.injection_layers),
@@ -878,7 +977,9 @@ impl SyntaxHighlighter {
         text: &Rope,
         timeout: Option<Duration>,
     ) -> bool {
-        if self.text.eq(text) {
+        // the trees kept through a text made anew are not of it, however
+        // alike the texts
+        if self.text.eq(text) && !self.anew {
             return true;
         }
 
@@ -887,6 +988,17 @@ impl SyntaxHighlighter {
             self.text = text.clone();
             return true;
         }
+
+        // trees kept from a text made anew are no start for a parse of
+        // this one: it starts afresh, and they colour it until it finishes
+        let kept = self.anew.then(|| Parse {
+            tree: self.tree.take(),
+            injection_layers: std::mem::take(&mut self.injection_layers),
+        });
+        // the key's own edit, which moves the kept trees where the parse
+        // runs out of its time
+        let key_edit = edit;
+        let edit = if kept.is_some() { None } else { edit };
 
         // An edit of a text parsed before: what it reaches is all the
         // injections need looked at again.
@@ -909,8 +1021,10 @@ impl SyntaxHighlighter {
             None => self.parser.parse("", None).unwrap(),
         };
         old_tree.edit(&edit);
-        self.edit_injection_layers(&edit);
-        self.note_edit(&edit);
+        if kept.is_none() {
+            self.edit_injection_layers(&edit);
+            self.note_edit(&edit);
+        }
 
         let mut timed_out = false;
         let start = Instant::now();
@@ -949,7 +1063,19 @@ impl SyntaxHighlighter {
             // call starts afresh from its own tree.
             self.parser.reset();
             // Restore the old tree so highlighting continues with stale data.
-            self.tree = Some(old_tree);
+            match kept {
+                // the trees of the text before it was made anew, which
+                // colour it still
+                Some(kept) => {
+                    self.tree = kept.tree;
+                    self.injection_layers = kept.injection_layers;
+                    // moved with the key, as `edit_tree` moves them
+                    if let Some(key_edit) = key_edit {
+                        self.move_trees(&key_edit);
+                    }
+                }
+                None => self.tree = Some(old_tree),
+            }
             self.text = text.clone();
             self.mark_stale();
             return false;
@@ -957,6 +1083,8 @@ impl SyntaxHighlighter {
 
         let new_tree = new_tree.unwrap();
         self.tree = Some(new_tree.clone());
+        self.anew = false;
+        self.coloured_to = None;
         self.stale = false;
         self.text = text.clone();
         let reach = edited.then(|| self.reach(&old_tree, &new_tree)).flatten();
@@ -996,9 +1124,11 @@ impl SyntaxHighlighter {
             query,
             content_capture_index: self.injection_content_capture_index,
             language_capture_index: self.injection_language_capture_index,
+            // a text made anew shares nothing with the old layers' trees
             old_layers: self
                 .injection_layers
                 .iter()
+                .filter(|_| !self.anew)
                 .map(|layer| ReusableInjectionLayer {
                     language_name: layer.language_name.clone(),
                     highlight_query: layer.highlight_query.clone(),
@@ -1549,22 +1679,38 @@ impl SyntaxHighlighter {
     ///
     /// `injection_layers` must also be pre-computed in the background via
     /// [`compute_injection_layers`] to avoid blocking the main thread.
+    /// Take the trees a parse off the UI thread made of `text`, where the
+    /// text is still that. The trees they take the place of are handed
+    /// back, for the caller to free where it likes, where they were kept
+    /// through a text made anew to colour it: an old text's whole trees,
+    /// which share nothing with the new. Others share nearly every node
+    /// with the new ones, and are freed here for next to nothing.
     pub(crate) fn apply_background_tree(
         &mut self,
         tree: Tree,
         text: &Rope,
         injection_layers: Vec<InjectionLayer>,
-    ) {
+    ) -> Option<Parse> {
         // Only apply if the text still matches what was parsed.
         if !self.text.eq(text) {
-            return;
+            return None;
         }
 
-        self.tree = Some(tree);
+        let replaced = Parse {
+            tree: self.tree.replace(tree),
+            injection_layers: std::mem::replace(&mut self.injection_layers, injection_layers),
+        };
         self.stale = false;
-        self.injection_layers = injection_layers;
         self.layers_whole = true;
         self.edited.clear();
+        // the trees are of the text now: a key's parse starts from them,
+        // and the fold candidates are found in them. Left set, every key's
+        // parse after a paste over a large file started from nothing, and
+        // an edit's lines found no folds, so a rename opened every fold
+        // between its first and last change (elundqvist/kvist#401)
+        let kept = std::mem::take(&mut self.anew);
+        self.coloured_to = None;
+        kept.then_some(replaced)
     }
 
     /// Parse injection layers after the main tree is updated, and return
@@ -1600,6 +1746,13 @@ impl SyntaxHighlighter {
         let mut injection_highlights = vec![];
         let Some(tree) = &self.tree else {
             return highlights;
+        };
+        // trees kept through a text made anew colour only what the two
+        // texts share at their start
+        let range = match self.coloured_to {
+            Some(end) if end <= range.start => return highlights,
+            Some(end) => range.start..range.end.min(end),
+            None => range,
         };
 
         let Some(query) = &self.query else {
@@ -1727,6 +1880,12 @@ impl SyntaxHighlighter {
         // them last so their colors win over broad Markdown captures such as
         // `fenced_code_block @text.literal`.
         highlights.extend(injection_highlights);
+        if let Some(end) = self.coloured_to {
+            highlights.retain_mut(|item| {
+                item.range.end = item.range.end.min(end);
+                item.range.start < item.range.end
+            });
+        }
 
         // DO NOT REMOVE THIS PRINT, it's useful for debugging
         // for item in highlights {
@@ -1809,6 +1968,69 @@ impl SyntaxHighlighter {
 
         styles
     }
+}
+
+/// How many bytes `a` and `b` begin with alike, at a boundary of a
+/// character: read a chunk at a time, and only as far as they are alike.
+fn common_prefix(a: &Rope, b: &Rope) -> usize {
+    let (mut ca, mut cb) = (a.chunks(), b.chunks());
+    let (mut x, mut y): (&[u8], &[u8]) = (&[], &[]);
+    let mut same = 0;
+    loop {
+        if x.is_empty() {
+            match ca.next() {
+                Some(chunk) => x = chunk.as_bytes(),
+                None => break,
+            }
+            continue;
+        }
+        if y.is_empty() {
+            match cb.next() {
+                Some(chunk) => y = chunk.as_bytes(),
+                None => break,
+            }
+            continue;
+        }
+        let n = x.len().min(y.len());
+        let alike = if x[..n] == y[..n] {
+            n
+        } else {
+            x[..n].iter().zip(&y[..n]).take_while(|(p, q)| p == q).count()
+        };
+        same += alike;
+        if alike < n {
+            break;
+        }
+        (x, y) = (&x[n..], &y[n..]);
+    }
+    a.clip_offset(same, Bias::Left)
+}
+
+/// How many bytes `a` and `b` end with alike, at most `most`, at a
+/// boundary of a character: read back from their ends a chunk at a time.
+fn common_suffix(a: &Rope, b: &Rope, most: usize) -> usize {
+    let (mut at_a, mut at_b) = (a.len(), b.len());
+    let mut same = 0;
+    while same < most {
+        let (chunk_a, start_a) = a.chunk(at_a - 1);
+        let (chunk_b, start_b) = b.chunk(at_b - 1);
+        let x = &chunk_a.as_bytes()[..at_a - start_a];
+        let y = &chunk_b.as_bytes()[..at_b - start_b];
+        let n = x.len().min(y.len()).min(most - same);
+        let (x, y) = (&x[x.len() - n..], &y[y.len() - n..]);
+        let alike = if x == y {
+            n
+        } else {
+            x.iter().rev().zip(y.iter().rev()).take_while(|(p, q)| p == q).count()
+        };
+        same += alike;
+        if alike < n {
+            break;
+        }
+        at_a -= n;
+        at_b -= n;
+    }
+    a.len() - a.clip_offset(a.len() - same, Bias::Right)
 }
 
 /// To merge intersection ranges, let the subsequent range cover
@@ -2254,6 +2476,127 @@ console.log(answer);
                 "{language}: `let` overtyped to `met` should not be a keyword"
             );
         }
+    }
+
+    /// A text made anew keeps the old text's colours until it is parsed,
+    /// as VS Code and IntelliJ keep them, where it stood plain until the
+    /// parse after the paste (elundqvist/kvist#401): what the two texts
+    /// share at their start and their end coloured as it was, where it is
+    /// now, what lies between plain; where that is too much to move the
+    /// trees over, only what they share at their start is coloured, the
+    /// old colours over shifted text giving plain words a keyword's. The
+    /// trees are no start for a parse of the new text, and say nothing of
+    /// its folds, and the parse that follows colours it as a fresh one
+    /// does, and is of the text, its folds found and a key's parse
+    /// starting from it.
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_a_text_made_anew_keeps_the_old_colours_until_its_parse() {
+        let function = |i: usize, v: &str| format!("fn f{i}() {{\n    let {v} = \"s{i}\";\n}}\n");
+        let old: String = (0..3000).map(|i| function(i, "v")).collect();
+        let named = |highlighter: &SyntaxHighlighter, text: &str, word: &str, name: &str| {
+            has_highlight_covering(&highlighter.match_styles(0..text.len()), text, word, name)
+        };
+        let parsed = |source: &str| {
+            let mut highlighter = SyntaxHighlighter::new("rust");
+            assert!(highlighter.update(None, &Rope::from_str(source), None));
+            highlighter
+        };
+        // a function in the middle renamed and given a line more
+        let middle = function(1000, "v");
+        let new = old.replacen(&middle, "fn changed() {\n    let w = 1;\n    let x = 2;\n}\n", 1);
+        let mut highlighter = parsed(&old);
+        highlighter.keep_colours_through(&Rope::from_str(&new));
+        assert!(highlighter.tree_of_text().is_none(), "the old tree is not of the text");
+        assert!(named(&highlighter, &new, "\"s3\"", "string"), "the start keeps its colours");
+        assert!(named(&highlighter, &new, "\"s2999\"", "string"), "the end too, where it is now");
+        assert!(!named(&highlighter, &new, "changed", "function"), "what went in is plain");
+        let styles = highlighter.match_styles(0..new.len());
+        let at = new.find("let x").unwrap();
+        assert!(
+            !styles.iter().any(|item| item.range.start < at + 5 && at < item.range.end),
+            "what lies between is plain"
+        );
+        assert!(highlighter.injection_parse_data().is_none_or(|data| data.old_layers.is_empty()));
+        // a key whose parse, from nothing, runs out of its time moves the
+        // kept trees with it
+        let mut keyed = parsed(&old);
+        keyed.keep_colours_through(&Rope::from_str(&new));
+        let (edit, typed) = replace(&new, 0..0, "// a comment\n");
+        assert!(!keyed.update(Some(edit), &Rope::from_str(&typed), Some(Duration::ZERO)));
+        assert!(keyed.tree_of_text().is_none());
+        assert!(named(&keyed, &typed, "\"s3\"", "string"), "where it is now");
+        assert!(named(&keyed, &typed, "\"s2999\"", "string"));
+        // a parse of it starts afresh, and colours it as a fresh one does
+        assert!(highlighter.update(None, &Rope::from_str(&new), None));
+        assert!(highlighter.tree_of_text().is_some());
+        assert_eq!(
+            highlighter.tree().unwrap().root_node().to_sexp(),
+            parsed(&new).tree().unwrap().root_node().to_sexp()
+        );
+        assert!(named(&highlighter, &new, "changed", "function"));
+
+        // a word made longer in every function from the 100th on, a
+        // difference of more than the trees are moved over: what the two
+        // share at their start keeps its colours, and the rest, where the
+        // old tokens would fall on other text, is plain
+        let other: String = (0..3000).map(|i| function(i, if i < 100 { "v" } else { "value" })).collect();
+        let head = old.find(&function(100, "v")).unwrap() + "fn f100() {\n    let v".len();
+        assert!(other.len() - head - " = \"s2999\";\n}\n".len() > KEEP_ANEW_EDIT_BYTES);
+        let mut highlighter = parsed(&old);
+        highlighter.keep_colours_through(&Rope::from_str(&other));
+        assert!(named(&highlighter, &other, "\"s3\"", "string"), "the start keeps its colours");
+        let styles = highlighter.match_styles(0..other.len());
+        assert!(styles.iter().all(|item| item.range.end <= head), "nothing past what the two share");
+        let theme = HighlightTheme::default_dark();
+        let coloured_past = |highlighter: &SyntaxHighlighter, text: &str, at: usize| {
+            highlighter
+                .styles(&(0..text.len()), theme.as_ref())
+                .iter()
+                .any(|(range, style)| range.end > at && style.color.is_some())
+        };
+        assert!(!coloured_past(&highlighter, &other, head));
+        // a key typed before it moves where the colours end, and one after
+        // it leaves it
+        let (edit, typed) = replace(&other, 0..0, "x");
+        highlighter.edit_tree(Some(edit), &Rope::from_str(&typed));
+        assert!(named(&highlighter, &typed, "\"s50\"", "string"));
+        assert!(!coloured_past(&highlighter, &typed, head + 1));
+        let at = typed.find("\"s2000\"").unwrap();
+        let (edit, typed) = replace(&typed, at..at, "y");
+        highlighter.edit_tree(Some(edit), &Rope::from_str(&typed));
+        assert!(named(&highlighter, &typed, "\"s50\"", "string"));
+        assert!(!coloured_past(&highlighter, &typed, head + 1));
+        // the parse off the UI thread lands: the trees are of the text, and
+        // the old ones are handed back to be freed elsewhere
+        let fresh = parsed(&typed);
+        let rope = Rope::from_str(&typed);
+        let replaced = highlighter.apply_background_tree(fresh.tree().unwrap().clone(), &rope, Vec::new());
+        assert!(replaced.is_some_and(|parse| !parse.is_empty()), "the old text's trees");
+        assert!(highlighter.tree_of_text().is_some(), "the trees are of the text");
+        assert_eq!(highlight_names(&highlighter, &typed), highlight_names(&fresh, &typed));
+        let (edit, typed) = replace(&typed, 0..0, "z");
+        assert!(highlighter.update(Some(edit), &Rope::from_str(&typed), None));
+        assert!(
+            highlighter.apply_background_tree(highlighter.tree().unwrap().clone(), &Rope::from_str(&typed), Vec::new()).is_none(),
+            "trees of a key are freed where they are"
+        );
+
+        // and a shorter one: the trees reach past its end, and nothing
+        // past it is coloured
+        let shorter = &other[..other.len() / 3];
+        let mut highlighter = parsed(&old);
+        highlighter.keep_colours_through(&Rope::from_str(shorter));
+        let styles = highlighter.styles(&(0..shorter.len()), theme.as_ref());
+        assert!(styles.iter().all(|(range, _)| range.end <= shorter.len()));
+        assert!(styles.iter().any(|(_, style)| style.color.is_some()));
+        // and one of the same length, which differs all over: the old
+        // tokens stand where the two differ, and are not coloured there
+        let same_length = old.replace("let v", "let w");
+        let mut highlighter = parsed(&old);
+        highlighter.keep_colours_through(&Rope::from_str(&same_length));
+        let head = old.find("let v").unwrap() + "let ".len();
+        assert!(!coloured_past(&highlighter, &same_length, head));
     }
 
     #[test]

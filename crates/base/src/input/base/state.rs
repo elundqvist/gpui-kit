@@ -3079,7 +3079,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.display_map
             .adjust_folds_for_steps(old_text, &text, range, new_text, steps);
         self.display_map
-            .on_text_changed(&self.text, range, &Rope::from(new_text), cx);
+            .on_text_edited(&self.text, range, new_text.len(), cx);
 
         self.mode.update_highlighter::<M>(
             super::mode::HighlighterUpdate {

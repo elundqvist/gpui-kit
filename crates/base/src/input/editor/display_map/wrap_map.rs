@@ -105,10 +105,10 @@ impl WrapMap {
         &mut self,
         changed_text: &Rope,
         range: &Range<usize>,
-        new_text: &Rope,
+        inserted_len: usize,
         cx: &mut App,
     ) {
-        self.wrapper.update(changed_text, range, new_text, cx);
+        self.wrapper.update(changed_text, range, inserted_len, cx);
     }
 
     /// Update layout parameters (wrap width or font)

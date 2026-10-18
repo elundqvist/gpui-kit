@@ -293,8 +293,21 @@ impl DisplayMap {
         new_text: &Rope,
         cx: &mut App,
     ) {
+        self.on_text_edited(changed_text, range, new_text.len(), cx);
+    }
+
+    /// Update text after `range` of the old text was replaced by
+    /// `inserted_len` bytes, `changed_text` the text now: as
+    /// [`Self::on_text_changed`], with no rope made of what went in.
+    pub(crate) fn on_text_edited(
+        &mut self,
+        changed_text: &Rope,
+        range: &Range<usize>,
+        inserted_len: usize,
+        cx: &mut App,
+    ) {
         self.wrap_map
-            .on_text_changed(changed_text, range, new_text, cx);
+            .on_text_changed(changed_text, range, inserted_len, cx);
         self.rebuild_fold_projection();
     }
 
