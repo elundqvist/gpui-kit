@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre 0.3.3 as published to crates.io: FORK.md at the
+// crate's root lists the changes.
 use crate::{FontId, Pixels, SharedString, TextRun, TextSystem, px};
 use collections::HashMap;
 use std::{borrow::Cow, iter, sync::Arc};
@@ -476,6 +478,10 @@ impl LineWrapper {
         // `2^3`, `a~b`, `a=1`, `Self::new`, etc. Trailing punctuation like `,`, `.`, `:`, `;`
         // is included so it stays attached to the preceding word when wrapping.
         matches!(c, '-' | '_' | '.' | '\'' | '’' | '‘' | '$' | '%' | '@' | '#' | '^' | '~' | ',' | '=' | ':' | ';') ||
+        // `+` glues as `-` does, so a key (`Ctrl+Space`, `Shift+F7`) or a
+        // name (`C++`) is not wrapped at its plus. A spaced `a + b` still
+        // breaks before the `+`, at the space.
+        c == '+' ||
         // Closing punctuation never starts a line (UAX #14 LB13: no break
         // before `!`, `)`, `]`, `}`, closing quotes or an ellipsis) — `plz!`,
         // `see)`, `quoted”` wrap as one word instead of orphaning the mark on
@@ -862,6 +868,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             &[Boundary::new(12, 0),], // special chars above take up 3, 2 and 3 bytes, so boundary ends up at 12
         );
+
+        // A key or a name with a plus wraps whole, before it, not at the
+        // plus: `aa Ctrl` / `+F7` and `aaaa C+` / `+ bb` before.
+        assert_eq!(
+            wrapper
+                .wrap_line(&[LineFragment::text("aa Ctrl+F7")], px(72.0))
+                .collect::<Vec<_>>(),
+            &[Boundary::new(3, 0)],
+        );
+        assert_eq!(
+            wrapper
+                .wrap_line(&[LineFragment::text("aaaa C++ bb")], px(72.0))
+                .collect::<Vec<_>>(),
+            &[Boundary::new(5, 0)],
+        );
+        // A spaced plus is still a place to break, before it.
+        assert_eq!(
+            wrapper
+                .wrap_line(&[LineFragment::text("aaaaaa + b")], px(72.0))
+                .collect::<Vec<_>>(),
+            &[Boundary::new(7, 0)],
+        );
     }
 
     #[test]
@@ -1162,6 +1190,9 @@ mod tests {
         assert_word("see)");
         assert_word("quoted”");
         assert_word("well…");
+        assert_word("Ctrl+Space");
+        assert_word("Shift+F7");
+        assert_word("C++");
 
         // Space
         assert_not_word("foo bar");

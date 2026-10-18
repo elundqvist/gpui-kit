@@ -22,6 +22,12 @@ asks (section 4(b)); each says so at its top:
   form `div.rs` asks for now; its tooltips still test its bounds.
 - `src/window.rs`: `HitboxId::is_hovered_during_prepaint` and
   `HitboxId::is_covered_during_prepaint`, which the check uses.
+- `src/text_system/line_wrapper.rs`: `+` is a word character, as `-`
+  and `=` are, so a key (`Ctrl+Space`, `Shift+F7`) or a name (`C++`) is
+  wrapped whole, before it, where it was wrapped at its plus, "Ctrl" at
+  the end of a line and "+Space" at the start of the next
+  (elundqvist/kvist#386). A plus with spaces around it is still a place
+  to break. Tests of both.
 
 ## Tests
 
