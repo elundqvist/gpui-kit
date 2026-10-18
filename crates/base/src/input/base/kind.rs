@@ -186,11 +186,12 @@ pub trait InputModeKind: sealed::Sealed + Sized + 'static {
     /// Drops decorations and hover state when the text is replaced wholesale.
     fn reset_annotations(_state: &mut InputBaseState<Self>) {}
 
-    /// Slides decoration ranges along with an edit.
+    /// Slides decoration ranges along with edits made one after another,
+    /// `steps`, each a range of the text as the ones before it left it and
+    /// how many bytes went there.
     fn adjust_annotations(
         _state: &mut InputBaseState<Self>,
-        _range: &std::ops::Range<usize>,
-        _new_len: usize,
+        _steps: &[(std::ops::Range<usize>, usize)],
     ) {
     }
 

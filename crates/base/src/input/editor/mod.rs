@@ -42,10 +42,9 @@ impl InputModeKind for EditorMode {
 
     fn adjust_annotations(
         state: &mut InputBaseState<Self>,
-        range: &std::ops::Range<usize>,
-        new_len: usize,
+        steps: &[(std::ops::Range<usize>, usize)],
     ) {
-        state.extras.decorations.adjust_for_edit(range, new_len);
+        state.extras.decorations.adjust_for_steps(steps);
     }
 
     fn refresh_language_features(

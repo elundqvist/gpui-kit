@@ -199,25 +199,25 @@ impl DisplayMap {
         if self.fold_map.folded_ranges().is_empty() && self.fold_map.fold_candidates().is_empty() {
             return;
         }
-
-        let edit_start_line = old_text.offset_to_point(range.start).row;
-        let edit_end_line = old_text.offset_to_point(range.end.min(old_text.len())).row;
-
-        let old_lines_in_range = edit_end_line.saturating_sub(edit_start_line);
-        let new_lines_in_range = new_text.chars().filter(|c| *c == '\n').count();
-        let line_delta = new_lines_in_range as isize - old_lines_in_range as isize;
-
-        self.fold_map
-            .adjust_folds_for_edit(edit_start_line, edit_end_line, line_delta);
+        let range = range.start.min(old_text.len())..range.end.min(old_text.len());
+        let put = new_text.bytes().filter(|b| *b == b'\n').count();
+        // what follows the edit begins a line where what went in ends in
+        // a line break, or where nothing went in at the start of a line
+        let line_after = match new_text.as_bytes().last() {
+            Some(last) => *last == b'\n',
+            None => range.start == old_text.line_start_offset(old_text.offset_to_point(range.start).row),
+        };
+        let lines = edit_lines(old_text, &range, put, line_after);
+        self.fold_map.adjust_folds_for_edits(&[lines]);
     }
 
     /// Adjust folds and candidates for edits made one after another, as a
-    /// replace-all and its undo make them: `steps`, each a range of the
-    /// text as the ones before it left it and how many bytes went there,
-    /// turned `old_text` into `new_text`, and `range` of `old_text` is the
-    /// one edit that covers them, `inserted` what is there now. A fold is
-    /// taken only where a step reaches its lines, and the rest move by the
-    /// lines the steps before them put in or took. Taken over the one edit,
+    /// replace-all, a rename and their undo make them: `steps`, each a
+    /// range of the text as the ones before it left it and how many bytes
+    /// went there, turned `old_text` into `new_text`, and `range` of
+    /// `old_text` is the one edit that covers them, `inserted` what is there
+    /// now. Each step moves and keeps the folds as it would alone
+    /// (`FoldMap::adjust_folds_for_edits`). Taken over the one edit,
     /// Replace All opened every fold between its first match and its last,
     /// and its undo did again (elundqvist/kvist#384). Steps in another
     /// order, that overlap (`apart`), are taken as the one edit.
@@ -242,16 +242,22 @@ impl DisplayMap {
         // where that is in the new text: past what the edits before it grew
         // the text by
         let mut grown = 0isize;
+        let mut reached = 0;
         let lines: Vec<(usize, usize, isize)> = edits
             .iter()
             .map(|(range, len)| {
-                let start = old_text.offset_to_point(range.start.min(old_text.len())).row;
-                let end = old_text.offset_to_point(range.end.min(old_text.len())).row;
+                let range = range.start.min(old_text.len())..range.end.min(old_text.len());
                 let at = ((range.start as isize + grown).max(0) as usize).min(new_text.len());
                 grown += *len as isize - range.len() as isize;
-                let put = new_text.offset_to_point((at + len).min(new_text.len())).row
-                    - new_text.offset_to_point(at).row;
-                (start, end, put as isize - (end - start) as isize)
+                let end = (at + len).min(new_text.len());
+                let put = new_text.offset_to_point(end).row - new_text.offset_to_point(at).row;
+                let line_after = end == 0 || new_text.byte(end - 1) == b'\n';
+                let (start, mut past, delta) = edit_lines(old_text, &range, put, line_after);
+                // an edit that ends where the one before it left a line
+                // the latter reaches: so that the lines reached never go back
+                past = past.max(reached);
+                reached = past;
+                (start, past, delta)
             })
             .collect();
         self.fold_map.adjust_folds_for_edits(&lines);
@@ -275,6 +281,8 @@ impl DisplayMap {
         let new_candidates = extract_fold_ranges(edit_byte_range, new_text);
         self.fold_map
             .merge_candidates_for_edit(new_start_line, new_end_line, new_candidates);
+        // a fold kept through the edit takes the lines it covers now
+        self.rebuild_fold_projection();
     }
 
     /// Update text (incremental or full)
@@ -446,6 +454,31 @@ impl DisplayMap {
     }
 }
 
+/// The lines of `old_text` an edit of `range` reaches, from the line it
+/// begins on to the one before the second, and how many lines it put in
+/// or took: `put` line breaks went in, and `line_after` says whether what
+/// follows the edit begins a line in the text after it. One that ends at
+/// the start of a line, where what follows it still begins a line, reaches
+/// no further than the line before: deleting the line above a fold leaves
+/// the fold's first line as it was, and so do lines put in before it, where
+/// the fold was taken as edited and opened (elundqvist/kvist#404). One that
+/// took nothing and put in whole lines reaches none (the two are the same),
+/// and lies before the line it was put in at.
+fn edit_lines(
+    old_text: &Rope,
+    range: &Range<usize>,
+    put: usize,
+    line_after: bool,
+) -> (usize, usize, isize) {
+    let start = old_text.offset_to_point(range.start).row;
+    let end = old_text.offset_to_point(range.end).row;
+    let delta = put as isize - (end - start) as isize;
+    let at_line_start = range.end == old_text.line_start_offset(end);
+    let nothing = range.is_empty() && put == 0;
+    let past = if at_line_start && line_after && !nothing { end } else { end + 1 };
+    (start, past, delta)
+}
+
 #[cfg(test)]
 mod tests {
     use std::ops::Range;
@@ -534,8 +567,10 @@ mod tests {
         let mut together = fresh();
         together.adjust_folds_for_steps(&text, &after, &covering, &inserted, &lens);
         assert_eq!(lines(&together), lines(&each), "the last first");
-        // the folds on lines 1, 5, 25 and 49 are taken, the rest moved
-        let kept = [(6, 8), (12, 14), (16, 18), (20, 22), (27, 29), (31, 33), (35, 37), (41, 43), (45, 47), (53, 55)];
+        // the folds on lines 1, 5 and 25 are taken, whose first lines the
+        // edits break or join, the rest moved; the one on 49 hides the
+        // line of the two words, which keeps it
+        let kept = [(6, 8), (12, 14), (16, 18), (20, 22), (27, 29), (31, 33), (35, 37), (41, 43), (45, 47), (49, 51), (53, 55)];
         assert_eq!(lines(&together).0, kept);
 
         // their undo: each the other way, the first first, on the text the
@@ -553,6 +588,32 @@ mod tests {
         together.adjust_folds_for_steps(&after, &back, &covering, &inserted, &lens);
         assert_eq!(lines(&together), lines(&each), "the first first");
 
+        // a rename in each of three folds, on a first line, a hidden line
+        // and a last line, and the line above a fourth taken: every fold
+        // stays, through the edits and their undo
+        let rename: Vec<(Range<usize>, String)> = [
+            (at(41, 0)..at(41, 4), "row"),
+            (at(34, 0)..at(34, 4), "row"),
+            (at(31, 0)..at(31, 4), "row"),
+            (at(8, 0)..at(9, 0), ""),
+        ]
+        .into_iter()
+        .map(|(range, new)| (range, new.to_string()))
+        .collect();
+        let (after, covering, inserted, lens) = made(&text, &rename);
+        let mut together = fresh();
+        together.adjust_folds_for_steps(&text, &after, &covering, &inserted, &lens);
+        let mut moved: Vec<(usize, usize)> = folds.iter().map(|f| (f.start_line, f.end_line)).collect();
+        for fold in &mut moved {
+            if fold.0 > 8 {
+                *fold = (fold.0 - 1, fold.1 - 1);
+            }
+        }
+        assert_eq!(lines(&together).0, moved, "renamed in three, and the line above the fold on 9 taken");
+        let mut each = fresh();
+        one_by_one(&mut each, &text, &rename);
+        assert_eq!(lines(&together), lines(&each), "renamed, each alone");
+
         // overlapping: taken as the one edit over them
         let tangled: Vec<(Range<usize>, String)> =
             vec![(at(20, 0)..at(20, 2), "ab\n".into()), (at(20, 1)..at(20, 3), "".into())];
@@ -562,5 +623,39 @@ mod tests {
         let mut together = fresh();
         together.adjust_folds_for_steps(&text, &after, &covering, &inserted, &lens);
         assert_eq!(lines(&together), lines(&one), "tangled");
+    }
+
+    /// What one edit does to a fold: lines put in or taken among those it
+    /// hides grow or shrink it, an edit on its first or its last line that
+    /// puts in no line keeps it, lines put in before its first line or
+    /// taken above it move it, and an edit across an edge of it, or one that
+    /// breaks its first line, takes it.
+    #[test]
+    fn test_an_edit_keeps_a_fold_it_lies_within() {
+        let text = Rope::from((0..20).map(|i| format!("line {i}\n")).collect::<String>());
+        let at = |line: usize, column: usize| text.line_start_offset(line) + column;
+        let folded = |range: Range<usize>, new: &str| {
+            let mut map = DisplayMap::new(gpui::font("Courier"), px(14.), None);
+            map.fold_map.set_candidates(vec![FoldRange::new(5, 10)]);
+            map.fold_map.set_folded(5, true);
+            map.adjust_folds_for_edit(&text, &range, new);
+            lines(&map).0
+        };
+        assert_eq!(folded(at(7, 0)..at(7, 4), "row"), [(5, 10)], "a word on a hidden line");
+        assert_eq!(folded(at(7, 0)..at(9, 0), ""), [(5, 8)], "two hidden lines taken");
+        assert_eq!(folded(at(6, 2)..at(6, 2), "a\nb\n"), [(5, 12)], "two lines put in on a hidden one");
+        assert_eq!(folded(at(10, 0)..at(10, 0), "x\n"), [(5, 11)], "a line put in before its last");
+        assert_eq!(folded(at(5, 0)..at(5, 4), "row"), [(5, 10)], "a word on its first line");
+        assert_eq!(folded(at(10, 0)..at(10, 4), "row"), [(5, 10)], "a word on its last line");
+        assert_eq!(folded(at(4, 0)..at(5, 0), ""), [(4, 9)], "the line above it taken");
+        assert_eq!(folded(at(2, 0)..at(5, 0), "x\n"), [(3, 8)], "lines above it made one");
+        assert_eq!(folded(at(5, 0)..at(5, 0), "x\ny\n"), [(7, 12)], "lines put in before its first");
+        assert_eq!(folded(at(4, 6)..at(4, 6), "\n"), [(6, 11)], "a line broken above it");
+        assert_eq!(folded(at(12, 0)..at(13, 0), ""), [(5, 10)], "a line taken below it");
+        assert!(folded(at(5, 6)..at(5, 6), "\n").is_empty(), "its first line broken");
+        assert!(folded(at(4, 6)..at(5, 0), "").is_empty(), "its first line joined to the one above");
+        assert!(folded(at(4, 0)..at(6, 0), "").is_empty(), "its first line taken");
+        assert!(folded(at(9, 2)..at(11, 0), "").is_empty(), "across its last line");
+        assert!(folded(at(10, 6)..at(10, 6), "\n").is_empty(), "its last line broken");
     }
 }

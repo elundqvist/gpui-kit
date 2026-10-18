@@ -111,34 +111,56 @@ impl FoldMap {
         candidates.sort_by_key(|r| r.start_line);
         candidates.dedup_by_key(|r| r.start_line);
         self.candidates = candidates;
-
-        // Remove any folded ranges that are no longer in candidates
-        self.folded.retain(|fold| {
-            self.candidates
-                .iter()
-                .any(|c| c.start_line == fold.start_line)
-        });
+        self.fold_as_candidates();
     }
 
     /// Merge new candidates extracted from an edited region into existing candidates.
     ///
     /// Replaces candidates within [edit_start_line, edit_end_line] with `new_candidates`,
-    /// keeping candidates outside the edit range intact.
+    /// keeping candidates outside the edit range intact. A new candidate
+    /// takes the place of one that begins on its line, as the extraction
+    /// finds the folds around the edit too, which a fold kept through the
+    /// edit grew or shrank with it, and a fold takes the lines of the
+    /// candidate on its first line, or goes with it.
     pub(super) fn merge_candidates_for_edit(
         &mut self,
         edit_start_line: usize,
         edit_end_line: usize,
-        new_candidates: Vec<FoldRange>,
+        mut new_candidates: Vec<FoldRange>,
     ) {
-        // Remove old candidates within the edit range (already done by adjust_folds_for_edit)
-        // But do it again in case adjust wasn't called or range differs
         self.candidates
             .retain(|c| c.start_line < edit_start_line || c.start_line > edit_end_line);
+        // the new first, so that the sort keeps them first on their line
+        // and the dedup keeps them
+        new_candidates.append(&mut self.candidates);
+        new_candidates.sort_by_key(|r| r.start_line);
+        new_candidates.dedup_by_key(|r| r.start_line);
+        self.candidates = new_candidates;
+        self.fold_as_candidates();
+    }
 
-        // Add new candidates
-        self.candidates.extend(new_candidates);
-        self.candidates.sort_by_key(|r| r.start_line);
-        self.candidates.dedup_by_key(|r| r.start_line);
+    /// Each fold covers what the candidate on its first line covers, and
+    /// one with no candidate there goes: a fold an edit kept found again
+    /// shorter or longer, or no longer found.
+    fn fold_as_candidates(&mut self) {
+        let candidates = &self.candidates;
+        let mut changed = false;
+        self.folded.retain_mut(|fold| {
+            match candidates.binary_search_by_key(&fold.start_line, |c| c.start_line) {
+                Ok(i) => {
+                    changed |= fold.end_line != candidates[i].end_line;
+                    fold.end_line = candidates[i].end_line;
+                    true
+                }
+                Err(_) => {
+                    changed = true;
+                    false
+                }
+            }
+        });
+        if changed {
+            self.needs_rebuild = true;
+        }
     }
 
     /// Set a fold at the given start_line (must be in candidates)
@@ -194,60 +216,25 @@ impl FoldMap {
         self.folded.clear();
     }
 
-    /// Adjust folds and candidates after a text edit.
-    ///
-    /// - Folds/candidates overlapping the edited line range are removed
-    /// - Folds/candidates after the edit are shifted by line_delta
-    ///
-    /// This avoids expensive full tree traversal on every keystroke.
-    pub(super) fn adjust_folds_for_edit(
-        &mut self,
-        edit_start_line: usize,
-        edit_end_line: usize,
-        line_delta: isize,
-    ) {
-        // Adjust folded ranges
-        if !self.folded.is_empty() {
-            self.folded.retain(|fold| {
-                !(fold.start_line <= edit_end_line && fold.end_line >= edit_start_line)
-            });
-
-            if line_delta != 0 {
-                for fold in &mut self.folded {
-                    if fold.start_line > edit_end_line {
-                        fold.start_line = (fold.start_line as isize + line_delta).max(0) as usize;
-                        fold.end_line = (fold.end_line as isize + line_delta).max(0) as usize;
-                    }
-                }
-            }
-        }
-
-        // Adjust candidates the same way
-        if !self.candidates.is_empty() {
-            self.candidates
-                .retain(|c| !(c.start_line <= edit_end_line && c.end_line >= edit_start_line));
-
-            if line_delta != 0 {
-                for c in &mut self.candidates {
-                    if c.start_line > edit_end_line {
-                        c.start_line = (c.start_line as isize + line_delta).max(0) as usize;
-                        c.end_line = (c.end_line as isize + line_delta).max(0) as usize;
-                    }
-                }
-            }
-        }
-
-        self.needs_rebuild = true;
-    }
-
     /// Adjust folds and candidates after edits of the text, `edits`, each
-    /// the first and last line it reached in the text before them all and
-    /// how many lines it put in or took, in order and apart (one may end on
-    /// the line the next begins on), as `adjust_folds_for_edit` adjusts
-    /// them for one: those whose lines an edit reaches are removed, and
-    /// the rest move by the lines the edits before them put in or took.
-    /// Each fold is looked up among the edits, so a replace of thousands
-    /// of matches in a file of thousands of folds is not their product.
+    /// the lines it reached in the text before them all, from the first to
+    /// the one before the second (none where the two are the same: whole
+    /// lines put in before the first), and how many lines it put in or
+    /// took, in order (one may end on the line the next begins on).
+    ///
+    /// A fold keeps its first and last line in view and hides those
+    /// between. One stays, and moves by the lines the edits before it put
+    /// in or took, where every edit that reaches it lies within the lines
+    /// it hides, which then grow or shrink by that edit's lines, or keeps
+    /// to its first line or its last and puts in or takes no line: a
+    /// rename, a replace or a line taken in a fold leaves it shut, as VS
+    /// Code and IntelliJ leave it; it was taken at any edit that reached
+    /// its lines, and opened (elundqvist/kvist#404). An edit across its
+    /// edges, or one that breaks or joins its first line or its last,
+    /// takes it. What it covers is found again where the edit was
+    /// (`merge_candidates_for_edit`). Each fold is looked up among the
+    /// edits, so a replace of thousands of matches in a file of thousands
+    /// of folds is not their product.
     pub(super) fn adjust_folds_for_edits(&mut self, edits: &[(usize, usize, isize)]) {
         if edits.is_empty() {
             return;
@@ -259,20 +246,24 @@ impl FoldMap {
         }
         let adjust = |ranges: &mut Vec<FoldRange>| {
             ranges.retain_mut(|fold| {
-                // the edits before it end on a line before it begins
-                let k = edits.partition_point(|&(_, end, _)| end < fold.start_line);
-                if edits
-                    .get(k)
-                    .is_some_and(|&(start, _, _)| start <= fold.end_line)
-                {
-                    return false;
+                let (first, last) = (fold.start_line, fold.end_line);
+                // the edits before it reach no further than the line
+                // before its first
+                let k = edits.partition_point(|&(_, past, _)| past <= first);
+                let mut inside = 0isize;
+                for &(start, past, delta) in edits[k..].iter().take_while(|&&(start, _, _)| start <= last) {
+                    let hidden = start > first && past <= last;
+                    let on_its_own = delta == 0 && past == start + 1 && (start == first || start == last);
+                    if hidden {
+                        inside += delta;
+                    } else if !on_its_own {
+                        return false;
+                    }
                 }
-                let delta = grown[k];
-                if delta != 0 {
-                    fold.start_line = (fold.start_line as isize + delta).max(0) as usize;
-                    fold.end_line = (fold.end_line as isize + delta).max(0) as usize;
-                }
-                true
+                let before = grown[k];
+                fold.start_line = (first as isize + before).max(0) as usize;
+                fold.end_line = (last as isize + before + inside).max(0) as usize;
+                fold.end_line > fold.start_line
             });
         };
         adjust(&mut self.folded);

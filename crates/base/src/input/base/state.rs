@@ -2277,6 +2277,7 @@ impl<M: InputModeKind> InputBaseState<M> {
                 .collect();
             self.replay(&steps, window, cx);
             self.selected_range = selection;
+            self.open_folds_hiding(self.cursor());
             // before the next layout chooses its lines: left to the
             // caret's follow in the layout, the lines were those at the
             // old place and painted at the new, and an undone paste of
@@ -2296,9 +2297,28 @@ impl<M: InputModeKind> InputBaseState<M> {
                 .collect();
             self.replay(&steps, window, cx);
             self.selected_range = selection;
+            self.open_folds_hiding(self.cursor());
             self.scroll_to_edited(self.cursor(), cx);
         }
         self.undo_manager.set_ignoring(false);
+    }
+
+    /// Open the folds that hide the line of `offset`, every one where they
+    /// nest: an undo or a redo puts the caret back where it was, which may
+    /// be in a fold made since, which the edit no longer opens
+    /// (elundqvist/kvist#404), as VS Code opens a fold its caret goes into.
+    fn open_folds_hiding(&mut self, offset: usize) {
+        let row = self.text.offset_to_point(offset.min(self.text.len())).row;
+        let hiding: Vec<usize> = self
+            .display_map
+            .folded_ranges()
+            .iter()
+            .filter(|fold| row > fold.start_line && row < fold.end_line)
+            .map(|fold| fold.start_line)
+            .collect();
+        for start_line in hiding {
+            self.display_map.set_folded(start_line, false);
+        }
     }
 
     /// Make a step of undo or redo, `steps` its changes in turn, each a
@@ -2334,15 +2354,22 @@ impl<M: InputModeKind> InputBaseState<M> {
         for (range, text) in steps {
             let range = self.text.clip_offset(range.start, Bias::Left)
                 ..self.text.clip_offset(range.end, Bias::Right);
+            // a change that puts back what is there changes nothing: the
+            // undo of a paste of the text over itself opened every fold
+            if puts_back(&self.text, &range, text) {
+                continue;
+            }
             head = head.min(range.start);
             tail = tail.min(self.text.len() - range.end);
             made.push((range.clone(), text.len()));
             self.text.replace(range, text);
         }
-        let range = head..old_text.len() - tail;
-        let new_text = self.text.slice(head..self.text.len() - tail).to_string();
-        M::adjust_annotations(self, &range, new_text.len());
-        self.follow_edit(&old_text, &range, &new_text, &made, window, cx);
+        if !made.is_empty() {
+            let range = head..old_text.len() - tail;
+            let new_text = self.text.slice(head..self.text.len() - tail).to_string();
+            M::adjust_annotations(self, &made);
+            self.follow_edit(&old_text, &range, &new_text, &made, window, cx);
+        }
         self.ime_marked_range.take();
         self.preferred_column = None;
         self.update_search(cx);
@@ -3107,10 +3134,12 @@ impl<M: InputModeKind> InputBaseState<M> {
         };
 
         // The new byte range in the updated text after the edit, on the
-        // whole of the lines it begins and ends on: the folds an edit's
-        // lines touch were taken (`adjust_folds_for_edit`), and one that
-        // begins on its last line or ends on its first is found again
-        // only here. Looked for in the edit's bytes alone, a function
+        // whole of the lines it begins and ends on: a fold the edit crosses
+        // the edges of, or whose first or last line it breaks or joins, was
+        // taken (`adjust_folds_for_steps`), one it lay within was kept and
+        // takes its extent from what is found here on its first line, and
+        // a candidate that begins on its last line or ends on its first is
+        // found again only here. Looked for in the edit's bytes alone, a function
         // that began where a cut ended, or where a paste began, lost its
         // chevron until the file was read again.
         let new_end = (edit_range.start + new_text.len()).min(self.text.len());
@@ -3123,6 +3152,13 @@ impl<M: InputModeKind> InputBaseState<M> {
             &self.text,
         );
     }
+}
+
+/// Whether putting `new` in place of `range` of `text` leaves it as it is:
+/// read only where the two are as long, as a paste of the whole text over
+/// itself is.
+fn puts_back(text: &Rope, range: &Range<usize>, new: &str) -> bool {
+    range.len() == new.len() && text.slice(range.clone()) == new
 }
 
 impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
@@ -3247,12 +3283,18 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
             }
         }
 
+        // A replacement by what is there already, a paste of the whole text
+        // over itself, changes nothing that follows the text: as an edit of
+        // all of it, it opened every fold and took every problem's mark and
+        // decoration (elundqvist/kvist#404). Nor is it a step of undo, which
+        // records no change that leaves the text as it was.
+        let puts_back = !mask_changed && puts_back(&old_text, &range, new_text);
         if mask_changed {
             // Masking rewrites the whole document, so ranges recorded against
             // the old text no longer point at anything.
             M::reset_annotations(self);
-        } else {
-            M::adjust_annotations(self, &range, new_text.len());
+        } else if !puts_back {
+            M::adjust_annotations(self, &[(range.clone(), new_text.len())]);
         }
         if mask_changed {
             // A segment-based history entry no longer matches the masked
@@ -3282,7 +3324,9 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         // edit into the same change, which then carries the text and selection
         // of the first composition.
         self.undo_manager.commit_transaction();
-        self.follow_edit(&old_text, &range, new_text, &[(range.clone(), new_text.len())], window, cx);
+        if !puts_back {
+            self.follow_edit(&old_text, &range, new_text, &[(range.clone(), new_text.len())], window, cx);
+        }
         self.selected_range = (new_offset..new_offset).into();
         self.ime_marked_range.take();
         // The layout is older than the text now, so the caret's place in it
@@ -3357,7 +3401,7 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
             }
         }
 
-        M::adjust_annotations(self, &range, new_text.len());
+        M::adjust_annotations(self, &[(range.clone(), new_text.len())]);
         self.follow_edit(&old_text, &range, new_text, &[(range.clone(), new_text.len())], window, cx);
         if new_text.is_empty() {
             // Cancel selection, when cancel IME input.
@@ -4676,12 +4720,13 @@ mod tests {
     }
 
     /// A replace-all of the find bar, its undo and its redo keep the folds
-    /// no match reaches shut, moved by the lines the matches before them
-    /// put in, and open those a match is in, as an edit there does. Taken
-    /// as one edit from the first match to the last, every fold between
-    /// them opened, at the replace and at its undo (elundqvist/kvist#384).
+    /// shut, moved by the lines the matches before them put in, and those
+    /// a match is in grown by its lines. Taken as one edit from the first
+    /// match to the last, every fold between them opened, at the replace
+    /// and at its undo (elundqvist/kvist#384); and one a match was in
+    /// opened, as any edit in it did (elundqvist/kvist#404).
     #[gpui::test]
-    fn test_a_replace_all_keeps_the_folds_its_matches_do_not_reach(cx: &mut TestAppContext) {
+    fn test_a_replace_all_keeps_the_folds(cx: &mut TestAppContext) {
         let view = InputView::<EditorMode>::new(cx);
         let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
         let input = view.input;
@@ -4721,21 +4766,169 @@ mod tests {
             })
         });
         cx.run_until_parked();
-        // each match a line longer
-        let (k1, k3) = ((10, 18), (29, 37));
+        // each match a line longer: k4 holds one and grows by its line,
+        // k1 and k3 move; k0, which the bar opened as it went to its match,
+        // stays open
+        let replaced = [(10, 18), (29, 37), (38, 47)];
         cx.update(|window, cx| {
             input.update(cx, |state, cx| {
                 assert_eq!(state.replace_all_search_matches("pin\n        // more", window, cx), 3);
                 assert_eq!(state.text.to_string(), text.replace("needle", "pin\n        // more"));
-                assert_eq!(folded(state), [k1, k3], "the replace");
+                assert_eq!(folded(state), replaced, "the replace");
                 state.undo(&Undo, window, cx);
                 assert_eq!(state.text.to_string(), text, "one step of undo");
-                assert_eq!(folded(state), [(9, 17), (27, 35)], "its undo");
+                assert_eq!(folded(state), [(9, 17), (27, 35), (36, 44)], "its undo");
                 state.redo(&Redo, window, cx);
-                assert_eq!(folded(state), [k1, k3], "its redo");
+                assert_eq!(folded(state), replaced, "its redo");
                 // and every fold has its chevron where its function is
                 let candidates: Vec<usize> = Blocks::all(&state.text).into_iter().map(|(_, fold)| fold.start_line).collect();
                 assert!(candidates.iter().all(|&line| state.display_map.is_fold_candidate(line)), "{candidates:?}");
+            })
+        });
+    }
+
+    /// An application's changes (`replace_steps`), as a rename makes them,
+    /// their undo and their redo move a decoration between two of them as
+    /// the changes before it move its text, so a line's breakpoint stays on
+    /// its line, and keep the folds the changes are in shut; the line
+    /// above a fold taken moves the fold, and a paste of the whole text
+    /// over itself leaves the folds and the decorations as they are. The
+    /// decoration went to the line of the first change and
+    /// stayed there through the undo, and every one of those folds opened
+    /// (elundqvist/kvist#404).
+    #[gpui::test]
+    fn test_changes_keep_decorations_and_folds_where_they_are(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        // five functions of nine lines each and a line between them, `sum`
+        // on the first line and on two hidden lines of each
+        let text: String = (0..5)
+            .map(|k| format!("fn k{k}(sum: i32) -> i32 {{\n    if sum > {k} {{\n        sum + 1\n    }} else {{\n        0\n    }}\n    // k{k}\n    // end\n}}\n\n"))
+            .collect();
+        let folded = |state: &InputBaseState<EditorMode>| -> Vec<(usize, usize)> {
+            state.display_map.folded_ranges().iter().map(|fold| (fold.start_line, fold.end_line)).collect()
+        };
+        let line = |text: &Rope, l: usize| text.line_start_offset(l)..text.line_start_offset(l + 1);
+        let collection = cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_highlighter_factory(
+                    Rc::new(|_: &str| Some(Box::new(Blocks) as Box<dyn crate::input::InputHighlighter>)),
+                    cx,
+                );
+                state.set_value(text.clone(), window, cx);
+                // a breakpoint on k1's `else` line, and one on k2's first
+                let style = gpui::HighlightStyle::default();
+                state.create_decorations_collection(
+                    vec![
+                        crate::input::TextDecoration::new(line(&state.text, 13), style),
+                        crate::input::TextDecoration::new(line(&state.text, 20), style),
+                    ],
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+        let all_folded = [(0, 8), (10, 18), (30, 38), (40, 48)];
+        cx.update(|_, cx| {
+            input.update(cx, |state, _| {
+                for (line, _) in all_folded {
+                    state.display_map.set_folded(line, true);
+                }
+                assert_eq!(folded(state), all_folded);
+            })
+        });
+        let decorated = |cx: &mut VisualTestContext| -> Vec<Range<usize>> { cx.update(|_, cx| collection.get_ranges(cx)) };
+        // `sum` renamed `total` in k0, k1 and k3, the last first
+        let in_k = |text: &str, at: usize| text[..at].matches('\n').count() / 10;
+        let mut places: Vec<Range<usize>> = text
+            .match_indices("sum")
+            .map(|(i, _)| i..i + 3)
+            .filter(|r| ![2, 4].contains(&in_k(&text, r.start)))
+            .collect();
+        places.reverse();
+        let renamed: String = text
+            .split_inclusive('\n')
+            .enumerate()
+            .map(|(row, l)| if [2, 4].contains(&(row / 10)) { l.to_string() } else { l.replace("sum", "total") })
+            .collect();
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                let edits: Vec<(Range<usize>, &str)> = places.iter().map(|r| (r.clone(), "total")).collect();
+                state.replace_steps(&edits, window, cx);
+                assert_eq!(state.text.to_string(), renamed);
+                assert_eq!(folded(state), all_folded, "renamed in them");
+            })
+        });
+        let before = Rope::from(text.as_str());
+        let after = Rope::from(renamed.as_str());
+        assert_eq!(decorated(&mut cx), [line(&after, 13), line(&after, 20)], "the rename");
+        cx.update(|window, cx| input.update(cx, |state, cx| state.undo(&Undo, window, cx)));
+        assert_eq!(decorated(&mut cx), [line(&before, 13), line(&before, 20)], "its undo");
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                assert_eq!(state.text.to_string(), text);
+                assert_eq!(folded(state), all_folded, "its undo");
+                state.redo(&Redo, window, cx);
+                assert_eq!(folded(state), all_folded, "its redo");
+            })
+        });
+        assert_eq!(decorated(&mut cx), [line(&after, 13), line(&after, 20)], "its redo");
+        let moved = [(0, 8), (10, 18), (29, 37), (39, 47)];
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                // the line above k3 taken
+                let above = line(&state.text, 29);
+                let range = state.range_to_utf16(&above);
+                state.replace_text_in_range(Some(range), "", window, cx);
+                assert_eq!(folded(state), moved, "the line above k3 taken");
+                // the whole text pasted over itself
+                let same = state.text.to_string();
+                state.select_all(window, cx);
+                state.replace_text_in_range(None, &same, window, cx);
+                assert_eq!(state.text.to_string(), same);
+                assert_eq!(folded(state), moved, "pasted over itself");
+                // which is no step of undo: the undo puts the line back
+                state.undo(&Undo, window, cx);
+                assert_eq!(folded(state), all_folded, "the line put back");
+            })
+        });
+        assert_eq!(decorated(&mut cx), [line(&after, 13), line(&after, 20)], "the paste, and the line put back");
+    }
+
+    /// An undo that puts the caret back in a fold made since opens it, as
+    /// VS Code opens a fold its caret goes into: the edit in it no longer
+    /// opens it (elundqvist/kvist#404).
+    #[gpui::test]
+    fn test_an_undo_into_a_fold_opens_it(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let text: String = (0..3).map(|k| format!("fn k{k}() {{\n    let a = 1;\n    let b = 2;\n}}\n")).collect();
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_highlighter_factory(
+                    Rc::new(|_: &str| Some(Box::new(Blocks) as Box<dyn crate::input::InputHighlighter>)),
+                    cx,
+                );
+                state.set_value(text.clone(), window, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                // typed on k1's second line, then k1 folded and the caret
+                // put on k0
+                let at = state.text.line_start_offset(6) + 4;
+                state.set_selected_range(at..at, cx);
+                state.replace_text_in_range(None, "x", window, cx);
+                state.display_map.set_folded(4, true);
+                assert_eq!(state.display_map.folded_ranges().len(), 1);
+                state.set_selected_range(0..0, cx);
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.text.to_string(), text);
+                assert!(state.display_map.folded_ranges().is_empty(), "the undo's caret is in it");
+                assert_eq!(state.cursor(), at);
             })
         });
     }
