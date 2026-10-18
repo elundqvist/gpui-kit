@@ -132,6 +132,8 @@ pub struct ThemeStyle {
     pub color: Option<gpui::Hsla>,
     pub font_style: Option<FontStyle>,
     pub font_weight: Option<FontWeightContent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strikethrough: Option<bool>,
 }
 
 impl From<ThemeStyle> for HighlightStyle {
@@ -153,6 +155,12 @@ impl From<ThemeStyle> for HighlightStyle {
                 FontStyle::Normal => gpui::FontStyle::Normal,
                 FontStyle::Italic => gpui::FontStyle::Italic,
                 FontStyle::Underline => gpui::FontStyle::Normal,
+            }),
+            strikethrough: style.strikethrough.filter(|&struck| struck).map(|_| {
+                gpui::StrikethroughStyle {
+                    thickness: gpui::px(1.),
+                    color: None,
+                }
             }),
             ..Default::default()
         }
@@ -205,6 +213,8 @@ pub struct SyntaxColors {
     pub string_special: Option<ThemeStyle>,
     #[serde(rename = "string.special.symbol")]
     pub string_special_symbol: Option<ThemeStyle>,
+    /// Markdown's `~~gone~~`, struck through by a style that says so.
+    pub strikethrough: Option<ThemeStyle>,
     pub tag: Option<ThemeStyle>,
     #[serde(rename = "tag.doctype")]
     pub tag_doctype: Option<ThemeStyle>,
@@ -260,6 +270,7 @@ impl SyntaxColors {
             "string.regex" => self.string_regex,
             "string.special" => self.string_special,
             "string.special.symbol" => self.string_special_symbol,
+            "strikethrough" => self.strikethrough,
             "tag" => self.tag,
             "tag.doctype" => self.tag_doctype,
             "text.code.span" => self.text_code_span,
@@ -283,7 +294,7 @@ impl SyntaxColors {
     }
 
     pub fn style_for_index(&self, index: usize) -> Option<HighlightStyle> {
-        const HIGHLIGHT_NAMES: [&str; 41] = [
+        const HIGHLIGHT_NAMES: [&str; 42] = [
             "attribute",
             "boolean",
             "comment",
@@ -311,6 +322,7 @@ impl SyntaxColors {
             "punctuation.delimiter",
             "punctuation.list_marker",
             "punctuation.special",
+            "strikethrough",
             "string",
             "string.escape",
             "string.regex",

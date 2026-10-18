@@ -184,6 +184,9 @@
           "string.special.symbol": {
             "color": "#d21f07"
           },
+          "strikethrough": {
+            "strikethrough": true
+          },
           "tag": {
             "color": "#0433ff"
           },
@@ -395,6 +398,9 @@
           },
           "string.special.symbol": {
             "color": "#A3E09F"
+          },
+          "strikethrough": {
+            "strikethrough": true
           },
           "tag": {
             "color": "#419CFF"

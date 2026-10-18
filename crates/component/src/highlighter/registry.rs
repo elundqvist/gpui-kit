@@ -13,7 +13,7 @@ use crate::{
     highlighter::{Language, languages},
 };
 
-pub(super) const HIGHLIGHT_NAMES: [&str; 41] = [
+pub(super) const HIGHLIGHT_NAMES: [&str; 42] = [
     "attribute",
     "boolean",
     "comment",
@@ -41,6 +41,7 @@ pub(super) const HIGHLIGHT_NAMES: [&str; 41] = [
     "punctuation.delimiter",
     "punctuation.list_marker",
     "punctuation.special",
+    "strikethrough",
     "string",
     "string.escape",
     "string.regex",
@@ -153,6 +154,8 @@ pub struct SyntaxColors {
     pub string_special: Option<ThemeStyle>,
     #[serde(rename = "string.special.symbol")]
     pub string_special_symbol: Option<ThemeStyle>,
+    /// Markdown's `~~gone~~`, struck through by a style that says so.
+    pub strikethrough: Option<ThemeStyle>,
     pub tag: Option<ThemeStyle>,
     #[serde(rename = "tag.doctype")]
     pub tag_doctype: Option<ThemeStyle>,
@@ -222,6 +225,10 @@ pub struct ThemeStyle {
     color: Option<Hsla>,
     font_style: Option<FontStyle>,
     font_weight: Option<FontWeightContent>,
+    /// `true` draws a line through the text, a pixel thick and in the
+    /// text's colour, as Markdown's `~~gone~~` is drawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    strikethrough: Option<bool>,
 }
 
 impl From<ThemeStyle> for HighlightStyle {
@@ -230,6 +237,12 @@ impl From<ThemeStyle> for HighlightStyle {
             color: style.color,
             font_weight: style.font_weight.map(Into::into),
             font_style: style.font_style.map(Into::into),
+            strikethrough: style.strikethrough.filter(|&struck| struck).map(|_| {
+                gpui::StrikethroughStyle {
+                    thickness: gpui::px(1.),
+                    color: None,
+                }
+            }),
             ..Default::default()
         }
     }
@@ -291,6 +304,7 @@ impl SyntaxColors {
             "string.regex" => self.string_regex,
             "string.special" => self.string_special,
             "string.special.symbol" => self.string_special_symbol,
+            "strikethrough" => self.strikethrough,
             "tag" => self.tag,
             "tag.doctype" => self.tag_doctype,
             "text.code.span" => self.text_code_span,

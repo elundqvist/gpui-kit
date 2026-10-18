@@ -1116,6 +1116,16 @@
             }
           ]
         },
+        "strikethrough": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThemeStyle"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "tag": {
           "anyOf": [
             {
@@ -1231,6 +1241,9 @@
               "type": "null"
             }
           ]
+        },
+        "strikethrough": {
+          "type": ["boolean", "null"]
         }
       },
       "required": []

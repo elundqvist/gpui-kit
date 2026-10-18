@@ -3653,6 +3653,37 @@ $x = 1;
         }
     }
 
+    /// Markdown's `~~gone~~` is named `strikethrough`, and a theme's style
+    /// of that name strikes it through, the default themes' too, beside an
+    /// emphasis that stays unstruck (elundqvist/kvist#382).
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_markdown_strikethrough_is_struck_through() {
+        let source = "Some *em* and ~~gone~~ text.\n";
+        let highlighter = fresh_highlighter(markdown_by_paragraph(), source);
+        let highlights = highlighter.match_styles(0..source.len());
+        assert!(has_highlight_covering(&highlights, source, "~~gone~~", "strikethrough"));
+        let at = |styles: &[(Range<usize>, HighlightStyle)], text: &str| {
+            let byte = source.find(text).unwrap();
+            styles
+                .iter()
+                .find(|(range, _)| range.contains(&byte))
+                .map(|(_, style)| *style)
+                .unwrap_or_default()
+        };
+        for theme in [HighlightTheme::default_dark(), HighlightTheme::default_light()] {
+            let styles = highlighter.styles(&(0..source.len()), theme.as_ref());
+            let struck = at(&styles, "gone").strikethrough.expect("gone is struck through");
+            assert_eq!((struck.thickness, struck.color), (gpui::px(1.), None));
+            assert_eq!(at(&styles, "em").strikethrough, None);
+            assert_eq!(at(&styles, "text").strikethrough, None);
+        }
+        let mut theme = HighlightTheme::default_dark().as_ref().clone();
+        theme.style.syntax.strikethrough = None;
+        let styles = highlighter.styles(&(0..source.len()), &theme);
+        assert_eq!(at(&styles, "gone").strikethrough, None, "a theme without the style");
+    }
+
     /// Paragraphs are not counted against the cap on spans parsed: a
     /// CHANGELOG's thousand items each have their layer, and so has the
     /// fence after them, where the cap left all past the 512th plain. A

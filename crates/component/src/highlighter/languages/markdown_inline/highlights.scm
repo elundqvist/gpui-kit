@@ -13,6 +13,9 @@
 ((strong_emphasis) @emphasis.strong
   (#set! highlight.allow-overlap))
 
+((strikethrough) @strikethrough
+  (#set! highlight.allow-overlap))
+
 [
   (link_destination)
   (uri_autolink)
