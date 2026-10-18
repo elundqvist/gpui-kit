@@ -2354,24 +2354,48 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     /// Put each of `edits` in, ranges of the text as it is, apart and the
-    /// last first, with what goes in each, as one step of undo of a change
-    /// apiece, and made as an undo makes its step (`replay`): the problems
-    /// move with each, so one between two stays on its text, and the rest
-    /// that follows the text takes one edit. The caret goes to the end of
-    /// the text, as the replace of the whole text this was put it. A
-    /// replace-all made the text anew in one change, so the underline of
-    /// a problem between two matches went with it, and went again with the
-    /// undo (elundqvist/kvist#370). A single line takes the edits as one
-    /// change of the whole, through its mask and its check.
-    pub(crate) fn replace_steps(
+    /// last first (each ends at or before the start of the one before it
+    /// in the list), with what goes in each, as one step of undo of a
+    /// change apiece, and made as an undo makes its step (`replay`): the
+    /// problems and the folds move with each, so one between two stays on
+    /// its text, and the rest that follows the text takes one edit. A
+    /// replace-all made the text anew in one change, so the underline of a
+    /// problem between two matches went with it, and went again with the
+    /// undo (elundqvist/kvist#370). The selection keeps to its text, as VS
+    /// Code keeps it through a Replace All, and a redo of the step puts it
+    /// there again: an end before an edit stays, one past it moves with
+    /// it, and one within it goes to the end of what went there. It went
+    /// to the end of the text, as the replace of the whole text this was
+    /// put it, and a redo took the view there, to the last line of the
+    /// file (elundqvist/kvist#383). A single line takes the edits as one
+    /// change of the whole, through its mask and its check. As the other
+    /// programmatic edits do, it edits a read-only or a disabled input too;
+    /// the find bar's Replace All asks first (`is_replaceable`), and an
+    /// application that replaces in the text it shows, as a project-wide
+    /// replace does in the file open, makes its changes here so that a
+    /// problem between two of them stays (elundqvist/kvist#383).
+    pub fn replace_steps(
         &mut self,
         edits: &[(Range<usize>, &str)],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if edits.is_empty() || !self.is_editable() {
+        if edits.is_empty() {
             return;
         }
+        debug_assert!(
+            edits.windows(2).all(|w| w[1].0.end <= w[0].0.start),
+            "the edits are apart and the last first: {edits:?}"
+        );
+        self.with_edits_allowed(|this| this.replace_steps_allowed(edits, window, cx));
+    }
+
+    fn replace_steps_allowed(
+        &mut self,
+        edits: &[(Range<usize>, &str)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.is_multi_line() {
             let mut text = self.text.clone();
             for (range, new) in edits {
@@ -2383,10 +2407,22 @@ impl<M: InputModeKind> InputBaseState<M> {
         }
         self.undo_manager.pending_intent.take();
         let before = self.selected_range;
-        let len = edits.iter().fold(self.text.len() as isize, |len, (range, new)| {
-            len + new.len() as isize - range.len() as isize
-        });
-        let after = Selection::new(len as usize, len as usize);
+        // where a place in the text is once the edits are in, the first of
+        // them first
+        let moved = |at: usize| {
+            let mut grown = 0isize;
+            for (range, new) in edits.iter().rev() {
+                if at <= range.start {
+                    break;
+                }
+                if at < range.end {
+                    return (range.start as isize + grown) as usize + new.len();
+                }
+                grown += new.len() as isize - range.len() as isize;
+            }
+            (at as isize + grown).max(0) as usize
+        };
+        let after = Selection::new(moved(before.start), moved(before.end));
         // as undo keeps them: each on the text the ones before it left,
         // which is the text as it is where it begins, as they are the last
         // first
@@ -4417,6 +4453,94 @@ mod tests {
                 assert_eq!(marks(state), said, "its redo");
                 state.undo(&Undo, window, cx);
                 assert_eq!(state.text.to_string(), text);
+            })
+        });
+    }
+
+    /// An application's own changes, a project-wide replace's in the file
+    /// it shows, go in through `replace_steps` as the find bar's do, into
+    /// a read-only editor too, as the other programmatic edits go: a
+    /// problem between two of them stays on its text, and one undo takes
+    /// them all back (elundqvist/kvist#383).
+    #[gpui::test]
+    fn test_an_applications_steps_keep_the_problems_between_them(cx: &mut TestAppContext) {
+        use crate::input::{Diagnostic, Position};
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let text = "old(1);\nlet x: i32 = \"no\";\nold(2); old(3);\n";
+        let marks = |state: &InputBaseState<EditorMode>| -> Vec<String> {
+            state
+                .diagnostics()
+                .unwrap()
+                .iter()
+                .map(|d| state.text.slice(d.range.clone()).to_string())
+                .collect()
+        };
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(text, window, cx);
+                state.set_readonly(true, cx);
+                let set = state.diagnostics_mut().unwrap();
+                set.push(Diagnostic::new(Position::new(1, 13)..Position::new(1, 17), "expected i32"));
+                // the last first: the second line of matches, then the first
+                let third = text.rfind("old").unwrap();
+                let second = text.find("old(2)").unwrap();
+                let edits: Vec<(Range<usize>, &str)> =
+                    vec![(second..third + 3, "new(2); new"), (0..3, "new")];
+                state.replace_steps(&edits, window, cx);
+                assert_eq!(state.text.to_string(), text.replace("old", "new"));
+                assert_eq!(marks(state), ["\"no\""], "the problem between them");
+                state.set_readonly(false, cx);
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.text.to_string(), text, "one step of undo");
+                assert_eq!(marks(state), ["\"no\""], "and after it");
+            })
+        });
+    }
+
+    /// The caret keeps to its text through a replace-all, its undo and its
+    /// redo, the find bar's and an application's: moved by the matches
+    /// before it, and, within one, at the end of what went there. It went
+    /// to the end of the text, and a redo took the view to the last line
+    /// of the file (elundqvist/kvist#383).
+    #[gpui::test]
+    fn test_the_caret_keeps_to_its_text_through_a_replace_all(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let text = "fn main() {\n    let x: i32 = \"no\";\n    if x {\n    }\n}\n";
+        let caret = text.find("\"no\"").unwrap();
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(text, window, cx);
+                state.open_search(true, cx);
+                state.set_search_query("{", true, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_selected_range(caret..caret, cx);
+                assert_eq!(state.replace_all_search_matches("{ ", window, cx), 2);
+                // one `{` before it, a byte longer
+                assert_eq!(state.selected_range(), caret + 1..caret + 1, "the replace");
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.selected_range(), caret..caret, "its undo");
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.selected_range(), caret + 1..caret + 1, "its redo");
+                state.undo(&Undo, window, cx);
+                // a selection from the `x` of `let x` to within `i32`, by
+                // an application's changes, the last first
+                let (x, i32_at) = (text.find("x:").unwrap(), text.find("i32").unwrap());
+                state.set_selected_range(x..i32_at + 1, cx);
+                let edits: Vec<(Range<usize>, &str)> = vec![(i32_at..i32_at + 3, "u64"), (0..2, "pub fn")];
+                state.replace_steps(&edits, window, cx);
+                assert_eq!(state.text.to_string(), text.replacen("fn", "pub fn", 1).replacen("i32", "u64", 1));
+                assert_eq!(state.selected_range(), x + 4..i32_at + 4 + 3, "the end within `i32` at the end of `u64`");
+                state.undo(&Undo, window, cx);
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.selected_range(), x + 4..i32_at + 4 + 3, "and its redo");
             })
         });
     }

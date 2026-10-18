@@ -182,6 +182,20 @@ impl SeekTarget<'_, DiagnosticSummary, DiagnosticSummary> for usize {
     }
 }
 
+/// A count of marks, to slice the set's tree by.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Count(usize);
+
+impl<'a> sum_tree::Dimension<'a, DiagnosticSummary> for Count {
+    fn zero(_: &()) -> Self {
+        Count(0)
+    }
+
+    fn add_summary(&mut self, summary: &'a DiagnosticSummary, _: &()) {
+        self.0 += summary.count;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DiagnosticSet {
     text: Rope,
@@ -221,7 +235,11 @@ impl DiagnosticSet {
     /// (elundqvist/kvist#370); moved by one edit from the first step to
     /// the last, as the highlighter is handed an undo, a mark between two
     /// of them went with the text that edit took. Whoever hands them is
-    /// to hand them again once it knows where the edits left them.
+    /// to hand them again once it knows where the edits left them. The
+    /// marks that end before the first edit are kept as they are, in the
+    /// part of the tree that holds them: every mark was copied and the
+    /// tree built anew, 0.7 ms a key with a thousand marks in a debug
+    /// build (elundqvist/kvist#383).
     pub fn edit_steps(&mut self, steps: &[(Range<usize>, usize)], text: &Rope) {
         let old = std::mem::replace(&mut self.text, text.clone());
         if self.diagnostics.is_empty() || steps.is_empty() {
@@ -275,9 +293,21 @@ impl DiagnosticSet {
                 text.offset_to_position(now)
             }
         };
-        let mut entries: Vec<DiagnosticEntry> = self
+        // the marks before the first edit, which none of it moves: those
+        // that end before it, up to the first that does not
+        let untouched = self
             .diagnostics
             .iter()
+            .take_while(|entry| entry.range.end < first)
+            .count();
+        let mut cursor = self.diagnostics.cursor::<Count>(&());
+        let mut kept = cursor.slice(&Count(untouched), Bias::Right);
+        let rest = std::iter::from_fn(|| {
+            let entry = cursor.item()?;
+            cursor.next();
+            Some(entry)
+        });
+        let mut entries: Vec<DiagnosticEntry> = rest
             .filter_map(|entry| {
                 let (from, to) = if entry.range.is_empty() {
                     // a point stays a point, out of what is typed at it
@@ -298,8 +328,12 @@ impl DiagnosticSet {
                 })
             })
             .collect();
+        drop(cursor);
+        // after those kept, which begin before the first edit, where none
+        // of these is moved to
         entries.sort_by_key(|entry| (entry.range.start, entry.range.end));
-        self.diagnostics = SumTree::from_iter(entries, &());
+        kept.extend(entries, &());
+        self.diagnostics = kept;
     }
 
     pub fn push(&mut self, diagnostic: impl Into<Diagnostic>) {
@@ -519,6 +553,53 @@ mod tests {
         );
         let said: Vec<&str> = moved.iter().map(|e| e.message.as_str()).collect();
         assert_eq!(said, ["mark 0", "mark 2", "mark 3"], "the `x` and the `z` taken whole");
+    }
+
+    /// The marks that end before an edit keep their places, in the tree
+    /// as it was; one that begins before it and ends past it keeps its
+    /// start and moves its end, and those after move: in order, so that
+    /// each is found where it is now (elundqvist/kvist#383).
+    #[test]
+    fn test_marks_before_an_edit_are_kept_as_they_are() {
+        use ropey::Rope;
+
+        use super::{Diagnostic, DiagnosticSet};
+        use crate::input::RopeExt as _;
+
+        // a hundred lines of 8 bytes, a mark on each of the first fifty, and
+        // one from line 10 to line 60
+        let text: String = (0..100).map(|i| format!("line {i:02}\n")).collect();
+        let mut set = DiagnosticSet::new(&Rope::from(text.as_str()));
+        for i in 0..50 {
+            set.push(Diagnostic::new(Position::new(i, 0)..Position::new(i, 4), format!("mark {i}")));
+            if i == 10 {
+                set.push(Diagnostic::new(Position::new(10, 2)..Position::new(60, 2), "long"));
+            }
+        }
+        let before: Vec<_> = set.iter().take(30).map(|e| (e.range.clone(), e.diagnostic.clone())).collect();
+        // three lines put in at the start of line 30
+        let edited = format!("{}a\nb\nc\n{}", &text[..240], &text[240..]);
+        let rope = Rope::from(edited.as_str());
+        set.edit(&(240..240), 6, &rope);
+        let after: Vec<_> = set.iter().map(|e| (e.range.clone(), e.diagnostic.clone())).collect();
+        assert_eq!(after.len(), 51);
+        assert!(after.windows(2).all(|w| (w[0].0.start, w[0].0.end) <= (w[1].0.start, w[1].0.end)), "in order");
+        // the first thirty, the long one among them, as they were but its end
+        for (k, ((range, d), (was_range, was))) in after.iter().zip(&before).enumerate() {
+            if d.message.as_str() == "long" {
+                assert_eq!(range.start, was_range.start);
+                assert_eq!(range.end, was_range.end + 6);
+                assert_eq!(d.range.end, Position::new(63, 2));
+            } else {
+                assert_eq!((range, d), (was_range, was), "mark {k}");
+            }
+        }
+        // and each is found where its text is
+        for e in set.iter() {
+            let found = set.for_offset(e.range.start).map(|f| f.message.clone());
+            assert!(found.is_some(), "{} at {:?}", e.message, e.range);
+            assert_eq!(rope.offset_to_position(e.range.start), e.diagnostic.range.start, "{}", e.message);
+        }
     }
 
     /// The marks moved by the edits of an undo or a replace-all, made one
