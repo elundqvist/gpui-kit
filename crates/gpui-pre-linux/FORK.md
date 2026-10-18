@@ -54,6 +54,13 @@ asks (section 4(b)); each says so at its top:
   has it, where it had the type of an atom interned by the name
   "XA_ATOM" (`xprop` showed `XdndAware(XA_ATOM)`), which a source that
   reads the property by its type would not find.
+- `src/linux/x11/clipboard.rs`: reading the clipboard slept a
+  millisecond each time it found no event, so a selection handed over
+  in pieces (ICCCM's INCR), 4 KB a piece as Tk and others hand them,
+  took a millisecond and more a piece on the drawing thread: 0.16 to
+  0.44 s to paste 1.4 MB from another program (elundqvist/kvist#384).
+  It waits on the connection's socket now (`wait_for_server`), and
+  wakes as the next piece comes.
 - `Cargo.toml`: an `[[example]]` entry for `examples/xdnd_source.rs`,
   which the fork adds (the published manifest names its targets and
   has no examples).

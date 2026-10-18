@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre-linux 0.3.3 as published to crates.io: FORK.md at
+// the crate's root lists the changes.
 /*
  * Copyright 2022 - 2025 Zed Industries, Inc.
  * License: Apache-2.0
@@ -207,6 +209,27 @@ enum ReadSelNotifyResult {
     EventNotRecognized,
 }
 
+/// Waits until the X server has sent something on `conn`, or `until`.
+///
+/// Changed in elundqvist/gpui-kit (elundqvist/kvist#384): the reader slept
+/// a millisecond each time it found no event, so a selection handed over
+/// in pieces (INCR) took a millisecond and more a piece, a piece of 4 KB
+/// as Tk and others hand them: 0.2 to 0.4 s of the drawing thread for a
+/// paste of 1.4 MB from another program. It wakes as the next piece comes.
+fn wait_for_server(conn: &RustConnection, until: Instant) {
+    use std::os::fd::AsRawFd as _;
+    let left = until.saturating_duration_since(Instant::now());
+    let mut fd = libc::pollfd {
+        fd: conn.stream().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `fd` is one valid `pollfd`, for the length of the call.
+    unsafe {
+        libc::poll(&mut fd, 1, left.as_millis().clamp(1, 100) as libc::c_int);
+    }
+}
+
 impl Inner {
     fn new() -> Result<Self> {
         let server = XContext::new()?;
@@ -408,7 +431,7 @@ impl Inner {
             let event = match event {
                 Some(e) => e,
                 None => {
-                    std::thread::sleep(Duration::from_millis(1));
+                    wait_for_server(&reader.conn, timeout_end);
                     continue;
                 }
             };
