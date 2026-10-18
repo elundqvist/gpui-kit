@@ -68,6 +68,37 @@ pub(crate) fn word_range_from_chars(
     start..end
 }
 
+/// What a double-click past the end of a line takes, `end` being where the
+/// line ends, before its line break, and `previous` its characters back
+/// from there: the word the line ends in, or the whitespace, as a
+/// double-click on its last character takes them, and a character that is
+/// neither, a CJK one or an emoji, alone, as there. A line that is empty or
+/// ends in punctuation gives nothing, a caret at its end. Never the line
+/// break: taken, the next key typed joined the line to the next
+/// (elundqvist/kvist#416). VS Code takes the word a click past the end
+/// touches, the whitespace after the last word, or nothing.
+pub(crate) fn word_range_before_line_end(
+    end: usize,
+    previous: impl Iterator<Item = char>,
+) -> Range<usize> {
+    let mut previous = previous.take(129).peekable();
+    let Some(&last) = previous.peek() else {
+        return end..end;
+    };
+    let kind = CharacterKind::from(last);
+    match kind {
+        CharacterKind::Newline => end..end,
+        CharacterKind::Other if last.is_ascii_punctuation() => end..end,
+        CharacterKind::Other => end - last.len_utf8()..end,
+        CharacterKind::Word | CharacterKind::Whitespace => {
+            let start = previous
+                .take_while(|character| CharacterKind::from(*character) == kind)
+                .fold(end, |offset, character| offset - character.len_utf8());
+            start..end
+        }
+    }
+}
+
 pub(crate) fn word_range_at(text: &str, offset: usize) -> Option<Range<usize>> {
     let offset = clip_offset_left(text, offset);
     let character = text[offset..].chars().next()?;

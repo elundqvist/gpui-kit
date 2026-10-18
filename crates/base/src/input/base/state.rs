@@ -6786,14 +6786,16 @@ mod tests {
                 state.delete_to_beginning_of_line(&DeleteToBeginningOfLine, window, cx);
                 assert_eq!(state.value(), "abcd\r\n");
 
-                // a double-click on the line's end takes the pair whole, so Right
-                // steps out of the selection onto the next line, not onto the \n;
-                // a triple-click stops before the \r
+                // a double-click on the line's end takes the line's last word,
+                // never the pair nor half of it (elundqvist/kvist#416); a
+                // triple-click stops before the \r
                 state.set_value("ab\r\ncd\r\n", window, cx);
                 state.select_word(2, window, cx);
-                assert_eq!(state.selected_range, Selection::new(2, 4), "the double-click takes the pair");
+                assert_eq!(state.selected_range, Selection::new(0, 2), "a double-click on the \\r");
+                state.select_word(3, window, cx);
+                assert_eq!(state.selected_range, Selection::new(0, 2), "a double-click on the \\n");
                 state.right(&MoveRight, window, cx);
-                assert_eq!(state.cursor(), 4);
+                assert_eq!(state.cursor(), 2);
                 state.select_line(1, window, cx);
                 assert_eq!(state.selected_range, Selection::new(0, 2), "the triple-click stops before the \\r");
 
