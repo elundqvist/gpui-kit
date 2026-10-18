@@ -4732,6 +4732,59 @@ mod tests {
         assert_eq!((edit.start_byte, edit.old_end_byte, edit.new_end_byte), (at, at, at + 50));
     }
 
+    /// A text made anew, a paste over all of it, its undo and its redo,
+    /// is handed to the highlighter as no edit, to be parsed afresh; an
+    /// edit of part of it, a paste over all but its first byte, as the
+    /// edit it is. Handed as an edit of the whole, the trees were edited
+    /// node by node to be thrown away, 33 ms of a paste of 1.4 MB over as
+    /// much (elundqvist/kvist#384).
+    #[gpui::test]
+    fn test_a_text_made_anew_is_no_edit_to_the_highlighter(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let edits = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let factory_edits = edits.clone();
+        let (text, pasted) = (numbered_lines(0..1_000), numbered_lines(5..2_000));
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_highlighter_factory(
+                    Rc::new(move |_: &str| {
+                        Some(Box::new(Edits(factory_edits.clone()))
+                            as Box<dyn crate::input::InputHighlighter>)
+                    }),
+                    cx,
+                );
+                state.set_value(text.clone(), window, cx);
+            })
+        });
+        cx.run_until_parked();
+        let handed = |edits: &Rc<std::cell::RefCell<Vec<Option<crate::input::InputEdit>>>>| {
+            edits.borrow_mut().drain(..).map(|edit| edit.is_some()).collect::<Vec<_>>()
+        };
+        edits.borrow_mut().clear();
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.select_all(window, cx);
+                state.replace_text_in_range(None, &pasted, window, cx);
+                assert_eq!(state.text.to_string(), pasted);
+                assert_eq!(handed(&edits), [false], "the paste over all");
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.text.to_string(), text);
+                assert_eq!(handed(&edits), [false], "its undo");
+                state.redo(&Redo, window, cx);
+                assert_eq!(handed(&edits), [false], "its redo");
+                state.undo(&Undo, window, cx);
+                assert_eq!(handed(&edits), [false], "its undo again");
+                // all but the first byte, and a key typed
+                let range = state.range_to_utf16(&(1..state.text.len()));
+                state.replace_text_in_range(Some(range), &pasted, window, cx);
+                state.replace_text_in_range(None, "x", window, cx);
+                assert_eq!(handed(&edits), [true, true], "an edit of part of it");
+            })
+        });
+    }
+
     /// A match in a fold opens it when it is gone to, by typing or by
     /// Enter, as VS Code and IntelliJ open the fold the current match is
     /// in. Folded, the bar said 1/1 and the match stayed hidden whatever

@@ -144,7 +144,7 @@ impl InputModeKind for EditorMode {
 
     fn drive_highlighter(
         highlighter: &std::rc::Rc<std::cell::RefCell<Option<Box<dyn super::InputHighlighter>>>>,
-        edit: super::InputEdit,
+        edit: Option<super::InputEdit>,
         text: &ropey::Rope,
         folding: bool,
         window: &mut Window,
@@ -154,7 +154,7 @@ impl InputModeKind for EditorMode {
         let Some(highlighter) = highlighter.as_mut() else {
             return;
         };
-        highlighter.update(Some(edit), text, folding, window, cx);
+        highlighter.update(edit, text, folding, window, cx);
     }
 
     fn register_actions(

@@ -151,10 +151,11 @@ pub trait InputModeKind: sealed::Sealed + Sized + 'static {
     ///
     /// Only a code editor has one. The engine's edit path is generic over the
     /// mode, so it dispatches here, where `Self` is concrete and the highlighter
-    /// can be handed this mode's own context.
+    /// can be handed this mode's own context. `edit` is None for a text made
+    /// anew, which the highlighter parses afresh.
     fn drive_highlighter(
         _highlighter: &Rc<RefCell<Option<Box<dyn InputHighlighter>>>>,
-        _edit: InputEdit,
+        _edit: Option<InputEdit>,
         _text: &Rope,
         _folding: bool,
         _window: &mut Window,

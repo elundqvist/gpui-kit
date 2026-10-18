@@ -203,12 +203,22 @@ impl LayoutMode {
                 }
                 drop(highlighter_ref);
 
-                let edit = replacement_input_edit(
-                    update.old_text,
-                    update.new_text,
-                    update.selected_range,
-                    update.change_text,
-                );
+                // A text made anew, a paste over all of it or the undo of
+                // one, is new to the highlighter too, and parsed afresh:
+                // handed as an edit of all of it, its trees were edited
+                // node by node to be thrown away, 33 ms of a paste of
+                // 1.4 MB over as much (elundqvist/kvist#384).
+                let anew = update.old_text.len() > 0
+                    && update.selected_range.start == 0
+                    && update.selected_range.end >= update.old_text.len();
+                let edit = (!anew).then(|| {
+                    replacement_input_edit(
+                        update.old_text,
+                        update.new_text,
+                        update.selected_range,
+                        update.change_text,
+                    )
+                });
                 M::drive_highlighter(highlighter, edit, update.new_text, *folding, window, cx);
             }
             _ => {}
