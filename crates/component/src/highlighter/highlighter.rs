@@ -508,9 +508,15 @@ fn match_range(
 /// the parse after an edit reuses as it is, one with no front matter, is
 /// parsed again for next to nothing. Other grammars reuse a tree made
 /// from nothing as they reuse any: Rust's first key costs what its second
-/// does. Told by the grammar's own name, whatever the language is
-/// registered as (Kvist's is `kvist-markdown`).
+/// does.
 pub(crate) fn parsed_again_from_itself(grammar: &tree_sitter::Language) -> bool {
+    is_markdown_blocks(grammar)
+}
+
+/// Whether `grammar` is tree-sitter-md's block grammar, told by its own
+/// name, whatever the language is registered as (Kvist's is
+/// `kvist-markdown`).
+fn is_markdown_blocks(grammar: &tree_sitter::Language) -> bool {
     grammar.name() == Some("markdown")
 }
 
@@ -1118,6 +1124,136 @@ impl SyntaxHighlighter {
         }
     }
 
+    /// Whether `edit`, of the text there now to `text`, is one that lies
+    /// in a line of a fenced code block in Markdown, after the line's first
+    /// character, which is not one a fence is made of, and puts in or takes
+    /// out no line break: one that can neither close the fence nor end
+    /// what holds it, a list item or a quote, as only a line's start says
+    /// where a block ends. Such an edit leaves the host's structure as it
+    /// was, and an update with a time limit, a keystroke's, moves the
+    /// host's tree over it and parses again only the fence's layer
+    /// (`parse_layers_around`), the host left to the parse after the pause.
+    /// tree-sitter-md's block grammar parses the whole of a fence again for
+    /// a key typed in it, its every punctuation mark a node: a key in a
+    /// fence of 10 KB took 4.2 ms of the highlighter, 2 of them the host's
+    /// parse, against 1 for a key in a paragraph (elundqvist/kvist#376).
+    /// The fence must have a layer of its content, one range: one with
+    /// none is the host's alone.
+    fn in_a_fence_line(&self, edit: &InputEdit, text: &Rope) -> bool {
+        let (Some(tree), Some(grammar)) = (self.tree.as_ref(), self.parser.language()) else {
+            return false;
+        };
+        // a tree a key's parse that ran out of time left is parsed at the
+        // next key, as far as both edits reach, as before
+        if !is_markdown_blocks(&grammar)
+            || self.stale
+            || self.anew
+            || self.coloured_to.is_some()
+        {
+            return false;
+        }
+        let old = &self.text;
+        let breaks = |text: &Rope, range: Range<usize>| {
+            range.end > text.len() || text.slice(range).bytes().any(|b| b == b'\n' || b == b'\r')
+        };
+        if edit.old_end_byte < edit.start_byte
+            || edit.new_end_byte < edit.start_byte
+            || breaks(old, edit.start_byte..edit.old_end_byte)
+            || breaks(text, edit.start_byte..edit.new_end_byte)
+        {
+            return false;
+        }
+        // the layer of the fence's content, one range: a combined layer's
+        // many are gathered by the host's whole query
+        let injected = self.injection_layers.iter().any(|layer| {
+            matches!(layer.ranges.as_slice(), [r] if r.start_byte < edit.start_byte && edit.old_end_byte <= r.end_byte)
+        });
+        if !injected {
+            return false;
+        }
+        let Some(mut node) = tree
+            .root_node()
+            .descendant_for_byte_range(edit.start_byte, edit.old_end_byte)
+        else {
+            return false;
+        };
+        let content = loop {
+            if node.kind() == "code_fence_content" {
+                break node;
+            }
+            match node.parent() {
+                Some(parent) => node = parent,
+                None => return false,
+            }
+        };
+        if edit.start_byte <= content.start_byte() || content.end_byte() <= edit.old_end_byte {
+            return false;
+        }
+        // the line's own text begins after what continues a list item or a
+        // quote on it, and on the fence's first line where the content does
+        let line_start = old.line_start_offset(old.offset_to_point(edit.start_byte).row);
+        let mut own_start = line_start.max(content.start_byte());
+        let mut cursor = content.walk();
+        if cursor.goto_first_child_for_byte(line_start.saturating_sub(1)).is_some() {
+            loop {
+                let child = cursor.node();
+                if child.start_byte() > edit.start_byte {
+                    break;
+                }
+                if child.kind() == "block_continuation" && child.start_byte() >= line_start {
+                    own_start = own_start.max(child.end_byte());
+                }
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+        if own_start >= edit.start_byte {
+            return false;
+        }
+        old.slice(own_start..edit.start_byte)
+            .chars()
+            .find(|c| !c.is_whitespace())
+            .is_some_and(|c| c != '`' && c != '~')
+    }
+
+    /// Parse again each layer whose text holds all `edit` put in, from its
+    /// tree moved over it, as the whole query would find it again: a key
+    /// typed in a fence's line (`in_a_fence_line`). Returns whether each
+    /// finished in its time.
+    fn parse_layers_around(&mut self, edit: &InputEdit) -> bool {
+        let mut finished = true;
+        let timeout = Some(self.injection_parse_timeout);
+        let text = self.text.clone();
+        for layer in Arc::make_mut(&mut self.injection_layers) {
+            let within = matches!(
+                layer.ranges.as_slice(),
+                [r] if r.start_byte < edit.start_byte && edit.new_end_byte <= r.end_byte
+            );
+            if !within {
+                continue;
+            }
+            layer.catch_up();
+            let (parsed, done) = Self::parse_injection_layer(
+                &layer.language_name,
+                layer.highlight_query.clone(),
+                layer.ranges.clone(),
+                Some(&layer.tree),
+                &text,
+                None,
+                timeout,
+            );
+            finished &= done;
+            if let Some(parsed) = parsed {
+                *layer = InjectionLayer {
+                    match_range: layer.match_range,
+                    ..parsed
+                };
+            }
+        }
+        finished
+    }
+
     /// Returns the language name for this highlighter.
     pub fn language(&self) -> &SharedString {
         &self.language
@@ -1153,6 +1289,9 @@ impl SyntaxHighlighter {
     /// its own: the span keeps its old tree, or has no layer if it had none,
     /// until the background parse, which gives it all the time it needs,
     /// finishes it.
+    /// With a `timeout`, a key typed in a line of a Markdown fence moves the
+    /// host's tree and parses the fence's layer alone, and returns `false`
+    /// for the host's parse after the pause (`in_a_fence_line`).
     /// When `timeout` is `None`, parsing runs to completion and always returns `true`.
     pub fn update(
         &mut self,
@@ -1218,6 +1357,15 @@ impl SyntaxHighlighter {
             new_end_position: Point::new(0, 0),
         });
 
+        // a key typed in a line of a fenced code block, which a parse with
+        // a time limit, a keystroke's, does not give the host's parser
+        // (`in_a_fence_line`)
+        let in_a_fence = timeout.is_some()
+            && kept.is_none()
+            && edited
+            && steps.is_empty()
+            && self.in_a_fence_line(&edit, text);
+
         // The tree of the empty text is made only where there is no tree:
         // made for every call, as `unwrap_or` made it, it was made before
         // anything else, and on a parser a time limit had halted it went on
@@ -1231,6 +1379,18 @@ impl SyntaxHighlighter {
         if kept.is_none() {
             self.edit_injection_layers(&edit);
             self.note_edit(&edit);
+        }
+        if in_a_fence {
+            // the host's tree is moved, not parsed, and left to the parse
+            // after the pause; the fence's layer is parsed again. The tree
+            // moved is what a parse would give, with the fence's nodes
+            // grown or shrunk over the key, but for the punctuation in the
+            // fence, which no query colours: it is not stale
+            self.tree = Some(old_tree);
+            self.text = text.clone();
+            let finished = self.parse_layers_around(&edit);
+            self.layers_whole &= finished;
+            return false;
         }
 
         let mut timed_out = false;
@@ -1795,7 +1955,7 @@ impl SyntaxHighlighter {
                         ranges,
                         old_tree,
                         text,
-                        data,
+                        data.cancel.as_deref(),
                         timeout,
                     );
                     finished &= done;
@@ -1831,7 +1991,7 @@ impl SyntaxHighlighter {
                 ranges,
                 old_tree,
                 text,
-                data,
+                data.cancel.as_deref(),
                 data.parse_timeout,
             );
             finished &= done;
@@ -1859,7 +2019,7 @@ impl SyntaxHighlighter {
         ranges: Vec<tree_sitter::Range>,
         old_tree: Option<&Tree>,
         text: &Rope,
-        data: &InjectionParseData,
+        cancel: Option<&AtomicBool>,
         timeout: Option<Duration>,
     ) -> (Option<InjectionLayer>, bool) {
         let Some(config) = LanguageRegistry::singleton().language(language_name) else {
@@ -1879,10 +2039,7 @@ impl SyntaxHighlighter {
         let mut timed_out = false;
         let mut progress = |_: &tree_sitter::ParseState| -> ControlFlow<()> {
             if timeout.is_some_and(|timeout| parse_start.elapsed() > timeout)
-                || data
-                    .cancel
-                    .as_ref()
-                    .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+                || cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed))
             {
                 timed_out = true;
                 ControlFlow::Break(())
@@ -4008,6 +4165,103 @@ $x = 1;
             .collect()
     }
 
+    /// A key typed in a line of a fence, past the line's first character,
+    /// moves the host's tree and parses the fence's layer alone, the host's
+    /// parse left to the pause: tree-sitter-md parses the whole of a fence
+    /// again for a key in it, every punctuation mark in it a node, and a key
+    /// in a fence of 10 KB took 4.2 ms of the highlighter, 2 of them the
+    /// host's parse, against 1 for a key in a paragraph
+    /// (elundqvist/kvist#376). What it leaves is coloured as a fresh parse
+    /// colours it, in a fence at the top, in a list item and in a quote.
+    /// A key at a line's first character, which may close the fence or
+    /// end what holds it, one in a line that begins as a fence does, a line
+    /// break and a key in a fence of no language are parsed as any other.
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_a_key_in_a_fences_line_parses_the_fence_alone() {
+        let language = markdown_blocks();
+        let body: String = (0..200)
+            .map(|i| format!("fn function_{i}(value: u32) -> u32 {{\n    value * {i}\n}}\n"))
+            .collect();
+        let source = format!(
+            "# Notes\n\nProse before.\n\n```rust\n{body}```\n\n- an item\n\n  ```rust\n  let item = 1;\n  ```\n\n> ```rust\n> let quoted = 2;\n> ```\n\n```\nplain text here\n```\n\n```rust\nlet a = 1;\n``x`\nlet b = 2;\n```\n\nProse after.\n"
+        );
+        let parses = || LAYER_PARSES.with(|parses| parses.get());
+        // (where, how far into it, how much is taken out, what is put in,
+        // and whether the host's tree is moved and the fence alone parsed)
+        let keys: &[(&str, usize, usize, &str, bool)] = &[
+            ("    value * 100", 9, 0, "x", true),
+            ("    value * 100", 10, 1, "", true),
+            ("    value * 100", 10, 0, "`", true),
+            ("  let item = 1;", 6, 0, "x", true),
+            ("> let quoted = 2;", 6, 0, "y", true),
+            // the line's first character, and before it
+            ("    value * 100", 4, 0, "x", false),
+            ("    value * 100", 2, 0, "x", false),
+            // a line break, put in and taken out
+            ("    value * 100", 9, 0, "\n", false),
+            ("    value * 100\n}", 15, 1, "", false),
+            // a fence of no language, which has no layer
+            ("plain text here", 6, 0, "x", false),
+            // a line that begins as a fence does: taken out, the `x` leaves
+            // the line that closes the fence
+            ("``x`", 2, 1, "", false),
+            // the fence's opening line
+            ("```rust\nfn function_0", 5, 0, "x", false),
+        ];
+        for &(find, into, out, put, moved) in keys {
+            let mut highlighter = fresh_highlighter(language, &source);
+            let at = source.find(find).unwrap_or_else(|| panic!("{find:?}")) + into;
+            let (edit, edited) = replace(&source, at..at + out, put);
+            let before = parses();
+            let parsed = highlighter.update(Some(edit), &Rope::from_str(&edited), Some(Duration::MAX));
+            assert_eq!(parsed, !moved, "{put:?} at {find:?}");
+            assert_eq!(highlighter.tree().unwrap().root_node().has_changes(), moved, "{put:?} at {find:?}");
+            if moved {
+                assert_eq!(parses() - before, 1, "{put:?} at {find:?}: the fence's layer alone");
+            }
+            let fresh = fresh_highlighter(language, &edited);
+            assert_eq!(layer_ranges(&highlighter), layer_ranges(&fresh), "{put:?} at {find:?}");
+            assert_eq!(
+                highlight_names(&highlighter, &edited),
+                highlight_names(&fresh, &edited),
+                "{put:?} at {find:?}"
+            );
+        }
+
+        // keys one after another, then the parse after the pause, and a
+        // key in prose that parses the host from the tree they moved
+        let mut highlighter = fresh_highlighter(language, &source);
+        let mut text = source.clone();
+        let at = text.find("    value * 150").unwrap() + "    value".len();
+        for (i, c) in " + 1".chars().enumerate() {
+            let (edit, edited) = replace(&text, at + i..at + i, &c.to_string());
+            text = edited;
+            assert!(!highlighter.update(Some(edit), &Rope::from_str(&text), Some(Duration::MAX)));
+            assert_eq!(highlight_names(&highlighter, &text), highlight_names(&fresh_highlighter(language, &text), &text));
+        }
+        let mut paused = fresh_highlighter(language, &source);
+        paused.update(None, &Rope::from_str(&text), None);
+        assert!(parse_in_background(&mut highlighter));
+        assert!(!highlighter.tree().unwrap().root_node().has_changes());
+        assert_eq!(highlight_names(&highlighter, &text), highlight_names(&paused, &text));
+        let at = text.find("Prose after").unwrap();
+        let (edit, edited) = replace(&text, at..at, "x");
+        assert!(highlighter.update(Some(edit), &Rope::from_str(&edited), Some(Duration::MAX)));
+        assert_eq!(highlight_names(&highlighter, &edited), highlight_names(&fresh_highlighter(language, &edited), &edited));
+        // and without the pause between
+        let mut highlighter = fresh_highlighter(language, &source);
+        let at = source.find("    value * 150").unwrap() + "    value".len();
+        let (edit, mut text) = replace(&source, at..at, "x");
+        assert!(!highlighter.update(Some(edit), &Rope::from_str(&text), Some(Duration::MAX)));
+        let at = text.find("Prose after").unwrap();
+        let (edit, edited) = replace(&text, at..at, "x");
+        text = edited;
+        assert!(highlighter.update(Some(edit), &Rope::from_str(&text), Some(Duration::MAX)));
+        assert!(!highlighter.tree().unwrap().root_node().has_changes());
+        assert_eq!(highlight_names(&highlighter, &text), highlight_names(&fresh_highlighter(language, &text), &text));
+    }
+
     /// An edit moves the trees of the layers it reaches and no others: a
     /// layer after it keeps its tree where it was until the tree is used
     /// for a parse, and its colours are read where its text is now; one
@@ -4251,11 +4505,13 @@ $x = 1;
             highlight_names(&fresh_highlighter(language, &source), &source)
         );
 
-        // an edit in a fence parses that fence again, and it alone
+        // an edit in a fence parses that fence again, and it alone, the
+        // host's tree moved and its parse left to the pause
+        // (`in_a_fence_line`)
         let at = source.find("function_4").unwrap();
         let (edit, source) = replace(&source, at..at, "x");
         let before = parses();
-        assert!(highlighter.update(Some(edit), &Rope::from_str(&source), Some(Duration::MAX)));
+        assert!(!highlighter.update(Some(edit), &Rope::from_str(&source), Some(Duration::MAX)));
         assert_eq!(parses() - before, 1);
         assert_eq!(highlighter.injection_layers.len(), 6);
         assert_eq!(
@@ -4283,10 +4539,13 @@ $x = 1;
         let parses = || LAYER_PARSES.with(|parses| parses.get());
         // (where the halted keystroke types, what, then where the one with
         // time types, what, and how many fences lie between the two, both
-        // included): a number typed between the braces is a number only in
-        // the layer parsed again
+        // included): a number typed in a fence is a number only in the layer
+        // parsed again. The halted key types at the start of a fence's line:
+        // one typed further on in the line does not parse the host
+        // (`in_a_fence_line`)
+        let fence_1 = format!("about function 0.\n\n{prose}```rust\n");
         let orders: [(&str, &str, &str, &str, usize); 2] = [
-            ("fn function_1() {", " 0x7f ", "about function 4", "x", 4),
+            (&fence_1, "0x7f; ", "about function 4", "x", 4),
             ("about function 1", "x", "fn function_4() {", " 0x7f ", 3),
         ];
         for (halted_at, halted, timed_at, timed, fences) in orders {
@@ -4311,7 +4570,7 @@ $x = 1;
             let fresh = fresh_highlighter(language, &edited);
             let names = highlight_names(&highlighter, &edited);
             assert_eq!(names, highlight_names(&fresh, &edited), "after {halted:?} at {halted_at:?}");
-            let number = edited.find(" 0x7f ").unwrap() + 1;
+            let number = edited.find("0x7f").unwrap();
             assert!(
                 names.iter().any(|(range, _)| *range == (number..number + 4)),
                 "the number typed in a fence is not coloured: {names:?}"
@@ -4392,7 +4651,14 @@ $x = 1;
                 let (edit, edited) = replace(&source, at + from..at + to, put);
                 source = edited;
                 highlighter.injection_parse_timeout = Duration::MAX;
-                assert!(highlighter.update(Some(edit), &Rope::from_str(&source), Some(Duration::MAX)));
+                // a key in a fence's line leaves the host's parse to the
+                // pause (`in_a_fence_line`), and finds what a whole query does
+                let in_a_fence = *find == "const second";
+                assert_eq!(
+                    highlighter.update(Some(edit), &Rope::from_str(&source), Some(Duration::MAX)),
+                    !in_a_fence,
+                    "{language}, after {put:?} at {find:?}"
+                );
                 let fresh = fresh_highlighter(language, &source);
                 assert_eq!(layers(&highlighter), layers(&fresh), "{language}, after {put:?} at {find:?}: {source:?}");
                 assert_eq!(
