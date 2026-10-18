@@ -3011,9 +3011,10 @@ impl<M: InputModeKind> InputBaseState<M> {
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.edit_steps(steps, &text)
         }
-        // Adjust folds before updating wrap map: remove overlapping folds and shift others
+        // Adjust folds before updating wrap map: remove those a step's lines
+        // reach and shift others
         self.display_map
-            .adjust_folds_for_edit(old_text, range, new_text);
+            .adjust_folds_for_steps(old_text, &text, range, new_text, steps);
         self.display_map
             .on_text_changed(&self.text, range, &Rope::from(new_text), cx);
 
@@ -4546,6 +4547,71 @@ mod tests {
                 let all = folds_of_each(state);
                 assert_eq!(all.len(), 5);
                 assert!(all.iter().all(|(_, has)| *has), "after the paste: {all:?}");
+            })
+        });
+    }
+
+    /// A replace-all of the find bar, its undo and its redo keep the folds
+    /// no match reaches shut, moved by the lines the matches before them
+    /// put in, and open those a match is in, as an edit there does. Taken
+    /// as one edit from the first match to the last, every fold between
+    /// them opened, at the replace and at its undo (elundqvist/kvist#384).
+    #[gpui::test]
+    fn test_a_replace_all_keeps_the_folds_its_matches_do_not_reach(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        // five functions of nine lines each, a match in k0, k2 and k4
+        let text: String = (0..5)
+            .map(|k| {
+                let body = if k % 2 == 0 { "needle" } else { "x" };
+                format!("fn k{k}(x: i32) -> i32 {{\n    if x > {k} {{\n        {body} + 1\n    }} else {{\n        x - 1\n    }}\n    // k{k}\n    // end\n}}\n")
+            })
+            .collect();
+        let folded = |state: &InputBaseState<EditorMode>| -> Vec<(usize, usize)> {
+            state
+                .display_map
+                .folded_ranges()
+                .iter()
+                .map(|fold| (fold.start_line, fold.end_line))
+                .collect()
+        };
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_highlighter_factory(
+                    Rc::new(|_: &str| Some(Box::new(Blocks) as Box<dyn crate::input::InputHighlighter>)),
+                    cx,
+                );
+                state.set_value(text.clone(), window, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                for line in [0, 9, 27, 36] {
+                    state.display_map.set_folded(line, true);
+                }
+                assert_eq!(folded(state), [(0, 8), (9, 17), (27, 35), (36, 44)]);
+                state.open_search(true, cx);
+                state.set_search_query("needle", true, cx);
+            })
+        });
+        cx.run_until_parked();
+        // each match a line longer
+        let (k1, k3) = ((10, 18), (29, 37));
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                assert_eq!(state.replace_all_search_matches("pin\n        // more", window, cx), 3);
+                assert_eq!(state.text.to_string(), text.replace("needle", "pin\n        // more"));
+                assert_eq!(folded(state), [k1, k3], "the replace");
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.text.to_string(), text, "one step of undo");
+                assert_eq!(folded(state), [(9, 17), (27, 35)], "its undo");
+                state.redo(&Redo, window, cx);
+                assert_eq!(folded(state), [k1, k3], "its redo");
+                // and every fold has its chevron where its function is
+                let candidates: Vec<usize> = Blocks::all(&state.text).into_iter().map(|(_, fold)| fold.start_line).collect();
+                assert!(candidates.iter().all(|&line| state.display_map.is_fold_candidate(line)), "{candidates:?}");
             })
         });
     }

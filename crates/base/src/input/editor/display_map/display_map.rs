@@ -211,6 +211,52 @@ impl DisplayMap {
             .adjust_folds_for_edit(edit_start_line, edit_end_line, line_delta);
     }
 
+    /// Adjust folds and candidates for edits made one after another, as a
+    /// replace-all and its undo make them: `steps`, each a range of the
+    /// text as the ones before it left it and how many bytes went there,
+    /// turned `old_text` into `new_text`, and `range` of `old_text` is the
+    /// one edit that covers them, `inserted` what is there now. A fold is
+    /// taken only where a step reaches its lines, and the rest move by the
+    /// lines the steps before them put in or took. Taken over the one edit,
+    /// Replace All opened every fold between its first match and its last,
+    /// and its undo did again (elundqvist/kvist#384). Steps in another
+    /// order, that overlap (`apart`), are taken as the one edit.
+    pub(crate) fn adjust_folds_for_steps(
+        &mut self,
+        old_text: &Rope,
+        new_text: &Rope,
+        range: &Range<usize>,
+        inserted: &str,
+        steps: &[(Range<usize>, usize)],
+    ) {
+        if self.fold_map.folded_ranges().is_empty() && self.fold_map.fold_candidates().is_empty() {
+            return;
+        }
+        let edits = (steps.len() > 1)
+            .then(|| crate::input::diagnostics::apart(steps))
+            .flatten();
+        let Some(edits) = edits else {
+            return self.adjust_folds_for_edit(old_text, range, inserted);
+        };
+        // each edit's lines in the old text, and those of what it put in,
+        // where that is in the new text: past what the edits before it grew
+        // the text by
+        let mut grown = 0isize;
+        let lines: Vec<(usize, usize, isize)> = edits
+            .iter()
+            .map(|(range, len)| {
+                let start = old_text.offset_to_point(range.start.min(old_text.len())).row;
+                let end = old_text.offset_to_point(range.end.min(old_text.len())).row;
+                let at = ((range.start as isize + grown).max(0) as usize).min(new_text.len());
+                grown += *len as isize - range.len() as isize;
+                let put = new_text.offset_to_point((at + len).min(new_text.len())).row
+                    - new_text.offset_to_point(at).row;
+                (start, end, put as isize - (end - start) as isize)
+            })
+            .collect();
+        self.fold_map.adjust_folds_for_edits(&lines);
+    }
+
     /// Incrementally update fold candidates after a text edit.
     ///
     /// Extracts new fold candidates only within the edited byte range
@@ -397,5 +443,124 @@ impl DisplayMap {
     #[inline]
     pub fn buffer_line_count(&self) -> usize {
         self.wrap_map.buffer_line_count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ops::Range;
+
+    use gpui::px;
+    use ropey::Rope;
+
+    use super::DisplayMap;
+    use crate::input::RopeExt as _;
+    use crate::input::display_map::FoldRange;
+
+    /// `text` after `steps`, made one after another, each a range of the
+    /// text the ones before it left and what goes there; with the one
+    /// edit that covers them, as the editor hands it on, and the steps as
+    /// the editor hands them to what follows the text.
+    fn made(
+        text: &Rope,
+        steps: &[(Range<usize>, String)],
+    ) -> (Rope, Range<usize>, String, Vec<(Range<usize>, usize)>) {
+        let mut after = text.clone();
+        let (mut head, mut tail) = (usize::MAX, usize::MAX);
+        for (range, new) in steps {
+            head = head.min(range.start);
+            tail = tail.min(after.len() - range.end);
+            after.replace(range.clone(), new);
+        }
+        let inserted = after.slice(head..after.len() - tail).to_string();
+        let lens = steps.iter().map(|(range, new)| (range.clone(), new.len())).collect();
+        (after, head..text.len() - tail, inserted, lens)
+    }
+
+    /// Folds and candidates as lines, to compare.
+    fn lines(map: &DisplayMap) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+        let lines = |ranges: &[FoldRange]| {
+            ranges.iter().map(|f| (f.start_line, f.end_line)).collect::<Vec<_>>()
+        };
+        (lines(map.fold_map.folded_ranges()), lines(map.fold_map.fold_candidates()))
+    }
+
+    /// `map` after each of `steps` of `text` taken as an edit of its own.
+    fn one_by_one(map: &mut DisplayMap, text: &Rope, steps: &[(Range<usize>, String)]) {
+        let mut now = text.clone();
+        for (range, new) in steps {
+            map.adjust_folds_for_edit(&now, range, new);
+            now.replace(range.clone(), new);
+        }
+    }
+
+    /// Edits apart, the last first as a replace-all makes them and the
+    /// first first as its undo does, take and move the folds as each made
+    /// as an edit of its own does: a fold an edit's lines reach goes, and
+    /// the rest move by the lines the edits before them put in or took.
+    /// Edits that overlap are taken as the one edit over them all.
+    #[test]
+    fn test_folds_follow_steps_as_each_step_alone() {
+        // sixty lines, a fold of three lines every four from line 1
+        let text = Rope::from((0..60).map(|i| format!("line {i}\n")).collect::<String>());
+        let folds: Vec<FoldRange> = (0..14).map(|k| FoldRange::new(1 + 4 * k, 3 + 4 * k)).collect();
+        let fresh = || {
+            let mut map = DisplayMap::new(gpui::font("Courier"), px(14.), None);
+            map.fold_map.set_candidates(folds.clone());
+            for fold in &folds {
+                map.fold_map.set_folded(fold.start_line, true);
+            }
+            map
+        };
+        let at = |line: usize, column: usize| text.line_start_offset(line) + column;
+        // a word on line 0 joined to line 1, lines 5 and 6 taken, two
+        // lines put in at 12, the end of 24 joined to 25, two lines put in
+        // on 40, two words on 50: the last first
+        let steps: Vec<(Range<usize>, String)> = [
+            (at(50, 4)..at(50, 6), "y"),
+            (at(50, 0)..at(50, 2), "x"),
+            (at(40, 2)..at(40, 4), "a\nb\nc"),
+            (at(24, 7)..at(25, 0), " "),
+            (at(12, 0)..at(12, 0), "x\ny\n"),
+            (at(5, 0)..at(7, 0), ""),
+            (at(0, 4)..at(1, 2), "-"),
+        ]
+        .into_iter()
+        .map(|(range, new)| (range, new.to_string()))
+        .collect();
+        let (after, covering, inserted, lens) = made(&text, &steps);
+        let mut each = fresh();
+        one_by_one(&mut each, &text, &steps);
+        let mut together = fresh();
+        together.adjust_folds_for_steps(&text, &after, &covering, &inserted, &lens);
+        assert_eq!(lines(&together), lines(&each), "the last first");
+        // the folds on lines 1, 5, 25 and 49 are taken, the rest moved
+        let kept = [(6, 8), (12, 14), (16, 18), (20, 22), (27, 29), (31, 33), (35, 37), (41, 43), (45, 47), (53, 55)];
+        assert_eq!(lines(&together).0, kept);
+
+        // their undo: each the other way, the first first, on the text the
+        // ones before it left
+        let mut now = text.clone();
+        let mut undo = Vec::new();
+        for (range, new) in &steps {
+            undo.push((range.start..range.start + new.len(), now.slice(range.clone()).to_string()));
+            now.replace(range.clone(), new);
+        }
+        undo.reverse();
+        let (back, covering, inserted, lens) = made(&after, &undo);
+        assert_eq!(back.to_string(), text.to_string());
+        one_by_one(&mut each, &after, &undo);
+        together.adjust_folds_for_steps(&after, &back, &covering, &inserted, &lens);
+        assert_eq!(lines(&together), lines(&each), "the first first");
+
+        // overlapping: taken as the one edit over them
+        let tangled: Vec<(Range<usize>, String)> =
+            vec![(at(20, 0)..at(20, 2), "ab\n".into()), (at(20, 1)..at(20, 3), "".into())];
+        let (after, covering, inserted, lens) = made(&text, &tangled);
+        let mut one = fresh();
+        one.adjust_folds_for_edit(&text, &covering, &inserted);
+        let mut together = fresh();
+        together.adjust_folds_for_steps(&text, &after, &covering, &inserted, &lens);
+        assert_eq!(lines(&together), lines(&one), "tangled");
     }
 }

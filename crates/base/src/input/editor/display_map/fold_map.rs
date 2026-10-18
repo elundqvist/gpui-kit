@@ -240,6 +240,46 @@ impl FoldMap {
         self.needs_rebuild = true;
     }
 
+    /// Adjust folds and candidates after edits of the text, `edits`, each
+    /// the first and last line it reached in the text before them all and
+    /// how many lines it put in or took, in order and apart (one may end on
+    /// the line the next begins on), as `adjust_folds_for_edit` adjusts
+    /// them for one: those whose lines an edit reaches are removed, and
+    /// the rest move by the lines the edits before them put in or took.
+    /// Each fold is looked up among the edits, so a replace of thousands
+    /// of matches in a file of thousands of folds is not their product.
+    pub(super) fn adjust_folds_for_edits(&mut self, edits: &[(usize, usize, isize)]) {
+        if edits.is_empty() {
+            return;
+        }
+        let mut grown = Vec::with_capacity(edits.len() + 1);
+        grown.push(0isize);
+        for (_, _, delta) in edits {
+            grown.push(grown[grown.len() - 1] + delta);
+        }
+        let adjust = |ranges: &mut Vec<FoldRange>| {
+            ranges.retain_mut(|fold| {
+                // the edits before it end on a line before it begins
+                let k = edits.partition_point(|&(_, end, _)| end < fold.start_line);
+                if edits
+                    .get(k)
+                    .is_some_and(|&(start, _, _)| start <= fold.end_line)
+                {
+                    return false;
+                }
+                let delta = grown[k];
+                if delta != 0 {
+                    fold.start_line = (fold.start_line as isize + delta).max(0) as usize;
+                    fold.end_line = (fold.end_line as isize + delta).max(0) as usize;
+                }
+                true
+            });
+        };
+        adjust(&mut self.folded);
+        adjust(&mut self.candidates);
+        self.needs_rebuild = true;
+    }
+
     /// Rebuild the fold mapping after wrap_map or fold state changes
     ///
     /// This is the core algorithm that projects wrap rows to display rows.
