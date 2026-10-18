@@ -54,6 +54,28 @@ asks (section 4(b)); each says so at its top:
   has it, where it had the type of an atom interned by the name
   "XA_ATOM" (`xprop` showed `XdndAware(XA_ATOM)`), which a source that
   reads the property by its type would not find.
+
+  A drop is finished once its data has come (elundqvist/kvist#380): the
+  client answered every drop `XdndFinished` at once and told gpui it
+  was dropped, so data that came after the drop, from a source slow to
+  answer, was no drag's and gpui had nothing to drop. A drop before
+  the data now waits for it (`XdndDropped::Waiting`), and the source is
+  told the drop is done, and gpui handed the files and told of the
+  drop, once it has come (`XdndCame`); a drop whose data the source
+  would not give, that could not be read, or that names no file gpui
+  can open, is finished not accepted and gpui told the drag has gone,
+  where it was accepted and dropped with nothing, and the drag is
+  refused at its positions from then on. A drop still waiting for its
+  data when another drag enters in its place is finished not accepted.
+  And data too large for one property, which the source
+  hands over in pieces (ICCCM's INCR), is gathered piece by piece from
+  the property's new values until the empty one (`XdndDrags::piece`),
+  where the answer was read as the data, its size in four bytes, which
+  named no file. Tests of the drop before and after the data, of the
+  pieces, of data that names no file, of a drop another drag takes the
+  place of, and of a drop refused.
+- `src/linux/x11/window.rs`: the atoms have `INCR`, which the client
+  reads a drag's data in pieces by.
 - `src/linux/x11/clipboard.rs`: reading the clipboard slept a
   millisecond each time it found no event, so a selection handed over
   in pieces (ICCCM's INCR), 4 KB a piece as Tk and others hand them,
@@ -82,7 +104,14 @@ The first should print `status: not accepted` and the application log
 nothing about it; the second `status: accepted`, `selection asked for
 in text/uri-list: answered` and `finished: accepted`. `--no-enter`
 sends the `XdndPosition` with no `XdndEnter` before it, and
-`--type-list` offers the types in `XdndTypeList`.
+`--type-list` offers the types in `XdndTypeList`. `--late` answers
+the request for the data only after the drop, and `--incr <bytes>`
+hands the data over in pieces of that many bytes:
+
+    DISPLAY=:99 cargo run --locked --example xdnd_source -- <window id> \
+        text/uri-list --data file:///tmp/x.txt --drop --late --incr 8
+
+should print `finished: accepted`, the window having taken the file.
 
 ## Tests
 

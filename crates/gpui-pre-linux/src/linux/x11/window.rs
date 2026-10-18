@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre-linux 0.3.3 as published to crates.io: FORK.md at
+// the crate's root lists the changes.
 use anyhow::{Context as _, anyhow};
 use x11rb::connection::RequestConnection;
 
@@ -54,6 +56,7 @@ x11rb::atom_manager! {
         TEXT_PLAIN_UTF8: b"text/plain;charset=utf-8",
         TEXT_PLAIN: b"text/plain",
         XDND_DATA,
+        INCR,
         WM_PROTOCOLS,
         WM_DELETE_WINDOW,
         WM_CHANGE_STATE,

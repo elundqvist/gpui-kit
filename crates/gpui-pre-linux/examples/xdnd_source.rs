@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! cargo run --example xdnd_source -- <window id> <type>... [--data <text>]
-//!     [--drop] [--no-enter] [--type-list]
+//!     [--drop] [--no-enter] [--type-list] [--late] [--incr <bytes>]
 //! ```
 //!
 //! - `--data <text>`: what a request for the drag's data in one of its
@@ -18,6 +18,11 @@
 //! - `--no-enter`: send the `XdndPosition` with no `XdndEnter` before it.
 //! - `--type-list`: offer the types in `XdndTypeList` rather than in the
 //!   `XdndEnter` message, as a source with more than three must.
+//! - `--late`: answer the request for the drag's data only once the drop
+//!   is sent, as a slow source does.
+//! - `--incr <bytes>`: hand the data over in pieces of that many bytes,
+//!   by ICCCM's INCR, as a source does with more than fits one property.
+//!   (Added for elundqvist/kvist#380.)
 //!
 //! It prints one line for each thing that happens, among them `status:
 //! accepted` or `status: not accepted`, and exits 0 once it has left or
@@ -29,8 +34,9 @@ use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::protocol::xproto::{
-    AtomEnum, ClientMessageEvent, ConnectionExt as _, CreateWindowAux, EventMask, PropMode,
-    SELECTION_NOTIFY_EVENT, SelectionNotifyEvent, SelectionRequestEvent, Window, WindowClass,
+    AtomEnum, ChangeWindowAttributesAux, ClientMessageEvent, ConnectionExt as _, CreateWindowAux,
+    EventMask, Property, PropMode, SELECTION_NOTIFY_EVENT, SelectionNotifyEvent,
+    SelectionRequestEvent, Window, WindowClass,
 };
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{COPY_DEPTH_FROM_PARENT, CURRENT_TIME, NONE};
@@ -46,11 +52,25 @@ struct Atoms {
     selection: u32,
     type_list: u32,
     action_copy: u32,
+    incr: u32,
+}
+
+/// How the drag's data is handed over: whole or in pieces, and when.
+struct Giving<'a> {
+    data: Option<&'a str>,
+    /// Pieces of this many bytes, by INCR.
+    incr: Option<usize>,
+    /// Requests held back until the drop is sent.
+    late: bool,
+    held: Vec<SelectionRequestEvent>,
+    /// A transfer in pieces under way: the requestor, its property, the
+    /// type, and how much of the data has gone.
+    pieces: Option<(Window, u32, u32, usize)>,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: xdnd_source <window id> <type>... [--data <text>] [--drop] [--no-enter] [--type-list]";
+    let usage = "usage: xdnd_source <window id> <type>... [--data <text>] [--drop] [--no-enter] [--type-list] [--late] [--incr <bytes>]";
     let target = args.next().ok_or(usage)?;
     let target: Window = match target.strip_prefix("0x") {
         Some(hex) => u32::from_str_radix(hex, 16)?,
@@ -58,12 +78,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     let (mut type_names, mut data, mut drops, mut no_enter, mut type_list) =
         (Vec::new(), None, false, false, false);
+    let (mut late, mut incr) = (false, None);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--data" => data = Some(args.next().ok_or(usage)?),
             "--drop" => drops = true,
             "--no-enter" => no_enter = true,
             "--type-list" => type_list = true,
+            "--late" => late = true,
+            "--incr" => incr = Some(args.next().ok_or(usage)?.parse::<usize>()?.max(1)),
             _ => type_names.push(arg),
         }
     }
@@ -87,6 +110,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         selection: intern("XdndSelection")?,
         type_list: intern("XdndTypeList")?,
         action_copy: intern("XdndActionCopy")?,
+        incr: intern("INCR")?,
     };
     let types: Vec<u32> = type_names
         .iter()
@@ -168,7 +192,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     println!("sent XdndPosition at {}, {}", at.dst_x, at.dst_y);
 
-    let accepted = match wait(&conn, &atoms, source, &types, data.as_deref(), atoms.status)? {
+    let mut giving = Giving {
+        data: data.as_deref(),
+        incr,
+        late,
+        held: Vec::new(),
+        pieces: None,
+    };
+    let accepted = match wait(&conn, &atoms, source, &types, &mut giving, atoms.status)? {
         Some(status) => {
             let accepted = status.data.as_data32()[1] & 1 == 1;
             println!(
@@ -193,14 +224,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 " to a window that refused the drag"
             }
         );
-        match wait(
-            &conn,
-            &atoms,
-            source,
-            &types,
-            data.as_deref(),
-            atoms.finished,
-        )? {
+        // what was held back is answered now, after the drop
+        giving.late = false;
+        for request in std::mem::take(&mut giving.held) {
+            answer(&conn, &atoms, source, &types, &mut giving, &request)?;
+        }
+        match wait(&conn, &atoms, source, &types, &mut giving, atoms.finished)? {
             Some(finished) => {
                 let done = finished.data.as_data32()[1] & 1 == 1;
                 println!(
@@ -214,20 +243,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         send(atoms.leave, [source, 0, 0, 0, 0])?;
         println!("sent XdndLeave");
         // answer what is still on its way, then go
-        wait(&conn, &atoms, source, &types, data.as_deref(), NONE)?;
+        giving.late = false;
+        wait(&conn, &atoms, source, &types, &mut giving, NONE)?;
     }
     Ok(())
 }
 
 /// Waits up to two seconds for a client message of type `wanted`,
-/// answering requests for the drag's data meanwhile; with `wanted` NONE
-/// it only answers them for half a second.
+/// answering requests for the drag's data meanwhile, or holding them back
+/// while `giving.late`, and handing over the next piece of a transfer in
+/// pieces as each is taken; with `wanted` NONE it only answers them for
+/// half a second.
 fn wait(
     conn: &impl Connection,
     atoms: &Atoms,
     source: Window,
     types: &[u32],
-    data: Option<&str>,
+    giving: &mut Giving,
     wanted: u32,
 ) -> Result<Option<ClientMessageEvent>, Box<dyn Error>> {
     let limit = if wanted == NONE { 500 } else { 2000 };
@@ -242,7 +274,34 @@ fn wait(
                 return Ok(Some(message));
             }
             Event::SelectionRequest(request) if request.selection == atoms.selection => {
-                answer(conn, source, types, data, &request)?;
+                if giving.late {
+                    println!("selection asked for: held back until the drop");
+                    giving.held.push(request);
+                } else {
+                    answer(conn, atoms, source, types, giving, &request)?;
+                }
+            }
+            // the requestor took the last piece: the next goes, the empty
+            // one last
+            Event::PropertyNotify(notify) if notify.state == Property::DELETE => {
+                let Some((requestor, property, target, sent)) = giving.pieces else {
+                    continue;
+                };
+                if notify.window != requestor || notify.atom != property {
+                    continue;
+                }
+                let data = giving.data.unwrap_or_default().as_bytes();
+                let size = giving.incr.unwrap_or(data.len());
+                let piece = &data[sent..(sent + size).min(data.len())];
+                conn.change_property8(PropMode::REPLACE, requestor, property, target, piece)?;
+                conn.flush()?;
+                if piece.is_empty() {
+                    println!("pieces: all handed over");
+                    giving.pieces = None;
+                } else {
+                    println!("pieces: {} bytes handed over", sent + piece.len());
+                    giving.pieces = Some((requestor, property, target, sent + piece.len()));
+                }
             }
             _ => {}
         }
@@ -252,9 +311,10 @@ fn wait(
 
 fn answer(
     conn: &impl Connection,
+    atoms: &Atoms,
     source: Window,
     types: &[u32],
-    data: Option<&str>,
+    giving: &mut Giving,
     request: &SelectionRequestEvent,
 ) -> Result<(), Box<dyn Error>> {
     let name = if request.target == NONE {
@@ -262,16 +322,37 @@ fn answer(
     } else {
         String::from_utf8_lossy(&conn.get_atom_name(request.target)?.reply()?.name).into_owned()
     };
-    let property = match data {
+    let property = match giving.data {
         Some(data) if request.owner == source && types.contains(&request.target) => {
-            conn.change_property8(
-                PropMode::REPLACE,
-                request.requestor,
-                request.property,
-                request.target,
-                data.as_bytes(),
-            )?;
-            println!("selection asked for in {name}: answered");
+            match giving.incr {
+                // in pieces: INCR with the size, and each piece once the
+                // requestor deletes the property
+                Some(_) => {
+                    conn.change_window_attributes(
+                        request.requestor,
+                        &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+                    )?;
+                    conn.change_property32(
+                        PropMode::REPLACE,
+                        request.requestor,
+                        request.property,
+                        atoms.incr,
+                        &[data.len() as u32],
+                    )?;
+                    giving.pieces = Some((request.requestor, request.property, request.target, 0));
+                    println!("selection asked for in {name}: answered in pieces");
+                }
+                None => {
+                    conn.change_property8(
+                        PropMode::REPLACE,
+                        request.requestor,
+                        request.property,
+                        request.target,
+                        data.as_bytes(),
+                    )?;
+                    println!("selection asked for in {name}: answered");
+                }
+            }
             request.property
         }
         _ => {

@@ -156,7 +156,57 @@ pub struct Xdnd {
     asked: Option<u32>,
     /// Whether the answer came, with the data or without.
     retrieved: bool,
+    /// Where the drag's data is.
+    data: XdndData,
+    /// Whether the drag was dropped before its data came: the drop is
+    /// finished, and gpui told of it, once the data has come or failed.
+    dropped: bool,
     position: Point<Pixels>,
+}
+
+/// Where an XDND drag's data is, once asked for.
+#[derive(Debug, Default, PartialEq)]
+enum XdndData {
+    /// Not come yet, or not asked for.
+    #[default]
+    Awaited,
+    /// Coming in pieces, as the source hands over a large selection by
+    /// ICCCM's INCR: these so far.
+    Incoming(Vec<u8>),
+    /// Come whole, and gpui handed the files it names.
+    Delivered,
+    /// The source would not give it, it could not be read, or it named no
+    /// file gpui can open.
+    Failed,
+}
+
+/// A drag's data has come whole, or will not: gpui is handed its files,
+/// and when the drag was dropped meanwhile, the source, `finish`, is told
+/// the drop is done and gpui that it was dropped.
+#[derive(Debug, PartialEq)]
+struct XdndCame {
+    position: Point<Pixels>,
+    /// The data, or None when it will not come or names no file.
+    data: Option<Vec<u8>>,
+    /// The source to tell, when the drag was dropped before its data came.
+    finish: Option<xproto::Window>,
+}
+
+/// What the client does at an `XdndDrop`.
+#[derive(Debug, PartialEq)]
+enum XdndDropped {
+    /// A drag gpui did not take: the source is told the drop is refused,
+    /// and gpui hears nothing.
+    Refused,
+    /// The drag's data has come, or failed: the source is told the drop is
+    /// done, accepted when gpui was handed the files, and gpui that it was
+    /// dropped, or that the drag has gone when it has nothing.
+    Done { position: Point<Pixels>, delivered: bool },
+    /// The drag's data is still on its way: the drop is finished once it
+    /// has come (`XdndCame`), as XDND has the target finish a drop once it
+    /// has the data. Finished at once, data that came after the drop was
+    /// never handed to gpui (elundqvist/kvist#380).
+    Waiting,
 }
 
 /// The XDND drags over the client's windows, one per window.
@@ -240,6 +290,11 @@ impl XdndDrags {
         let Some(drag) = self.accepted(window, source) else {
             return XdndReply::Refuse;
         };
+        // the source would not give its data, or it named no file: the
+        // drop is refused from here on, as it is finished refused
+        if drag.data == XdndData::Failed {
+            return XdndReply::Refuse;
+        }
         if let Some(position) = pointer() {
             drag.position = position;
         }
@@ -264,6 +319,107 @@ impl XdndDrags {
         })?;
         drag.retrieved = true;
         Some(drag.position)
+    }
+
+    /// The answer to the drag over `window` said its data comes in pieces
+    /// (INCR): they are gathered from here on (`piece`).
+    fn begin_pieces(&mut self, window: xproto::Window) {
+        if let Some(drag) = self.0.get_mut(&window).filter(|drag| drag.retrieved) {
+            if drag.data == XdndData::Awaited {
+                drag.data = XdndData::Incoming(Vec::new());
+            }
+        }
+    }
+
+    /// Whether the data of the drag over `window` is coming in pieces, so
+    /// that a new value of the property it comes in is the next piece.
+    fn takes_pieces(&self, window: xproto::Window) -> bool {
+        self.0
+            .get(&window)
+            .is_some_and(|drag| matches!(drag.data, XdndData::Incoming(_)))
+    }
+
+    /// A piece of the data of the drag over `window`, which comes in
+    /// pieces; the empty one ends it, and the data has come whole, or
+    /// failed when a piece could not be read (`None`).
+    fn piece(&mut self, window: xproto::Window, piece: Option<&[u8]>) -> Option<XdndCame> {
+        let drag = self.0.get_mut(&window)?;
+        let XdndData::Incoming(data) = &mut drag.data else {
+            return None;
+        };
+        match piece {
+            Some([]) => {
+                let data = std::mem::take(data);
+                self.came(window, Some(data))
+            }
+            Some(piece) => {
+                data.extend_from_slice(piece);
+                None
+            }
+            None => self.came(window, None),
+        }
+    }
+
+    /// The data of the drag over `window` has come whole, or will not
+    /// (`None`): handed to gpui, and the drop finished when the drag was
+    /// dropped before it came, which ends the drag. Data that names no
+    /// file gpui can open, not text or no `file:` URI, is none: the drop
+    /// is refused, and gpui told the drag has gone, where it was accepted
+    /// and gpui told of a drop of nothing. None for a drag whose data has
+    /// come already.
+    fn came(&mut self, window: xproto::Window, data: Option<Vec<u8>>) -> Option<XdndCame> {
+        let drag = self.0.get_mut(&window).filter(|drag| {
+            drag.retrieved && matches!(drag.data, XdndData::Awaited | XdndData::Incoming(_))
+        })?;
+        let data = data.filter(|data| str::from_utf8(data).is_ok_and(|list| !xdnd_paths(list).is_empty()));
+        drag.data = if data.is_some() {
+            XdndData::Delivered
+        } else {
+            XdndData::Failed
+        };
+        let came = XdndCame {
+            position: drag.position,
+            data,
+            finish: drag.dropped.then_some(drag.other_window),
+        };
+        if came.finish.is_some() {
+            self.0.remove(&window);
+        }
+        Some(came)
+    }
+
+    /// An `XdndDrop` from `source` over `window`: done with when its data
+    /// has come or failed, and then the drag ends; else the drop waits for
+    /// the data. A drop of a drag gpui did not take, or from another
+    /// source, is refused, and the drag gpui did not take ends.
+    fn drop(&mut self, window: xproto::Window, source: xproto::Window) -> XdndDropped {
+        let Some(drag) = self.accepted(window, source) else {
+            self.end(window, source);
+            return XdndDropped::Refused;
+        };
+        let position = drag.position;
+        match drag.data {
+            XdndData::Delivered | XdndData::Failed => {
+                let delivered = drag.data == XdndData::Delivered;
+                self.0.remove(&window);
+                XdndDropped::Done {
+                    position,
+                    delivered,
+                }
+            }
+            // asked for at the first position, which comes before a drop
+            XdndData::Awaited if drag.asked.is_none() => {
+                self.0.remove(&window);
+                XdndDropped::Done {
+                    position,
+                    delivered: false,
+                }
+            }
+            XdndData::Awaited | XdndData::Incoming(_) => {
+                drag.dropped = true;
+                XdndDropped::Waiting
+            }
+        }
     }
 
     /// An `XdndLeave` or `XdndDrop` from `source` over `window`: ends the
@@ -951,6 +1107,42 @@ impl X11Client {
             .map(|window_reference| window_reference.window.clone())
     }
 
+    /// A drag's data over `x_window` has come whole, or will not: gpui is
+    /// handed the files it names, and when the drag was dropped before it
+    /// came, the source is told the drop is done, accepted when the data
+    /// came, and gpui that it was dropped, or that the drag has gone.
+    fn xdnd_came(
+        &self,
+        state: std::cell::RefMut<X11ClientState>,
+        window: &X11WindowStatePtr,
+        x_window: xproto::Window,
+        came: XdndCame,
+    ) {
+        if let Some(source) = came.finish {
+            xdnd_send_finished(
+                &state.xcb_connection,
+                &state.atoms,
+                x_window,
+                source,
+                came.data.is_some(),
+            );
+        }
+        drop(state);
+        let delivered = came.data.is_some();
+        if let Some(data) = came.data {
+            // a list of files is text, which is all gpui takes
+            if let Ok(file_list) = str::from_utf8(&data) {
+                window.handle_input(PlatformInput::FileDrop(FileDropEvent::Entered {
+                    position: came.position,
+                    paths: gpui::ExternalPaths(xdnd_paths(file_list)),
+                }));
+            }
+        }
+        if came.finish.is_some() {
+            window.handle_input(xdnd_dropped(came.position, delivered));
+        }
+    }
+
     fn handle_event(&self, event: Event) -> Option<()> {
         match event {
             Event::UnmapNotify(event) => {
@@ -1020,6 +1212,18 @@ impl X11Client {
                     let Some(gone) = state.xdnd_drags.enter(event.window, atom, drag_type) else {
                         return Some(());
                     };
+                    // and one dropped and waiting for its data is finished,
+                    // refused, as its data now would be taken for the new
+                    // drag's
+                    if gone.dropped {
+                        xdnd_send_finished(
+                            &state.xcb_connection,
+                            &state.atoms,
+                            event.window,
+                            gone.other_window,
+                            false,
+                        );
+                    }
                     drop(state);
                     window.handle_input(PlatformInput::FileDrop(FileDropEvent::Pending {
                         position: gone.position,
@@ -1096,23 +1300,35 @@ impl X11Client {
                         }));
                     }
                 } else if event.type_ == state.atoms.XdndDrop {
-                    let drag = state.xdnd_drags.end(event.window, atom);
-                    if atom != 0 {
-                        xdnd_send_finished(
-                            &state.xcb_connection,
-                            &state.atoms,
-                            event.window,
-                            atom,
-                            drag.is_some(),
-                        );
-                    }
-                    let Some(drag) = drag else {
-                        return Some(());
+                    let (position, delivered) = match state.xdnd_drags.drop(event.window, atom) {
+                        XdndDropped::Refused => {
+                            if atom != 0 {
+                                xdnd_send_finished(
+                                    &state.xcb_connection,
+                                    &state.atoms,
+                                    event.window,
+                                    atom,
+                                    false,
+                                );
+                            }
+                            return Some(());
+                        }
+                        // finished once the data has come
+                        XdndDropped::Waiting => return Some(()),
+                        XdndDropped::Done {
+                            position,
+                            delivered,
+                        } => (position, delivered),
                     };
+                    xdnd_send_finished(
+                        &state.xcb_connection,
+                        &state.atoms,
+                        event.window,
+                        atom,
+                        delivered,
+                    );
                     drop(state);
-                    window.handle_input(PlatformInput::FileDrop(FileDropEvent::Submit {
-                        position: drag.position,
-                    }));
+                    window.handle_input(xdnd_dropped(position, delivered));
                 }
             }
             Event::SelectionNotify(event) => {
@@ -1124,39 +1340,44 @@ impl X11Client {
                 // the answer to the request for a drag's data made at its
                 // first `XdndPosition`, if the drag is still over the window:
                 // not a late one to a drag that has gone, nor another's
-                let position =
-                    state
-                        .xdnd_drags
-                        .answer(event.requestor, event.target, event.time)?;
+                state
+                    .xdnd_drags
+                    .answer(event.requestor, event.target, event.time)?;
                 // The source would not give its data in that type, so there
                 // is none, and what the property still holds is another's.
-                if event.property == x11rb::NONE {
-                    return Some(());
-                }
-                // read whole and deleted, as ICCCM has the requestor do
-                let reply = get_reply(
-                    || "Failed to get XDND_DATA",
-                    state.xcb_connection.get_property(
-                        true,
-                        event.requestor,
-                        event.property,
-                        AtomEnum::ANY,
-                        0,
-                        u32::MAX / 4,
-                    ),
-                )
-                .log_err();
-                let Some(reply) = reply else {
+                let came = if event.property == x11rb::NONE {
+                    state.xdnd_drags.came(event.requestor, None)
+                } else {
+                    // read whole and deleted, as ICCCM has the requestor do
+                    let reply = get_reply(
+                        || "Failed to get XDND_DATA",
+                        state.xcb_connection.get_property(
+                            true,
+                            event.requestor,
+                            event.property,
+                            AtomEnum::ANY,
+                            0,
+                            u32::MAX / 4,
+                        ),
+                    )
+                    .log_err();
+                    match reply {
+                        // too large for one property: the source hands it
+                        // over in pieces once the property is deleted, each
+                        // a new value of it, the last an empty one. Read as
+                        // the data, its size named no file.
+                        Some(reply) if reply.type_ == state.atoms.INCR => {
+                            state.xdnd_drags.begin_pieces(event.requestor);
+                            None
+                        }
+                        Some(reply) => state.xdnd_drags.came(event.requestor, Some(reply.value)),
+                        None => state.xdnd_drags.came(event.requestor, None),
+                    }
+                };
+                let Some(came) = came else {
                     return Some(());
                 };
-                if let Ok(file_list) = str::from_utf8(&reply.value) {
-                    let input = PlatformInput::FileDrop(FileDropEvent::Entered {
-                        position,
-                        paths: gpui::ExternalPaths(xdnd_paths(file_list)),
-                    });
-                    drop(state);
-                    window.handle_input(input);
-                }
+                self.xdnd_came(state, &window, event.requestor, came);
             }
             Event::ConfigureNotify(event) => {
                 let bounds = Bounds {
@@ -1177,6 +1398,33 @@ impl X11Client {
             }
             Event::PropertyNotify(event) => {
                 let window = self.get_window(event.window)?;
+                let mut state = self.0.borrow_mut();
+                // the next piece of a drag's data that comes in pieces
+                if event.atom == state.atoms.XDND_DATA
+                    && event.state == xproto::Property::NEW_VALUE
+                    && state.xdnd_drags.takes_pieces(event.window)
+                {
+                    let piece = get_reply(
+                        || "Failed to get a piece of XDND_DATA",
+                        state.xcb_connection.get_property(
+                            true,
+                            event.window,
+                            event.atom,
+                            AtomEnum::ANY,
+                            0,
+                            u32::MAX / 4,
+                        ),
+                    )
+                    .log_err();
+                    let came = state
+                        .xdnd_drags
+                        .piece(event.window, piece.as_ref().map(|piece| &piece.value[..]));
+                    if let Some(came) = came {
+                        self.xdnd_came(state, &window, event.window, came);
+                    }
+                    return Some(());
+                }
+                drop(state);
                 window
                     .property_notify(event)
                     .context("X11: Failed to handle property notify")
@@ -2530,6 +2778,17 @@ fn xdnd_paths(data: &str) -> SmallVec<[PathBuf; 2]> {
     paths
 }
 
+/// What gpui is told of a drop that is done: dropped at `position` when
+/// it was handed the drag's files, else that the drag has gone, as a drop
+/// of nothing is no click.
+fn xdnd_dropped(position: Point<Pixels>, delivered: bool) -> PlatformInput {
+    PlatformInput::FileDrop(if delivered {
+        FileDropEvent::Submit { position }
+    } else {
+        FileDropEvent::Exited {}
+    })
+}
+
 fn xdnd_is_atom_supported(atom: u32, atoms: &XcbAtoms) -> bool {
     atom == atoms.TEXT
         || atom == atoms.STRING
@@ -3380,7 +3639,7 @@ mod tests {
 
 #[cfg(test)]
 mod xdnd_tests {
-    use super::{XdndDrags, XdndReply, xdnd_drag_type, xdnd_paths};
+    use super::{XdndCame, XdndDropped, XdndDrags, XdndReply, xdnd_drag_type, xdnd_paths};
     use gpui::{Pixels, Point, point, px};
     use std::{cell::RefCell, path::PathBuf};
 
@@ -3510,6 +3769,211 @@ mod xdnd_tests {
         assert!(drags.answer(WINDOW, TEXT, 20).is_none());
         assert!(drags.answer(OTHER_WINDOW, URI_LIST, 20).is_none());
         assert_eq!(drags.answer(WINDOW, URI_LIST, 20), pointer());
+    }
+
+    /// A drag entered over the window, its data asked for at its first
+    /// position, at `time`.
+    fn asked(drags: &mut XdndDrags, time: u32) {
+        drags.enter(WINDOW, SOURCE, URI_LIST);
+        assert_eq!(
+            drags.position(WINDOW, SOURCE, time, pointer),
+            accept(Some(URI_LIST))
+        );
+    }
+
+    const FILES: &[u8] = b"file:///tmp/a.txt\r\n";
+
+    /// A drop whose data has come is done at once: the source told it is
+    /// accepted and gpui that it was dropped, and the drag ends. One whose
+    /// data the source would not give is refused, and gpui told the drag
+    /// has gone, where it was told the drop was accepted and dropped with
+    /// nothing.
+    #[test]
+    fn a_drop_after_its_data_is_done_at_once() {
+        let mut drags = XdndDrags::default();
+        asked(&mut drags, 5);
+        assert_eq!(drags.answer(WINDOW, URI_LIST, 5), pointer());
+        let came = XdndCame {
+            position: point(px(10.), px(20.)),
+            data: Some(FILES.to_vec()),
+            finish: None,
+        };
+        assert_eq!(drags.came(WINDOW, Some(FILES.to_vec())), Some(came));
+        assert_eq!(drags.came(WINDOW, Some(FILES.to_vec())), None, "came twice");
+        assert_eq!(
+            drags.drop(WINDOW, SOURCE),
+            XdndDropped::Done {
+                position: point(px(10.), px(20.)),
+                delivered: true
+            }
+        );
+        assert!(drags.0.is_empty(), "the drag did not end");
+
+        asked(&mut drags, 6);
+        drags.answer(WINDOW, URI_LIST, 6);
+        assert_eq!(drags.came(WINDOW, None).map(|came| came.finish), Some(None));
+        assert_eq!(
+            drags.drop(WINDOW, SOURCE),
+            XdndDropped::Done {
+                position: point(px(10.), px(20.)),
+                delivered: false
+            }
+        );
+        assert!(drags.0.is_empty());
+    }
+
+    /// A drop before its data has come waits for it: the source is told
+    /// the drop is done, and gpui handed the files and told of the drop,
+    /// once the data has come, or told the drop is refused when it fails.
+    /// The drop was finished at once, and the data that came after it was
+    /// no drag's (elundqvist/kvist#380).
+    #[test]
+    fn a_drop_before_its_data_is_finished_once_the_data_has_come() {
+        let mut drags = XdndDrags::default();
+        asked(&mut drags, 5);
+        assert_eq!(drags.drop(WINDOW, SOURCE), XdndDropped::Waiting);
+        assert_eq!(drags.position(WINDOW, SOURCE, 6, pointer), accept(None));
+        assert_eq!(drags.answer(WINDOW, URI_LIST, 5), pointer());
+        assert_eq!(
+            drags.came(WINDOW, Some(FILES.to_vec())),
+            Some(XdndCame {
+                position: point(px(10.), px(20.)),
+                data: Some(FILES.to_vec()),
+                finish: Some(SOURCE),
+            })
+        );
+        assert!(drags.0.is_empty(), "the drag did not end");
+
+        asked(&mut drags, 7);
+        assert_eq!(drags.drop(WINDOW, SOURCE), XdndDropped::Waiting);
+        drags.answer(WINDOW, URI_LIST, 7);
+        assert_eq!(
+            drags.came(WINDOW, None),
+            Some(XdndCame {
+                position: point(px(10.), px(20.)),
+                data: None,
+                finish: Some(SOURCE),
+            })
+        );
+        assert!(drags.0.is_empty());
+
+        // a drop with no position before it asked for nothing, and has
+        // nothing to wait for
+        drags.enter(WINDOW, SOURCE, URI_LIST);
+        assert_eq!(
+            drags.drop(WINDOW, SOURCE),
+            XdndDropped::Done {
+                position: Point::default(),
+                delivered: false
+            }
+        );
+    }
+
+    /// Data that names no file gpui can open, not text or no `file:` URI,
+    /// is none: the drag is refused at its next position, and its drop is
+    /// finished refused, with gpui told the drag has gone. It was taken as
+    /// the drag's files, accepted, and gpui told of a drop of nothing.
+    #[test]
+    fn data_that_names_no_file_is_none() {
+        let mut drags = XdndDrags::default();
+        for data in [&b"\xff\xfe not text"[..], b"https://example.com/a.txt\r\n", b""] {
+            asked(&mut drags, 5);
+            drags.answer(WINDOW, URI_LIST, 5);
+            let came = drags.came(WINDOW, Some(data.to_vec())).expect("the data came");
+            assert_eq!(came.data, None, "{data:?}");
+            assert_eq!(drags.position(WINDOW, SOURCE, 6, pointer), XdndReply::Refuse);
+            assert_eq!(
+                drags.drop(WINDOW, SOURCE),
+                XdndDropped::Done {
+                    position: point(px(10.), px(20.)),
+                    delivered: false
+                }
+            );
+            assert!(drags.0.is_empty());
+        }
+    }
+
+    /// A drop waiting for its data that another drag's `XdndEnter` takes
+    /// the place of is given back as dropped, for its source to be told
+    /// the drop is refused: its data would now be taken for the new
+    /// drag's, and the source waited for an answer that never came.
+    #[test]
+    fn an_enter_over_a_drop_waiting_for_its_data_gives_it_back_dropped() {
+        let mut drags = XdndDrags::default();
+        asked(&mut drags, 5);
+        assert_eq!(drags.drop(WINDOW, SOURCE), XdndDropped::Waiting);
+        let gone = drags.enter(WINDOW, OTHER_SOURCE, URI_LIST).expect("given back");
+        assert!(gone.dropped);
+        assert_eq!(gone.other_window, SOURCE);
+        // one not dropped yet is given back as before, not dropped
+        drags.position(WINDOW, OTHER_SOURCE, 6, pointer);
+        assert!(!drags.enter(WINDOW, SOURCE, URI_LIST).expect("given back").dropped);
+    }
+
+    /// Data too large for one property comes in pieces (ICCCM's INCR),
+    /// gathered until the empty one, and then it has come whole, before
+    /// the drop or after it. Read as the data, the answer was its size in
+    /// four bytes, which named no file.
+    #[test]
+    fn data_in_pieces_comes_whole() {
+        let mut drags = XdndDrags::default();
+        for drop_first in [false, true] {
+            asked(&mut drags, 5);
+            assert!(!drags.takes_pieces(WINDOW));
+            drags.answer(WINDOW, URI_LIST, 5);
+            drags.begin_pieces(WINDOW);
+            assert!(drags.takes_pieces(WINDOW));
+            assert!(!drags.takes_pieces(OTHER_WINDOW));
+            assert_eq!(drags.piece(WINDOW, Some(&FILES[..9])), None);
+            if drop_first {
+                assert_eq!(drags.drop(WINDOW, SOURCE), XdndDropped::Waiting);
+            }
+            assert_eq!(drags.piece(WINDOW, Some(&FILES[9..])), None);
+            let came = drags.piece(WINDOW, Some(&[])).expect("the data came");
+            assert_eq!(came.data.as_deref(), Some(FILES));
+            assert_eq!(came.finish, drop_first.then_some(SOURCE));
+            assert!(!drags.takes_pieces(WINDOW));
+            assert_eq!(drags.piece(WINDOW, Some(b"more")), None);
+            if !drop_first {
+                assert!(matches!(
+                    drags.drop(WINDOW, SOURCE),
+                    XdndDropped::Done {
+                        delivered: true,
+                        ..
+                    }
+                ));
+            }
+            assert!(drags.0.is_empty());
+        }
+
+        // a piece that cannot be read fails the data, and a drag that left
+        // takes no more pieces
+        asked(&mut drags, 6);
+        drags.answer(WINDOW, URI_LIST, 6);
+        drags.begin_pieces(WINDOW);
+        assert_eq!(drags.drop(WINDOW, SOURCE), XdndDropped::Waiting);
+        let came = drags.piece(WINDOW, None).expect("the data failed");
+        assert_eq!((came.data, came.finish), (None, Some(SOURCE)));
+        asked(&mut drags, 7);
+        drags.answer(WINDOW, URI_LIST, 7);
+        drags.begin_pieces(WINDOW);
+        drags.end(WINDOW, SOURCE);
+        assert!(!drags.takes_pieces(WINDOW));
+        assert_eq!(drags.piece(WINDOW, Some(&[])), None);
+    }
+
+    /// A drop of a drag gpui refused is refused and ends it; one from
+    /// another source than the drag's is refused and leaves it be.
+    #[test]
+    fn a_drop_gpui_did_not_take_is_refused() {
+        let mut drags = XdndDrags::default();
+        drags.enter(WINDOW, SOURCE, 0);
+        assert_eq!(drags.drop(WINDOW, SOURCE), XdndDropped::Refused);
+        assert!(drags.0.is_empty());
+        asked(&mut drags, 5);
+        assert_eq!(drags.drop(WINDOW, OTHER_SOURCE), XdndDropped::Refused);
+        assert_eq!(drags.drop(OTHER_WINDOW, SOURCE), XdndDropped::Refused);
+        assert_eq!(drags.drop(WINDOW, SOURCE), XdndDropped::Waiting);
     }
 
     /// An `XdndPosition` with no `XdndEnter` before it is refused, as is
