@@ -38,6 +38,8 @@ mod client;
 mod ctext;
 #[cfg(feature = "server")]
 mod server;
+#[cfg(any(feature = "x11rb-server", feature = "x11rb-client", feature = "xlib-client", test))]
+mod transport;
 
 #[cfg(any(feature = "x11rb-server", feature = "x11rb-client"))]
 pub mod x11rb;

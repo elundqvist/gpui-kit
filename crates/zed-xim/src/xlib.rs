@@ -1,8 +1,11 @@
+// Changed in elundqvist/gpui-kit from zed-xim 0.4.0-zed as published to crates.io: FORK.md at the
+// crate's root lists the changes.
 //! Provides a wrapper around Xlib (through the [`x11-dl`] crate) that allows to use Xlib as a
 //! client for XIM.
 //!
 //! Note that it is generally discouraged to use Xlib in the modern era.
 
+use crate::transport::{transport, Transport};
 use crate::AHashMap;
 use alloc::vec::Vec;
 use std::ffi::CStr;
@@ -444,12 +447,7 @@ impl<X: XlibRef> XlibClient<X> {
         self.buf.resize(req.size(), 0);
         xim_parser::write(&req, &mut self.buf);
 
-        if self.buf.len() < self.transport_max {
-            if self.buf.len() > 20 {
-                todo!("multi-CM");
-            }
-            self.buf.resize(20, 0);
-            let buf: [u8; 20] = self.buf.as_slice().try_into().unwrap();
+        if let Transport::ClientMessage(buf) = transport(&self.buf, self.transport_max) {
             let mut ev = xlib::XClientMessageEvent {
                 type_: xlib::ClientMessage,
                 display: self.display,

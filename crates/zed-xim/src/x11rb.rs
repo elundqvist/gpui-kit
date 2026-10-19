@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from zed-xim 0.4.0-zed as published to crates.io: FORK.md at the
+// crate's root lists the changes.
 //! Provides an implementation of XIM using [`x11rb`] as a transport.
 //!
 //! Wrap your `Connection` in an [`X11rbClient`] or [`X11rbServer`] and use it as a
@@ -8,8 +10,10 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use std::{convert::TryInto, rc::Rc, sync::Arc};
+use std::{rc::Rc, sync::Arc};
 use x11rb::protocol::xproto::EventMask;
+
+use crate::transport::{transport, Transport};
 
 #[cfg(feature = "x11rb-client")]
 use crate::client::{
@@ -703,19 +707,14 @@ fn send_req_impl<C: HasConnection, E: From<ConnectionError> + From<ReplyError>>(
     buf.resize(req.size(), 0);
     xim_parser::write(req, buf);
 
-    if buf.len() < transport_max {
-        if buf.len() > 20 {
-            todo!("multi-CM");
-        }
-        buf.resize(20, 0);
-        let buf: [u8; 20] = buf.as_slice().try_into().unwrap();
+    if let Transport::ClientMessage(data) = transport(buf, transport_max) {
         c.conn().send_event(
             false,
             target,
             EventMask::NO_EVENT,
             ClientMessageEvent {
                 response_type: CLIENT_MESSAGE_EVENT,
-                data: buf.into(),
+                data: data.into(),
                 format: 8,
                 sequence: 0,
                 type_: atoms.XIM_PROTOCOL,

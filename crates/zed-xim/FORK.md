@@ -56,6 +56,20 @@ beside this file.
   the lifetime of the builder they return: today's rustc warned of
   both, and the crate builds as a path dependency of gpui-pre-linux,
   whose warnings an application patching it in by path is shown.
+- `src/transport.rs` (added), `src/x11rb.rs`, `src/xlib.rs` and
+  `src/lib.rs`: a request longer than the 20 bytes of a ClientMessage
+  goes in a property of the other side's window, as one at or over the
+  TRANSPORT_MAX the server announced already went (`transport`), where
+  one between 21 bytes and a limit above 20 ended the application on
+  `todo!("multi-CM")` (elundqvist/kvist#473). The protocol's multi-CM,
+  a request in several ClientMessages, is still not sent: IMdkit and
+  xcb-imdkit, which ibus and fcitx build their servers on, read a
+  property for any request whatever limit they announce, and ibus and
+  fcitx announce none above 20. Tests of where a request of each length
+  goes, and of the requests the client sends a server with a limit of
+  4096 (an open, its encoding, the input context gpui-pre-linux
+  creates and the spot it moves, a sync's reply), through
+  `client::tests`' client that keeps what it is asked to send.
 
 ## Tests
 

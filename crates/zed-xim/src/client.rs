@@ -607,12 +607,14 @@ pub trait ClientHandler<C: Client> {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_request, ClientCore, ClientError, ClientHandler};
+    use super::{handle_request, Client, ClientCore, ClientError, ClientHandler};
+    use crate::transport::{transport, Transport};
     use crate::AHashMap;
     use alloc::string::String;
     use alloc::vec::Vec;
     use xim_parser::{
-        Attr, AttributeName, CommitData, Feedback, PreeditDrawStatus, Request, XEvent,
+        Attr, AttributeName, CommitData, Feedback, InputStyle, Point, PreeditDrawStatus, Request,
+        XEvent,
     };
 
     /// A client that sends nothing anywhere: what it was asked to send is
@@ -713,5 +715,66 @@ mod tests {
         );
         // a synchronous commit is still answered
         assert!(matches!(client.sent.as_slice(), [Request::SyncReply { .. }]));
+    }
+
+    /// What the client sends a server that announced a TRANSPORT_MAX of
+    /// 4096, an open, the encoding the open's reply has it ask for, the
+    /// input context gpui-pre-linux creates and the spot it moves, and a
+    /// sync's reply, goes as the X transports send it: the requests of 20
+    /// bytes or fewer in one ClientMessage, the rest by property. Those
+    /// between 21 bytes and the limit ended the client on
+    /// `todo!("multi-CM")`.
+    #[test]
+    fn a_request_longer_than_a_client_message_goes_by_property() {
+        let mut client = Quiet::default();
+        for (name, id) in [
+            (AttributeName::InputStyle, 1),
+            (AttributeName::ClientWindow, 2),
+            (AttributeName::FocusWindow, 3),
+            (AttributeName::PreeditAttributes, 4),
+            (AttributeName::SpotLocation, 5),
+        ] {
+            client.attributes.insert(name, id);
+        }
+        let mut handler = Texts::default();
+        client.open("en_US.UTF-8").unwrap();
+        let reply = Request::OpenReply { input_method_id: 1, im_attrs: Vec::new(), ic_attrs: Vec::new() };
+        handle_request(&mut client, &mut handler, reply).unwrap();
+        let spot = |client: &Quiet| {
+            client
+                .build_ic_attributes()
+                .push(AttributeName::InputStyle, InputStyle::PREEDIT_CALLBACKS)
+                .push(AttributeName::ClientWindow, 0x0480_0001u32)
+                .push(AttributeName::FocusWindow, 0x0480_0001u32)
+                .nested_list(AttributeName::PreeditAttributes, |b| {
+                    b.push(AttributeName::SpotLocation, Point { x: 120, y: 340 });
+                })
+                .build()
+        };
+        let ic = spot(&client);
+        client.create_ic(1, ic).unwrap();
+        let ic = spot(&client);
+        client.set_ic_values(1, 1, ic).unwrap();
+        handle_request(&mut client, &mut handler, Request::Sync { input_method_id: 1, input_context_id: 1 }).unwrap();
+
+        let sent: Vec<(&str, Vec<u8>)> = client.sent.iter().map(|r| (r.name(), xim_parser::write_to_vec(r))).collect();
+        let names: Vec<&str> = sent.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, ["Open", "EncodingNegotiation", "CreateIc", "SetIcValues", "SyncReply"]);
+        for (name, bytes) in &sent {
+            let how = transport(bytes, 4096);
+            if bytes.len() <= 20 {
+                let mut data = [0u8; 20];
+                data[..bytes.len()].copy_from_slice(bytes);
+                assert_eq!(how, Transport::ClientMessage(data), "{name}, {} bytes", bytes.len());
+            } else {
+                assert!(bytes.len() < 4096, "{name}, {} bytes", bytes.len());
+                assert_eq!(how, Transport::Property, "{name}, {} bytes", bytes.len());
+                // as under ibus's limit of 20
+                assert_eq!(transport(bytes, 20), Transport::Property, "{name}");
+            }
+        }
+        // the encoding, the context and its spot are the ones past 20
+        let long: Vec<&str> = sent.iter().filter(|(_, b)| b.len() > 20).map(|(n, _)| *n).collect();
+        assert_eq!(long, ["EncodingNegotiation", "CreateIc", "SetIcValues"]);
     }
 }
