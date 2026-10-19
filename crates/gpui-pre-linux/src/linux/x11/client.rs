@@ -2267,7 +2267,8 @@ impl LinuxClient for X11Client {
     /// MB): a read waits on the owner, four seconds at most where it does
     /// not answer, and is not to take a worker of the background executor
     /// meanwhile. The app's own copy, with its metadata, is at hand and is
-    /// given at once, as before.
+    /// given at once, as before. An owner that does not answer in time, or
+    /// stops handing its text over, gives an error (`read_for_paste`).
     fn read_from_clipboard_async(
         &self,
     ) -> Task<std::result::Result<Option<gpui::ClipboardItem>, gpui::ClipboardReadError>> {
@@ -2285,12 +2286,9 @@ impl LinuxClient for X11Client {
         let spawned = std::thread::Builder::new()
             .name("Clipboard read".to_owned())
             .spawn(move || {
-                read.send(
-                    reader
-                        .get_any(clipboard::ClipboardKind::Clipboard)
-                        .context("X11: Failed to read from clipboard (clipboard)")
-                        .log_with_level(log::Level::Debug),
-                )
+                read.send(read_for_paste(
+                    reader.get_any(clipboard::ClipboardKind::Clipboard),
+                ))
                 .ok();
             });
         if let Err(error) = spawned {
@@ -2299,7 +2297,7 @@ impl LinuxClient for X11Client {
         }
         executor.spawn(async move {
             item.await
-                .map_err(|_| gpui::ClipboardReadError::Unavailable)
+                .unwrap_or(Err(gpui::ClipboardReadError::Unavailable))
         })
     }
 
@@ -3364,9 +3362,46 @@ fn xkb_state_for_key_event(xkb: &xkbc::State, event_state: xproto::KeyButMask) -
     key_event_state
 }
 
+/// What a read of the clipboard another program owns gives a paste: what
+/// it holds, nothing where it holds nothing a paste takes, and an error
+/// where the owner did not answer in time or stopped handing it over.
+///
+/// Changed in elundqvist/gpui-kit (elundqvist/kvist#435): that was nothing
+/// too, as for an empty clipboard, and a paste that waited four seconds on
+/// an owner that did not answer ended with nothing to say why.
+fn read_for_paste(
+    read: std::result::Result<gpui::ClipboardItem, clipboard::Error>,
+) -> std::result::Result<Option<gpui::ClipboardItem>, gpui::ClipboardReadError> {
+    match read {
+        Ok(item) => Ok(Some(item)),
+        Err(clipboard::Error::TimedOut) => Err(gpui::ClipboardReadError::Unavailable),
+        Err(error) => {
+            log::debug!("X11: Failed to read from clipboard (clipboard): {error}");
+            Ok(None)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A read whose owner did not answer in time is an error, which a paste
+    /// says, and one of a clipboard holding nothing a paste takes is
+    /// nothing, as before (elundqvist/kvist#435).
+    #[test]
+    fn a_read_the_owner_did_not_answer_is_an_error() {
+        assert_eq!(
+            read_for_paste(Err(clipboard::Error::TimedOut)),
+            Err(gpui::ClipboardReadError::Unavailable)
+        );
+        assert_eq!(
+            read_for_paste(Err(clipboard::Error::ContentNotAvailable)),
+            Ok(None)
+        );
+        let text = gpui::ClipboardItem::new_string("text".into());
+        assert_eq!(read_for_paste(Ok(text.clone())), Ok(Some(text)));
+    }
 
     fn test_keymap(layouts: &str) -> xkbc::Keymap {
         test_keymap_with_variant(layouts, "")

@@ -23,12 +23,13 @@ pub use gpui_base::input::{
     IndentInline, InputEdit, InputEvent, InputHighlighter, InputHighlighterFactory, InputState,
     Lsp, MaskPattern, MoveDown, MoveEnd, MoveHome, MoveLeft, MovePageDown, MovePageUp, MoveRight,
     MoveToEnd, MoveToEndOfLine, MoveToNextWord, MoveToPreviousWord, MoveToStart, MoveToStartOfLine,
-    MoveUp, Outdent, OutdentInline, PASTE_WAIT_SHOWN_AFTER, Paste, PasteInputHold, PasteKeyDown,
-    Point, PreparedValue, Redo, Replace, Rope, RopeExt, RopeLines, Search, SelectAll, SelectToEnd,
-    SelectToEndOfLine, SelectToNextWordEnd, SelectToPreviousWordStart, SelectToStart,
-    SelectToStartOfLine, Selection, ShowCharacterPalette, ShowDocumentHandler, TabSize,
-    TextDecoration, TextDecorationCollection, TextareaState, ToggleCodeActions, Undo,
-    WrappingIndent, paste_waits, read_clipboard_for_paste,
+    MoveUp, Outdent, OutdentInline, PASTE_UNANSWERED_SHOWN_FOR, PASTE_WAIT_SHOWN_AFTER, Paste,
+    PasteInputHold, PasteKeyDown, Point, PreparedValue, Redo, Replace, Rope, RopeExt, RopeLines,
+    Search, SelectAll, SelectToEnd, SelectToEndOfLine, SelectToNextWordEnd,
+    SelectToPreviousWordStart, SelectToStart, SelectToStartOfLine, Selection, ShowCharacterPalette,
+    ShowDocumentHandler, TabSize, TextDecoration, TextDecorationCollection, TextareaState,
+    ToggleCodeActions, Undo, WrappingIndent, paste_unanswered, paste_waits,
+    read_clipboard_for_paste,
 };
 pub use gpui_base::input::{EditorMode, InputMode, InputModeKind, TextareaMode};
 #[doc(hidden)]

@@ -141,6 +141,12 @@ asks (section 4(b)); each says so at its top:
   gpui-base input does: the focus may have moved to a field whose
   selection it would delete. Tests of a field whose input is held, and
   of one with a selection and nothing marked.
+- `src/linux/x11/client.rs`: a read of the clipboard whose owner did not
+  answer in time, or stopped handing its text over, gives an error,
+  `ClipboardReadError::Unavailable` (`read_for_paste`,
+  elundqvist/kvist#435), where it gave nothing, as an empty clipboard
+  does, and a paste that waited four seconds ended with nothing to say
+  why. A test of what each read gives.
 - `Cargo.toml`: an `[[example]]` entry for `examples/xdnd_source.rs`,
   which the fork adds (the published manifest names its targets and
   has no examples).

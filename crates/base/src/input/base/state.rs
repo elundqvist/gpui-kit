@@ -92,6 +92,12 @@ pub type PasteKeyDown = Box<dyn FnMut(&KeyDownEvent, &mut Window, &mut App) -> b
 /// by with nothing to show for them (elundqvist/kvist#435).
 pub const PASTE_WAIT_SHOWN_AFTER: std::time::Duration = std::time::Duration::from_millis(300);
 
+/// How long a window says that a paste's clipboard could not be read
+/// ([`paste_unanswered`]): where the program that holds it did not answer,
+/// or stopped handing it over, the wait ended with nothing pasted and
+/// nothing to say why (elundqvist/kvist#435).
+pub const PASTE_UNANSWERED_SHOWN_FOR: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl PasteInputHold {
     /// A hold made of `hold`, which holds a window's input and gives back
     /// what releases it, an `H`, and `release`, which is handed that `H`
@@ -207,6 +213,12 @@ fn paste_when_read<V: 'static>(
     });
     let held = (hold.hold)(window, cx, escape);
     *wait.held.borrow_mut() = Some(held);
+    // a paste that waits again says no more that the last went unanswered
+    if paste_unanswered(window, cx) {
+        let id = window.window_handle().window_id();
+        cx.global_mut::<PasteUnanswered>().0.remove(&id);
+        window.refresh();
+    }
     window
         .spawn(cx, {
             let wait = wait.clone();
@@ -217,22 +229,77 @@ fn paste_when_read<V: 'static>(
         })
         .detach();
     cx.spawn_in(window, async move |view, cx| {
-        let item = read.await.ok().flatten();
+        let read = read.await;
         cx.update(|window, cx| {
             // given up with Escape: the input has gone on without it
             if !wait.waiting() {
                 return;
             }
+            // not read: on X11 the program that holds it did not answer in
+            // time, or stopped handing it over
+            let unanswered = read.is_err();
             if let Some(landing) = &hold.landing {
                 landing(window, cx);
             }
-            view.update(cx, |view, cx| paste(view, item, window, cx))
+            view.update(cx, |view, cx| paste(view, read.ok().flatten(), window, cx))
                 .ok();
             wait.end(window, cx);
+            if unanswered {
+                say_unanswered(window, cx);
+            }
         })
         .ok();
     })
     .detach();
+}
+
+/// The windows that say a paste's clipboard could not be read
+/// ([`paste_unanswered`]), each with the number of the time it began to,
+/// and the number the next time takes.
+#[derive(Default)]
+struct PasteUnanswered(std::collections::HashMap<gpui::WindowId, u64>, u64);
+
+impl gpui::Global for PasteUnanswered {}
+
+/// Have `window` say, for [`PASTE_UNANSWERED_SHOWN_FOR`], that a paste's
+/// clipboard could not be read.
+fn say_unanswered(window: &mut Window, cx: &mut App) {
+    let id = window.window_handle().window_id();
+    let unanswered = cx.default_global::<PasteUnanswered>();
+    unanswered.1 += 1;
+    let time = unanswered.1;
+    unanswered.0.insert(id, time);
+    window.refresh();
+    window
+        .spawn(cx, async move |cx| {
+            cx.background_executor()
+                .timer(PASTE_UNANSWERED_SHOWN_FOR)
+                .await;
+            cx.update(|window, cx| {
+                let unanswered = &mut cx.default_global::<PasteUnanswered>().0;
+                if unanswered.get(&id) == Some(&time) {
+                    unanswered.remove(&id);
+                    window.refresh();
+                }
+            })
+            .ok();
+        })
+        .detach();
+}
+
+/// Whether `window` says that the clipboard a paste in it waited for could
+/// not be read, for [`PASTE_UNANSWERED_SHOWN_FOR`] after: the program that
+/// holds it did not answer, or stopped handing it over, and nothing was
+/// pasted, where the wait ended with nothing to say why
+/// (elundqvist/kvist#435). The window is drawn again as that begins and as
+/// it ends, and a paste that waits again ends it.
+pub fn paste_unanswered(window: &Window, cx: &App) -> bool {
+    cx.try_global::<PasteUnanswered>()
+        .is_some_and(|unanswered| {
+            unanswered
+                .0
+                .contains_key(&window.window_handle().window_id())
+        })
 }
 
 /// A paste waiting for the clipboard: what holds its window's input, until
@@ -4476,6 +4543,76 @@ mod tests {
             !press(&mut cx, &keys, "escape"),
             "a paste that landed takes no key"
         );
+    }
+
+    /// A paste whose clipboard could not be read, its owner not answering,
+    /// pastes nothing and lets the input go, and its window says so for
+    /// `PASTE_UNANSWERED_SHOWN_FOR`, or until a paste waits again; one
+    /// given up with Escape says nothing (elundqvist/kvist#435).
+    #[gpui::test]
+    fn test_a_paste_whose_clipboard_could_not_be_read_says_so(cx: &mut TestAppContext) {
+        type Read = Result<Option<ClipboardItem>, gpui::ClipboardReadError>;
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let keys = Keys::default();
+        let paste = |cx: &mut VisualTestContext,
+                     log: &Rc<std::cell::RefCell<Vec<&'static str>>>| {
+            let (send, received) = futures::channel::oneshot::channel::<Read>();
+            let read = cx
+                .executor()
+                .spawn(async move { received.await.unwrap_or(Ok(None)) });
+            cx.update(|window, cx| {
+                input.update(cx, |state, cx| {
+                    paste_when_read(
+                        state,
+                        read,
+                        keyed_hold(log, &keys),
+                        window,
+                        cx,
+                        InputBaseState::paste_item,
+                    )
+                })
+            });
+            send
+        };
+        let unanswered =
+            |cx: &mut VisualTestContext| cx.update(|window, cx| paste_unanswered(window, cx));
+        cx.update(|window, cx| input.update(cx, |state, cx| state.set_value("one", window, cx)));
+
+        let send = paste(&mut cx, &log);
+        cx.executor().advance_clock(PASTE_WAIT_SHOWN_AFTER);
+        cx.run_until_parked();
+        assert!(!unanswered(&mut cx));
+        send.send(Err(gpui::ClipboardReadError::Unavailable))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(!paste_waits(window, cx));
+            assert_eq!(input.read(cx).value(), "one");
+        });
+        assert!(unanswered(&mut cx), "the window says it was not read");
+        assert_eq!(*log.borrow(), ["hold", "landing", "release"]);
+        cx.executor().advance_clock(PASTE_UNANSWERED_SHOWN_FOR);
+        cx.run_until_parked();
+        assert!(!unanswered(&mut cx), "for a while");
+
+        let send = paste(&mut cx, &log);
+        send.send(Err(gpui::ClipboardReadError::Unavailable))
+            .unwrap();
+        cx.run_until_parked();
+        assert!(unanswered(&mut cx));
+        let send = paste(&mut cx, &log);
+        cx.run_until_parked();
+        assert!(!unanswered(&mut cx), "a paste that waits again ends it");
+        cx.executor().advance_clock(PASTE_WAIT_SHOWN_AFTER);
+        cx.run_until_parked();
+        assert!(press(&mut cx, &keys, "escape"), "given up");
+        send.send(Err(gpui::ClipboardReadError::Unavailable))
+            .unwrap();
+        cx.run_until_parked();
+        assert!(!unanswered(&mut cx), "one given up says nothing");
     }
 
     /// A view that pastes into something of its own, not an input, as a
