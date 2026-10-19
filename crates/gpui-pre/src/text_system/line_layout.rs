@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre 0.3.3 as published to crates.io: FORK.md at the
+// crate's root lists the changes.
 use crate::{FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, point, px};
 use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
@@ -72,30 +74,41 @@ impl LineLayout {
 
     /// closest_index_for_x returns the character boundary closest to the given x coordinate
     /// (e.g. to handle aligning up/down arrow keys)
+    ///
+    /// The boundaries are where a cluster starts, and the line's end: the glyphs of one
+    /// cluster share its index, and a caret between them would stand inside it. A grapheme
+    /// the font draws as two glyphs, a family emoji it has no glyph of its own for, is one
+    /// cluster, and a click on its right half, on the left of its second glyph, went to its
+    /// start, which that glyph's start was taken for; the last cluster ends at the line's
+    /// width, so a click on its left half goes before it, where it went to the line's end.
     pub fn closest_index_for_x(&self, x: Pixels) -> usize {
+        // the cluster before x: where it starts, and its index
         let mut prev_index = 0;
         let mut prev_x = px(0.);
+        let nearer = |prev_index: usize, prev_x: Pixels, index: usize, at: Pixels| {
+            if at - x < x - prev_x {
+                index
+            } else {
+                prev_index
+            }
+        };
 
         for run in self.runs.iter() {
             for glyph in run.glyphs.iter() {
+                // a glyph of the cluster before it
+                if glyph.index == prev_index {
+                    continue;
+                }
                 if glyph.position.x >= x {
-                    if glyph.position.x - x < x - prev_x {
-                        return glyph.index;
-                    } else {
-                        return prev_index;
-                    }
+                    return nearer(prev_index, prev_x, glyph.index, glyph.position.x);
                 }
                 prev_index = glyph.index;
                 prev_x = glyph.position.x;
             }
         }
 
-        if self.len == 1 {
-            if x > self.width / 2. {
-                return 1;
-            } else {
-                return 0;
-            }
+        if x <= self.width {
+            return nearer(prev_index, prev_x, self.len, self.width);
         }
 
         self.len
@@ -1136,5 +1149,79 @@ mod tests {
 
         let positions = glyph_x_positions(&layout);
         assert_eq!(positions, vec![0.5, 0.5]);
+    }
+
+    /// `x👧‍👦a` as cosmic-text shapes it with Noto Color Emoji, which has no glyph for a
+    /// girl and a boy: the x, the two glyphs of the family, both of the cluster at byte 1
+    /// where the joined emoji starts, and the a after it at byte 12, the line 13 long. Each
+    /// is 16 px but the x, which is 8.
+    fn family() -> LineLayout {
+        LineLayout {
+            len: "x👧‍👦a".len(),
+            width: px(56.),
+            ..make_layout(vec![
+                glyph_at(0., 0),
+                glyph_at(8., 1),
+                glyph_at(24., 1),
+                glyph_at(40., 12),
+            ])
+        }
+    }
+
+    /// A click on a grapheme of two glyphs goes to its nearer edge: its start for its
+    /// left half, the end for its right half, the left of its second glyph among it, where
+    /// that went to its start (elundqvist/kvist#474).
+    #[test]
+    fn a_click_on_a_cluster_of_two_glyphs_goes_to_its_nearer_edge() {
+        let layout = family();
+        // the family runs from 8 to 40, its middle at 24
+        for (x, at) in [
+            (9., 1),
+            (20., 1),
+            (23.9, 1),
+            (24.1, 12),
+            (26., 12),
+            (30., 12),
+            (39., 12),
+        ] {
+            assert_eq!(layout.closest_index_for_x(px(x)), at, "a click at {x}");
+        }
+        // the x and the a, either side of it
+        for (x, at) in [
+            (-3., 0),
+            (0., 0),
+            (3., 0),
+            (5., 1),
+            (41., 12),
+            (47.9, 12),
+            (48.1, 13),
+            (56., 13),
+            (90., 13),
+        ] {
+            assert_eq!(layout.closest_index_for_x(px(x)), at, "a click at {x}");
+        }
+    }
+
+    /// The last cluster ends at the line's width: a click on its left half goes before
+    /// it, as on any other, where any click past its start went to the line's end.
+    #[test]
+    fn a_click_on_the_left_half_of_the_last_cluster_goes_before_it() {
+        let ab = LineLayout {
+            len: 2,
+            width: px(16.),
+            ..make_layout(vec![glyph_at(0., 0), glyph_at(8., 1)])
+        };
+        assert_eq!(ab.closest_index_for_x(px(9.)), 1);
+        assert_eq!(ab.closest_index_for_x(px(11.9)), 1);
+        assert_eq!(ab.closest_index_for_x(px(12.1)), 2);
+        assert_eq!(ab.closest_index_for_x(px(30.)), 2);
+        // a line of one cluster, as before
+        let a = LineLayout {
+            len: 1,
+            width: px(8.),
+            ..make_layout(vec![glyph_at(0., 0)])
+        };
+        assert_eq!(a.closest_index_for_x(px(3.)), 0);
+        assert_eq!(a.closest_index_for_x(px(5.)), 1);
     }
 }

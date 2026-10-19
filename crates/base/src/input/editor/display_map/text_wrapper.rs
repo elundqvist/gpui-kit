@@ -637,6 +637,33 @@ impl WrapDisplayPoint {
     }
 }
 
+/// The caret position in `line` nearest `x`: gpui's nearest edge of a cluster
+/// (`closest_index_for_x`), and where that is inside a grapheme of the line's text, the
+/// edge of the grapheme nearer `x`. A cluster is a grapheme where the shaper merges it, a
+/// family emoji drawn as two glyphs among them, but a grapheme a shaper leaves in parts,
+/// a letter and an accent from two fonts, gave the index of its second part, and the
+/// caret stood inside it, where the keys step a grapheme at a time (elundqvist/kvist#474).
+fn closest_grapheme_edge(line: &ShapedLine, x: Pixels) -> usize {
+    let ix = line.closest_index_for_x(x);
+    let text = line.text.as_ref();
+    if ix == 0 || ix >= text.len() || !text.is_char_boundary(ix) {
+        return ix;
+    }
+    // the whole line is the one chunk, so the cursor needs no context
+    let mut cursor = unicode_segmentation::GraphemeCursor::new(ix, text.len(), true);
+    if cursor.is_boundary(text, 0).unwrap_or(true) {
+        return ix;
+    }
+    let start = cursor.prev_boundary(text, 0).ok().flatten().unwrap_or(0);
+    let mut cursor = unicode_segmentation::GraphemeCursor::new(ix, text.len(), true);
+    let end = cursor.next_boundary(text, 0).ok().flatten().unwrap_or(text.len());
+    if line.x_for_index(end) - x < x - line.x_for_index(start) {
+        end
+    } else {
+        start
+    }
+}
+
 /// The layout info of a line with soft wrapped lines.
 pub(crate) struct LineLayout {
     /// Total bytes length of this line.
@@ -800,7 +827,7 @@ impl LineLayout {
         for (i, line) in self.wrapped_lines.iter().enumerate() {
             let line_indent = self.line_indent(i);
             if x <= line_indent + line.width {
-                return acc_len + line.closest_index_for_x(x - line_indent);
+                return acc_len + closest_grapheme_edge(line, x - line_indent);
             }
             acc_len += line.len;
         }
@@ -851,7 +878,7 @@ impl LineLayout {
     ) -> Option<(usize, bool)> {
         let (i, offset, x) = self.wrapped_line_at(pos, last_layout)?;
         let line = &self.wrapped_lines[i];
-        let ix = line.closest_index_for_x(x);
+        let ix = closest_grapheme_edge(line, x);
         let line_end_affinity = i + 1 < self.wrapped_lines.len() && ix == line.len;
 
         Some((offset + ix, line_end_affinity))
@@ -1455,6 +1482,53 @@ mod tests {
             line_layout.position_for_index(0, &test_last_layout(px(20.)), false),
             Some(point(px(0.), px(0.)))
         );
+    }
+
+    /// `text` shaped by gpui's test text system, which gives each character a glyph and a
+    /// cluster of its own, 6 px wide at 10 px, 12 for one outside the BMP: a shaper that
+    /// leaves a grapheme in parts.
+    fn shaped(text: &str) -> ShapedLine {
+        let text_system = gpui::WindowTextSystem::new(std::sync::Arc::new(gpui::TextSystem::new(
+            std::sync::Arc::new(gpui::NoopTextSystem::new()),
+        )));
+        let run = gpui::TextRun {
+            len: text.len(),
+            font: test_font(),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        text_system.shape_line(text.to_string().into(), px(10.), &[run], None)
+    }
+
+    /// A click inside a grapheme a shaper left in parts goes to the grapheme's nearer
+    /// edge, where it went to the edge of the part nearer, inside it: in `x👧‍👦a`, where
+    /// the family runs from 6 to 36 in three clusters, a click at 26 put the caret before
+    /// the boy, at byte 8, and Backspace there took the girl and the joiner
+    /// (elundqvist/kvist#474).
+    #[test]
+    fn a_click_inside_a_grapheme_in_parts_goes_to_its_nearer_edge() {
+        let line = shaped("x👧‍👦a");
+        assert_eq!(line.x_for_index(1), px(6.));
+        assert_eq!(line.x_for_index(12), px(36.));
+        let mut layout = LineLayout::new();
+        layout.set_wrapped_lines(smallvec::smallvec![line.clone()]);
+        let last_layout = test_last_layout(px(20.));
+        for (x, at) in [(2., 0), (4., 1), (8., 1), (16., 1), (20., 1), (22., 12), (26., 12), (35., 12), (40., 13)] {
+            assert_eq!(closest_grapheme_edge(&line, px(x)), at, "a click at {x}");
+            assert_eq!(layout.closest_index_for_x(px(x), &last_layout), at, "a click at {x} on one line");
+            assert_eq!(
+                layout.closest_index_for_position(point(px(x), px(5.)), &last_layout),
+                Some((at, false)),
+                "a click at {x}"
+            );
+        }
+        // where the parts are graphemes, as a line of letters, each is a place
+        let abc = shaped("abc");
+        for (x, at) in [(2., 0), (4., 1), (8., 1), (10., 2), (16., 3)] {
+            assert_eq!(closest_grapheme_edge(&abc, px(x)), at, "a click at {x} on abc");
+        }
     }
 
     #[test]

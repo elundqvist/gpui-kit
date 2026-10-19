@@ -64,6 +64,16 @@ asks (section 4(b)); each says so at its top:
   again. The hold most recently taken is asked first, and a hold
   released looks at no more keys. Tests of a key taken and the rest let
   go, of a key taken under another hold, and of the like keys dropped.
+- `src/text_system/line_layout.rs`: `LineLayout::closest_index_for_x`
+  goes to the nearer edge of the cluster under the pointer
+  (elundqvist/kvist#474). It took each glyph's start for a place to
+  stand, and the glyphs of one cluster share its index: a grapheme
+  the font draws as two glyphs, 👧‍👦 in Noto Color Emoji, which has no
+  glyph of its own for it, is one cluster of two, and a click on the
+  left of its second glyph, its right half, went to its start. The last
+  cluster ends at the line's width, so a click on its left half goes
+  before it, where any click past its start went to the line's end.
+  Tests of both.
 
 ## Tests
 
