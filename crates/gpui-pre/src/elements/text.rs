@@ -700,13 +700,21 @@ impl TextLayout {
                     if let Some(max_lines) = text_style.line_clamp
                         && let Some(wrap_width) = wrap_width
                     {
-                        line_wrapper.truncate_wrapped_line(
+                        // Changed in elundqvist/gpui-kit (elundqvist/kvist#485): the
+                        // cut shapes the text, through the window's line layout
+                        // cache, as the text is shaped below, so that a text
+                        // measured again is not shaped again
+                        let text_system = window.text_system();
+                        line_wrapper.truncate_wrapped_line_shaped_by(
                             text.clone(),
                             wrap_width,
                             max_lines,
                             &truncation_affix,
                             &runs,
                             truncate_from,
+                            &|text, font_runs| {
+                                text_system.layout_font_runs(text, font_size, font_runs)
+                            },
                         )
                     } else if let Some(unclipped) = window
                         .text_system()

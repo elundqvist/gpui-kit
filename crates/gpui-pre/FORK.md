@@ -74,6 +74,29 @@ asks (section 4(b)); each says so at its top:
   cluster ends at the line's width, so a click on its left half goes
   before it, where any click past its start went to the line's end.
   Tests of both.
+- `src/text_system/line_wrapper.rs`: `LineWrapper::truncate_wrapped_line`,
+  the cut of `line_clamp` with an ellipsis, cuts the text on the rows it
+  is drawn in (elundqvist/kvist#485): each paragraph is shaped in its
+  runs' fonts and wrapped by the window's own rule, and the last row
+  allowed is cut where it and the ellipsis fit as shaped, a cluster at a
+  time. It added each character's width shaped on its own, and a
+  character the font lacks falls back to a font by the script of the
+  characters around it: a lone `。`, of no script, came out half the
+  width it is drawn at among Chinese, so the rows it worked out held
+  more than the rows drawn, and the cut fell past the last, which the
+  clamp then cut mid-row, its ellipsis over the edge. A paragraph is
+  shaped only as far as the rows allowed and two more could reach
+  (`shape_rows`), and one no wider than a row is not walked for where
+  it wraps, so a long text clamped to two rows costs what two rows
+  cost. Tests with a text system that draws `。` so, and that counts
+  what it shapes.
+- `src/elements/text.rs` and `src/text_system.rs`: the text element
+  has that cut shape through the window's line layout cache
+  (`WindowTextSystem::layout_font_runs`), as it shapes what it draws:
+  measured every frame, and several times a frame, the cut shaped the
+  text anew each time.
+- `src/text_system/line_layout.rs`: `LineLayout::compute_wrap_boundaries`
+  is crate-visible, for the cut above.
 
 ## Tests
 

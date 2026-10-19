@@ -1,7 +1,10 @@
 // Changed in elundqvist/gpui-kit from gpui-pre 0.3.3 as published to crates.io: FORK.md at the
 // crate's root lists the changes.
-use crate::{FontId, Pixels, SharedString, TextRun, TextSystem, px};
+use crate::{
+    FontId, FontRun, LineLayout, Pixels, SharedString, TextRun, TextSystem, WrapBoundary, px,
+};
 use collections::HashMap;
+use smallvec::SmallVec;
 use std::{borrow::Cow, iter, sync::Arc};
 
 /// Determines whether to truncate text from the start or end.
@@ -304,9 +307,9 @@ impl LineWrapper {
     ///
     /// Unlike `truncate_line` which treats the text as a flat width budget
     /// (`width * max_lines`), this method accounts for word-boundary wrapping:
-    /// it walks through characters once, tracking wrap boundaries and the
-    /// truncation point simultaneously. When text overflows on the last
-    /// allowed line, it truncates there and appends the affix.
+    /// it shapes the text and wraps it as it is drawn, and when it has more
+    /// rows than allowed, cuts the last allowed row where it and the affix
+    /// fit, and appends the affix.
     ///
     /// For `max_lines == 1`, this delegates to `truncate_line`.
     pub fn truncate_wrapped_line<'a>(
@@ -317,6 +320,40 @@ impl LineWrapper {
         truncation_affix: &str,
         runs: &'a [TextRun],
         truncate_from: TruncateFrom,
+    ) -> (SharedString, Cow<'a, [TextRun]>) {
+        let text_system = self.text_system.clone();
+        let font_size = self.font_size;
+        self.truncate_wrapped_line_shaped_by(
+            text,
+            wrap_width,
+            max_lines,
+            truncation_affix,
+            runs,
+            truncate_from,
+            &|text, font_runs| {
+                Arc::new(
+                    text_system
+                        .platform_text_system
+                        .layout_line(text, font_size, font_runs),
+                )
+            },
+        )
+    }
+
+    /// `truncate_wrapped_line`, its text shaped by `shape`, a text in the
+    /// fonts of `FontRun`s at this wrapper's size: the text element shapes
+    /// it through the window's line layout cache, as it shapes the text it
+    /// draws, so that a text measured again, in the same frame or the next,
+    /// is not shaped again (elundqvist/kvist#485).
+    pub(crate) fn truncate_wrapped_line_shaped_by<'a>(
+        &mut self,
+        text: SharedString,
+        wrap_width: Pixels,
+        max_lines: usize,
+        truncation_affix: &str,
+        runs: &'a [TextRun],
+        truncate_from: TruncateFrom,
+        shape: &dyn Fn(&str, &[FontRun]) -> Arc<LineLayout>,
     ) -> (SharedString, Cow<'a, [TextRun]>) {
         if max_lines <= 1 || truncate_from == TruncateFrom::Start {
             return self.truncate_line(
@@ -331,120 +368,185 @@ impl LineWrapper {
             return self.truncate_line(text, wrap_width, truncation_affix, runs, truncate_from);
         }
 
-        let affix_width: Pixels = truncation_affix
-            .chars()
-            .map(|c| self.width_for_char(c))
-            .sum();
-
-        let mut width = px(0.);
-        let mut line = 0usize;
-        let mut first_non_whitespace_ix = None;
-        let mut last_candidate_ix = 0usize;
-        let mut last_candidate_width = px(0.);
-        let mut last_wrap_ix = 0usize;
-        let mut prev_c = '\0';
-        let mut indent: Option<u32> = None;
-        let mut truncate_ix = 0usize;
-
-        for (ix, c) in text.char_indices() {
-            if c == '\n' {
-                if line >= max_lines - 1 && !text[ix + 1..].trim().is_empty() {
-                    // Newline on the last allowed line with real content
-                    // below. Truncate here.
-                    let truncated = text[..truncate_ix]
-                        .trim_end_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation());
-                    let result = SharedString::from(format!("{truncated}{truncation_affix}"));
-                    let mut runs = runs.to_vec();
-                    update_runs_after_truncation(
-                        &result,
-                        truncation_affix,
-                        &mut runs,
-                        TruncateFrom::End,
-                    );
-                    return (result, Cow::Owned(runs));
-                }
-
-                // Newline before the last line: it consumes a line.
-                line += 1;
-                width = px(0.);
-                first_non_whitespace_ix = None;
-                last_candidate_ix = 0;
-                last_candidate_width = px(0.);
-                last_wrap_ix = ix + 1;
-                prev_c = '\0';
-                indent = None;
-                truncate_ix = ix + 1;
+        // Changed in elundqvist/gpui-kit (elundqvist/kvist#485): the rows are
+        // the ones the text is shaped into as it is drawn, each paragraph
+        // shaped in its runs' fonts and wrapped by the window's own rule
+        // (`LineLayout::compute_wrap_boundaries`), and the last is cut where
+        // it ends with the affix in its width as shaped. Each character's width
+        // was its width shaped alone, and a character the font lacks falls
+        // back to a font by the script of the characters around it: a lone
+        // `。` came out half the width it is drawn at among Chinese, so the
+        // rows guessed for Chinese held more than the rows drawn, and the cut
+        // fell past the clamp, which cut the text mid-row with no affix. A
+        // paragraph is shaped only as far as the rows allowed reach
+        // (`shape_rows`), so that a long text clamped to two rows costs what
+        // two rows cost.
+        let mut rows_left = max_lines;
+        let mut paragraph_start = 0;
+        loop {
+            let paragraph_end = text[paragraph_start..]
+                .find('\n')
+                .map_or(text.len(), |ix| paragraph_start + ix);
+            let paragraph = &text[paragraph_start..paragraph_end];
+            let (layout, shaped, boundaries) = self.shape_rows(
+                paragraph,
+                paragraph_start,
+                runs,
+                wrap_width,
+                rows_left,
+                shape,
+            );
+            let whole = shaped == paragraph.len();
+            let rows = boundaries.len() + 1;
+            let last = paragraph_end == text.len();
+            if whole && rows < rows_left && !last {
+                // a newline before the last row: it ends a row
+                rows_left -= rows;
+                paragraph_start = paragraph_end + 1;
                 continue;
             }
-
-            let char_width = self.width_for_char(c);
-
-            if Self::is_word_char(c) {
-                if prev_c == ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = ix;
-                    last_candidate_width = width;
-                }
-            } else if c != ' ' && first_non_whitespace_ix.is_some() {
-                last_candidate_ix = ix;
-                last_candidate_width = width;
+            if whole && rows <= rows_left && (last || text[paragraph_end + 1..].trim().is_empty()) {
+                // Text fits within max_lines without truncation.
+                return (text, Cow::Borrowed(runs));
             }
-
-            if c != ' ' && first_non_whitespace_ix.is_none() {
-                first_non_whitespace_ix = Some(ix);
+            // The last row allowed is in this paragraph: it ends in the affix,
+            // cut where the two fit, a cluster at a time. A part shaped has
+            // rows past it, so its row ends where the next begins.
+            let glyphs: Vec<(usize, Pixels)> = layout
+                .runs
+                .iter()
+                .flat_map(|run| run.glyphs.iter())
+                .map(|glyph| (glyph.index, glyph.position.x))
+                .collect();
+            // each row's first glyph, `glyphs.len()` ending the last
+            let row_starts: Vec<usize> = iter::once(0)
+                .chain(boundaries.iter().map(|boundary| {
+                    layout.runs[..boundary.run_ix]
+                        .iter()
+                        .map(|run| run.glyphs.len())
+                        .sum::<usize>()
+                        + boundary.glyph_ix
+                }))
+                .chain(iter::once(glyphs.len()))
+                .collect();
+            let row = rows_left - 1;
+            let row_x = glyphs.get(row_starts[row]).map_or(px(0.), |(_, x)| *x);
+            let mut cuts: Vec<(usize, Pixels)> = Vec::new();
+            for k in row_starts[row]..row_starts[row + 1] {
+                let (index, x) = glyphs[k];
+                if cuts.last().is_none_or(|(at, _)| *at < index) {
+                    cuts.push((index, x - row_x));
+                }
             }
-
-            width += char_width;
-
-            if line < max_lines - 1 {
-                // Before the last line: replicate wrap_line's boundary logic.
-                if width > wrap_width && ix > last_wrap_ix {
-                    if let (None, Some(first_nw)) = (indent, first_non_whitespace_ix) {
-                        indent = Some(Self::MAX_INDENT.min((first_nw - last_wrap_ix) as u32));
-                    }
-
-                    if last_candidate_ix > last_wrap_ix {
-                        last_wrap_ix = last_candidate_ix;
-                        width -= last_candidate_width;
-                        last_candidate_ix = 0;
-                    } else {
-                        last_wrap_ix = ix;
-                        width = char_width;
-                    }
-
-                    if let Some(ind) = indent {
-                        width += self.width_for_char(' ') * ind as f32;
-                    }
-
-                    line += 1;
-                    truncate_ix = last_wrap_ix;
-                }
-            } else {
-                // On the last line: track the furthest point where the affix
-                // still fits, and stop as soon as the line overflows.
-                if width + affix_width <= wrap_width {
-                    truncate_ix = ix + c.len_utf8();
-                }
-
-                if width > wrap_width {
-                    let truncated = text[..truncate_ix]
-                        .trim_end_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation());
-                    let result = SharedString::from(format!("{truncated}{truncation_affix}"));
-                    let mut runs = runs.to_vec();
-                    update_runs_after_truncation(
-                        &result,
-                        truncation_affix,
-                        &mut runs,
-                        TruncateFrom::End,
-                    );
+            let row_end = glyphs.get(row_starts[row + 1]);
+            cuts.push((
+                row_end.map_or(shaped, |(index, _)| *index),
+                row_end.map_or(layout.width, |(_, x)| *x) - row_x,
+            ));
+            let affix_width = self.shape(truncation_affix, &[], 0, shape).width;
+            let row_start = paragraph_start + cuts[0].0;
+            let mut fits = cuts
+                .iter()
+                .rposition(|(_, width)| *width + affix_width <= wrap_width)
+                .unwrap_or(0);
+            loop {
+                let truncated = text[..paragraph_start + cuts[fits].0]
+                    .trim_end_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation());
+                let result = SharedString::from(format!("{truncated}{truncation_affix}"));
+                let mut runs = runs.to_vec();
+                update_runs_after_truncation(
+                    &result,
+                    truncation_affix,
+                    &mut runs,
+                    TruncateFrom::End,
+                );
+                // the row as it is drawn, the affix in the font it takes
+                let drawn = row_start.min(truncated.len());
+                if fits == 0
+                    || self.shape(&result[drawn..], &runs, drawn, shape).width <= wrap_width
+                {
                     return (result, Cow::Owned(runs));
                 }
+                fits -= 1;
             }
-
-            prev_c = c;
         }
+    }
 
-        // Text fits within max_lines without truncation.
-        (text, Cow::Borrowed(runs))
+    /// `paragraph`, the part from `start` of a text in `runs`, shaped as far
+    /// as the window wraps it into two rows more than the `rows` allowed, the
+    /// last allowed ending where a whole row begins, or whole where it has
+    /// no more: its layout, how long the part shaped is, and where its rows
+    /// wrap.
+    ///
+    /// Added in elundqvist/gpui-kit (elundqvist/kvist#485): the paragraph was
+    /// shaped whole, every frame, so a note of 300 KB clamped to two rows
+    /// took Kvist 28 s a frame. The part first shaped is as long as three
+    /// rows past those allowed could be, were each character as narrow as a
+    /// space at its narrowest, 0.15 em, and four bytes long, and is doubled
+    /// where it wraps into too few, characters drawn as none, an emoji
+    /// joined from several. A part no wider than a row is one, its glyphs
+    /// not walked for where it wraps, as a text measured at its own width
+    /// is, every frame.
+    fn shape_rows(
+        &self,
+        paragraph: &str,
+        start: usize,
+        runs: &[TextRun],
+        wrap_width: Pixels,
+        rows: usize,
+        shape: &dyn Fn(&str, &[FontRun]) -> Arc<LineLayout>,
+    ) -> (Arc<LineLayout>, usize, SmallVec<[WrapBoundary; 1]>) {
+        let chars = (wrap_width * (rows + 3) as f32 / (self.font_size * 0.15)).ceil() as usize;
+        let mut len = match chars.saturating_mul(4) {
+            bytes if bytes >= paragraph.len() => paragraph.len(),
+            bytes => paragraph.floor_char_boundary(bytes),
+        };
+        loop {
+            let part = &paragraph[..len];
+            let layout = self.shape(part, runs, start, shape);
+            let boundaries = if layout.width <= wrap_width {
+                SmallVec::new()
+            } else {
+                layout.compute_wrap_boundaries(part, wrap_width, None)
+            };
+            if len == paragraph.len() || boundaries.len() > rows {
+                return (layout, len, boundaries);
+            }
+            len = paragraph.ceil_char_boundary((len * 2).max(len + 1).min(paragraph.len()));
+        }
+    }
+
+    /// `text`, the part from `start` of a text in `runs`, shaped by `shape`
+    /// as a window shapes it to draw it: in the runs' fonts, and this
+    /// wrapper's where they leave off.
+    fn shape(
+        &self,
+        text: &str,
+        runs: &[TextRun],
+        start: usize,
+        shape: &dyn Fn(&str, &[FontRun]) -> Arc<LineLayout>,
+    ) -> Arc<LineLayout> {
+        let end = start + text.len();
+        let mut font_runs: Vec<FontRun> = Vec::new();
+        let mut push = |font_id: FontId, len: usize| match font_runs.last_mut() {
+            Some(last) if last.font_id == font_id => last.len += len,
+            _ => font_runs.push(FontRun { len, font_id }),
+        };
+        let mut run_start = 0;
+        let mut covered = start;
+        for run in runs {
+            let run_end = run_start + run.len;
+            let (from, to) = (run_start.max(start), run_end.min(end));
+            if from < to {
+                push(self.text_system.resolve_font(&run.font), to - from);
+                covered = to;
+            }
+            run_start = run_end;
+        }
+        if covered < end {
+            push(self.font_id, end - covered);
+        }
+        shape(text, &font_runs)
     }
 
     /// Any character in this list should be treated as a word character,
@@ -1342,6 +1444,209 @@ mod tests {
             "Truncated text '{}' should end with ellipsis",
             truncated
         );
+    }
+
+    /// A text system that draws a `。` among Chinese twice as wide as on its own,
+    /// as cosmic-text draws it in Kvist: a character the font lacks falls back to
+    /// a font by the script of the characters around it, and a lone `。`, of no
+    /// script, to one that has it half-width. Each character else is 10 px wide.
+    /// It counts the bytes it shapes.
+    #[derive(Default)]
+    struct FallbackTextSystem {
+        shaped: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::PlatformTextSystem for FallbackTextSystem {
+        fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> anyhow::Result<()> {
+            crate::NoopTextSystem.add_fonts(fonts)
+        }
+        fn all_font_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn font_id(&self, descriptor: &Font) -> anyhow::Result<FontId> {
+            crate::NoopTextSystem.font_id(descriptor)
+        }
+        fn font_metrics(&self, font_id: FontId) -> crate::FontMetrics {
+            crate::NoopTextSystem.font_metrics(font_id)
+        }
+        fn typographic_bounds(
+            &self,
+            font_id: FontId,
+            glyph_id: crate::GlyphId,
+        ) -> anyhow::Result<crate::Bounds<f32>> {
+            crate::NoopTextSystem.typographic_bounds(font_id, glyph_id)
+        }
+        fn advance(
+            &self,
+            font_id: FontId,
+            glyph_id: crate::GlyphId,
+        ) -> anyhow::Result<crate::Size<f32>> {
+            crate::NoopTextSystem.advance(font_id, glyph_id)
+        }
+        fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<crate::GlyphId> {
+            crate::NoopTextSystem.glyph_for_char(font_id, ch)
+        }
+        fn glyph_raster_bounds(
+            &self,
+            params: &crate::RenderGlyphParams,
+        ) -> anyhow::Result<crate::Bounds<crate::DevicePixels>> {
+            crate::NoopTextSystem.glyph_raster_bounds(params)
+        }
+        fn rasterize_glyph(
+            &self,
+            params: &crate::RenderGlyphParams,
+            raster_bounds: crate::Bounds<crate::DevicePixels>,
+        ) -> anyhow::Result<(crate::Size<crate::DevicePixels>, Vec<u8>)> {
+            crate::NoopTextSystem.rasterize_glyph(params, raster_bounds)
+        }
+        fn layout_line(&self, text: &str, font_size: Pixels, _runs: &[FontRun]) -> LineLayout {
+            self.shaped
+                .fetch_add(text.len(), std::sync::atomic::Ordering::Relaxed);
+            let among_chinese = text.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c));
+            let mut x = px(0.);
+            let glyphs = text
+                .char_indices()
+                .map(|(index, c)| {
+                    let glyph = crate::ShapedGlyph {
+                        id: crate::GlyphId(c as u32),
+                        position: crate::point(x, px(0.)),
+                        index,
+                        is_emoji: false,
+                    };
+                    x += if c == '。' && !among_chinese {
+                        px(5.)
+                    } else {
+                        px(10.)
+                    };
+                    glyph
+                })
+                .collect();
+            LineLayout {
+                font_size,
+                width: x,
+                ascent: px(10.),
+                descent: px(-3.),
+                runs: vec![crate::ShapedRun {
+                    font_id: FontId(0),
+                    glyphs,
+                }],
+                len: text.len(),
+            }
+        }
+        fn recommended_rendering_mode(
+            &self,
+            font_id: FontId,
+            font_size: Pixels,
+        ) -> crate::TextRenderingMode {
+            crate::NoopTextSystem.recommended_rendering_mode(font_id, font_size)
+        }
+    }
+
+    /// Chinese clamped to two rows with an ellipsis is cut on the rows it is
+    /// drawn in: each character's width on its own had a `。` half its drawn
+    /// width, so the rows guessed held more than the rows drawn, and the cut
+    /// fell on a third row, which the clamp hid with its ellipsis
+    /// (elundqvist/kvist#485).
+    #[test]
+    fn test_multiline_truncation_cuts_chinese_on_the_rows_drawn() {
+        let text_system = Arc::new(TextSystem::new(Arc::new(FallbackTextSystem::default())));
+        let font_id = text_system.resolve_font(&font("Dummy"));
+        let mut wrapper = LineWrapper::new(font_id, px(16.), text_system.clone());
+        // eight characters a row, three rows drawn
+        let text = "是的。".repeat(8);
+        let wrap_width = px(80.);
+        let runs = generate_test_runs(&[text.len()]);
+        let (truncated, truncated_runs) = wrapper.truncate_wrapped_line(
+            text.into(),
+            wrap_width,
+            2,
+            "\u{2026}",
+            &runs,
+            TruncateFrom::End,
+        );
+
+        // the second row whole but its last character, given way to the ellipsis
+        assert_eq!(truncated.as_ref(), "是的。是的。是的。是的。是的。\u{2026}");
+        assert_eq!(truncated_runs[0].len, truncated.len());
+        // and drawn in two rows
+        let drawn = text_system.platform_text_system.layout_line(
+            &truncated,
+            px(16.),
+            &[FontRun {
+                len: truncated.len(),
+                font_id,
+            }],
+        );
+        assert_eq!(
+            drawn
+                .compute_wrap_boundaries(&truncated, wrap_width, None)
+                .len(),
+            1,
+            "'{truncated}' is drawn in two rows"
+        );
+
+        // where it fits, it is left whole
+        let text = "是的。".repeat(5);
+        let runs = generate_test_runs(&[text.len()]);
+        let (whole, _) = wrapper.truncate_wrapped_line(
+            text.clone().into(),
+            wrap_width,
+            2,
+            "\u{2026}",
+            &runs,
+            TruncateFrom::End,
+        );
+        assert_eq!(whole.as_ref(), text);
+    }
+
+    /// A long text clamped to two rows is shaped as far as two rows reach, not
+    /// whole: the cut shaped every paragraph whole, every frame, and a note
+    /// of 300 KB clamped to two rows took Kvist 28 s a frame
+    /// (elundqvist/kvist#485). Where the guess from each character's width
+    /// is short of the rows, it is made longer, and the cut is the one the
+    /// whole text gets.
+    #[test]
+    fn test_multiline_truncation_shapes_only_the_rows_it_cuts() {
+        let platform = Arc::new(FallbackTextSystem::default());
+        let text_system = Arc::new(TextSystem::new(platform.clone()));
+        let font_id = text_system.resolve_font(&font("Dummy"));
+        let mut wrapper = LineWrapper::new(font_id, px(16.), text_system.clone());
+        let wrap_width = px(80.);
+        let cut = |wrapper: &mut LineWrapper, text: &str| {
+            let runs = generate_test_runs(&[text.len()]);
+            let (cut, _) = wrapper.truncate_wrapped_line(
+                text.to_string().into(),
+                wrap_width,
+                2,
+                "\u{2026}",
+                &runs,
+                TruncateFrom::End,
+            );
+            cut.to_string()
+        };
+        let shaped = || platform.shaped.load(std::sync::atomic::Ordering::Relaxed);
+
+        // some 100 KB of Chinese, eight characters a row
+        let long = "是的。".repeat(12_000);
+        let before = shaped();
+        let long_cut = cut(&mut wrapper, &long);
+        assert_eq!(long_cut, "是的。是的。是的。是的。是的。\u{2026}");
+        assert!(
+            shaped() - before < 1_000,
+            "{} bytes shaped for a cut of two rows",
+            shaped() - before
+        );
+        // as the cut of a text of three rows
+        assert_eq!(cut(&mut wrapper, &"是的。".repeat(8)), long_cut);
+
+        // and of paragraphs: a long one after a row of its own
+        let before = shaped();
+        let paragraphs = format!("是的。\n{long}");
+        assert_eq!(
+            cut(&mut wrapper, &paragraphs),
+            "是的。\n是的。是的。是\u{2026}"
+        );
+        assert!(shaped() - before < 1_000);
     }
 
     #[test]

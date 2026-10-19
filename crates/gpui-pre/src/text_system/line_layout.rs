@@ -200,7 +200,9 @@ impl LineLayout {
         (left, right)
     }
 
-    fn compute_wrap_boundaries(
+    // Changed in elundqvist/gpui-kit (elundqvist/kvist#485): crate-visible, so that
+    // `LineWrapper::truncate_wrapped_line` cuts text on the rows it is drawn in
+    pub(crate) fn compute_wrap_boundaries(
         &self,
         text: &str,
         wrap_width: Pixels,

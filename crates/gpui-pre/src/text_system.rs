@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre 0.3.3 as published to crates.io: FORK.md at the
+// crate's root lists the changes.
 mod font_fallbacks;
 mod font_features;
 mod line;
@@ -707,6 +709,21 @@ impl WindowTextSystem {
         self.font_runs_pool.lock().push(font_runs);
 
         layout
+    }
+
+    /// A line of text shaped in the fonts of `runs` as they are, through the
+    /// window's line layout cache: the cut of a text element's `line_clamp`
+    /// with an ellipsis shapes by it, as it measures the text every frame.
+    ///
+    /// Added in elundqvist/gpui-kit (elundqvist/kvist#485).
+    pub(crate) fn layout_font_runs(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+    ) -> Arc<LineLayout> {
+        self.line_layout_cache
+            .layout_line(text, font_size, runs, None)
     }
 
     /// Returns the shaped layout width of for the given character, in the given font and size.
