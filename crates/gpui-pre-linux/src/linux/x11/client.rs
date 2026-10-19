@@ -989,6 +989,9 @@ impl X11Client {
 
                 let xim_filtered = ximc.filter_event(&event, &mut xim_handler);
                 let xim_callback_event = xim_handler.last_callback_event.take();
+                if let Ok(true) = xim_filtered {
+                    xim_handler.heard();
+                }
 
                 let mut state = self.0.borrow_mut();
                 state.restore_xim(ximc, xim_handler);
@@ -1011,14 +1014,34 @@ impl X11Client {
                     }
                     Err(err) => {
                         // this might happen when xim server crashes on one of the events
-                        // we do lose 1-2 keys when crash happens since there is no reliable way to get that info
                         // luckily, x11 sends us window not found error when xim server crashes upon further key press
                         // hence we fall back to handle_event
+                        //
+                        // Changed in elundqvist/gpui-kit (elundqvist/kvist#455): a composition
+                        // under way is kept as text where it is, where the next key typed
+                        // replaced it, and the keys sent to a server that has gone since it
+                        // last said anything are handled as if there were none, where the
+                        // first of them was lost.
                         log::error!("XIMClientError: {}", err);
                         let mut state = self.0.borrow_mut();
-                        state.take_xim();
+                        let composing = std::mem::take(&mut state.composing);
+                        let xim = state.take_xim();
                         drop(state);
+                        let mut keys_lost = Vec::new();
+                        if let Some((_, mut xim_handler)) = xim {
+                            if matches!(err, xim::ClientError::NoXimServer) {
+                                keys_lost = xim_handler.take_keys_unanswered();
+                            }
+                            if composing {
+                                if let Some(window) = self.get_window(xim_handler.window) {
+                                    window.handle_ime_unmark();
+                                }
+                            }
+                        }
                         self.handle_event(event);
+                        for key in keys_lost {
+                            self.handle_event(key);
+                        }
                     }
                 }
             }
@@ -1617,9 +1640,21 @@ impl X11Client {
                 );
 
                 if state.composing && state.ximc.is_some() {
+                    // Changed in elundqvist/gpui-kit (elundqvist/kvist#455): the
+                    // composition is kept where it is, in the window it is in, and
+                    // what the input method commits for it after the reset is
+                    // dropped (`keep_composition`), where the commit went in again
+                    // where the click put the caret
+                    let composed = state.xim_handler.as_mut().map(|xim_handler| {
+                        xim_handler.keep_composition();
+                        xim_handler.window
+                    });
                     drop(state);
                     self.reset_ime();
-                    window.handle_ime_unmark();
+                    composed
+                        .and_then(|composed| self.get_window(composed))
+                        .unwrap_or_else(|| window.clone())
+                        .handle_ime_unmark();
                     state = self.0.borrow_mut();
                 } else if let Some(text) = state.pre_edit_text.take() {
                     if let Some(compose_state) = state.compose_state.as_mut() {
@@ -1898,22 +1933,24 @@ impl X11Client {
     }
 
     fn xim_handle_event(&self, event: Event) -> Option<()> {
-        match event {
-            Event::KeyPress(event) | Event::KeyRelease(event) => {
+        match &event {
+            Event::KeyPress(key) | Event::KeyRelease(key) => {
+                let key = *key;
                 let mut state = self.0.borrow_mut();
                 state.pre_key_char_down = Some(keystroke_from_xkb(
                     &state.xkb,
                     state.modifiers,
-                    event.detail.into(),
+                    key.detail.into(),
                 ));
                 let (mut ximc, mut xim_handler) = state.take_xim()?;
                 drop(state);
-                xim_handler.window = event.event;
+                xim_handler.key_sent(&event);
+                xim_handler.window = key.event;
                 ximc.forward_event(
                     xim_handler.im_id,
                     xim_handler.ic_id,
                     xim::ForwardEventFlag::empty(),
-                    &event,
+                    &key,
                 )
                 .context("X11: Failed to forward XIM event")
                 .log_err();
@@ -1921,7 +1958,7 @@ impl X11Client {
                 state.restore_xim(ximc, xim_handler);
                 drop(state);
             }
-            event => {
+            _ => {
                 self.handle_event(event);
             }
         }

@@ -3519,9 +3519,21 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
             .map(|range| self.range_to_utf16(&range.into()))
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.ime_marked_range = None;
+    /// End the composition, keeping what it marked as text: an edit, as a
+    /// commit is, that says so with [`InputEvent::Change`]. Marking says
+    /// nothing, so a composition a click or Escape ended was in the field
+    /// and nowhere else, and an editor that saves as it is typed in,
+    /// Kvist's, said "Saved" of a file without it until the next key
+    /// (elundqvist/kvist#455).
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let kept = self.ime_marked_range.take().is_some_and(|range| !range.is_empty());
         self.undo_manager.commit_transaction();
+        if kept {
+            self.update_search(cx);
+            if self.emit_events {
+                cx.emit(InputEvent::Change);
+            }
+        }
     }
 
     /// Replace text in range.
@@ -8003,6 +8015,63 @@ mod tests {
                 assert_eq!(state.selected_range(), 9..9);
             });
         });
+    }
+
+    /// A composition whose mark ends with its text kept, as a click or
+    /// Escape ends one, is an edit as a commit is, and says so: marking
+    /// says nothing, and Kvist's editor, which saves as it is typed in, said
+    /// "Saved" of a file without the text (elundqvist/kvist#455). An end
+    /// with nothing marked is none, nor is the one macOS sends after a
+    /// commit, which said so itself.
+    #[gpui::test]
+    fn test_a_composition_kept_as_its_mark_ends_is_a_change(cx: &mut TestAppContext) {
+        let input_view = InputView::build(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let changes = std::rc::Rc::new(std::cell::Cell::new(0));
+        cx.update(|_, cx| {
+            let changes = changes.clone();
+            cx.subscribe(&input, move |_, event: &InputEvent, _| {
+                if matches!(event, InputEvent::Change) {
+                    changes.set(changes.get() + 1);
+                }
+            })
+            .detach();
+        });
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("a", window, cx);
+                state.set_selected_range(1..1, cx);
+            })
+        });
+        let before = changes.get();
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.replace_and_mark_text_in_range(None, "日", None, window, cx);
+                state.replace_and_mark_text_in_range(None, "明", None, window, cx);
+            })
+        });
+        assert_eq!(changes.get(), before, "a mark is no change");
+        cx.update(|window, cx| input.update(cx, |state, cx| state.unmark_text(window, cx)));
+        assert_eq!(changes.get(), before + 1, "the text kept is");
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                assert_eq!(state.value(), "a明");
+                state.unmark_text(window, cx);
+            })
+        });
+        assert_eq!(changes.get(), before + 1, "an end with nothing marked is none");
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.replace_and_mark_text_in_range(None, "日", None, window, cx);
+                state.replace_text_in_range(None, "日", window, cx);
+                state.unmark_text(window, cx);
+                assert_eq!(state.value(), "a明日");
+            })
+        });
+        assert_eq!(changes.get(), before + 2, "a commit is one change, its end none");
     }
 
     #[gpui::test]

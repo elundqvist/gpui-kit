@@ -160,6 +160,21 @@ asks (section 4(b)); each says so at its top:
   setting it. A test of which windows are asked about; the requests
   themselves need gpui's own windows on a connection, and were checked
   under Kvist's harness on Xvfb.
+- `src/linux/x11/client.rs` and `src/linux/x11/xim_handler.rs`: a click
+  while an input method composes keeps the composition as text where it
+  was drawn, in the window it is in, and drops what the input method
+  commits for it before the next key goes to it (`keep_composition`,
+  elundqvist/kvist#455): ibus answers the reset the click asks for with
+  an empty preedit and a commit of the composition, which went in again
+  where the click had put the caret, so a 明 typed and a click gave two.
+  Chromium's fields, VS Code's among them, keep a composition a click
+  ends so and pass over that commit. A composition under way as the
+  input method's server goes is kept as text likewise, where the next
+  key typed replaced it, and the keys sent to the server since it last
+  said anything, which went to its window after it was destroyed, are
+  handled as if there were no input method, where the first was lost.
+  The fork's gpui-base input takes the end of a mark with its text kept
+  as an edit, as a commit is. Tests of what the handler hands on.
 - `Cargo.toml`: an `[[example]]` entry for `examples/xdnd_source.rs`,
   which the fork adds (the published manifest names its targets and
   has no examples). And zed-xim, the XIM client, is taken by path from
