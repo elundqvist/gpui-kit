@@ -1268,6 +1268,13 @@ pub struct Window {
     pub(crate) input_holds: usize,
     /// The keyboard input that came while it was held, in the order it came.
     pub(crate) held_input: std::collections::VecDeque<HeldInput>,
+    /// What each hold that looks at the keys pressed while it is out
+    /// ([`Window::hold_input_with_keys`]) looks at them with.
+    held_key_downs: Vec<HeldKeys>,
+    /// The number the next hold is told apart by.
+    next_input_hold: usize,
+    /// The key down being dispatched, which asks for a hold taken meanwhile.
+    key_asking: Option<Keystroke>,
     prompt: Option<RenderablePromptHandle>,
     pub(crate) client_inset: Option<Pixels>,
     /// The hitbox that has captured the pointer, if any.
@@ -2094,6 +2101,9 @@ impl Window {
             pending_input_observers: SubscriberSet::new(),
             input_holds: 0,
             held_input: Default::default(),
+            held_key_downs: Vec::new(),
+            next_input_hold: 0,
+            key_asking: None,
             prompt: None,
             client_inset: None,
             image_cache_stack: Vec::new(),
@@ -2144,6 +2154,8 @@ pub struct DispatchEventResult {
 #[must_use = "the window's input waits until the hold is released"]
 pub struct InputHold {
     window: AnyWindowHandle,
+    /// Tells this hold apart from the window's others.
+    id: usize,
     cx: Option<AsyncApp>,
 }
 
@@ -2152,16 +2164,54 @@ impl Drop for InputHold {
         let Some(mut cx) = self.cx.take() else {
             return;
         };
-        let window = self.window;
+        let (window, id) = (self.window, self.id);
         cx.foreground_executor()
             .clone()
             .spawn(async move {
                 window
-                    .update(&mut cx, |_, window, cx| window.end_input_hold(cx))
+                    .update(&mut cx, |_, window, cx| window.end_input_hold(id, cx))
                     .ok();
             })
             .detach();
     }
+}
+
+/// What a hold from [`Window::hold_input_with_keys`] looks at the keys
+/// pressed while it is out with.
+type HeldKeyDown = Rc<RefCell<dyn FnMut(&KeyDownEvent, &mut Window, &mut App) -> bool>>;
+
+/// A hold from [`Window::hold_input_with_keys`]: what it looks at the keys
+/// with, and the key that asked for it, if a key did.
+struct HeldKeys {
+    hold: usize,
+    asked_by: Option<Keystroke>,
+    key_down: HeldKeyDown,
+}
+
+/// Drop the key downs in `held` like one of `like`, the same key with the
+/// same modifiers, and the key up that follows each.
+fn drop_held_keys_like(held: &mut std::collections::VecDeque<HeldInput>, like: &[Keystroke]) {
+    let mut ups: Vec<String> = Vec::new();
+    held.retain(|input| match input {
+        HeldInput::Event(PlatformInput::KeyDown(key_down))
+            if like.iter().any(|key| {
+                key.key == key_down.keystroke.key && key.modifiers == key_down.keystroke.modifiers
+            }) =>
+        {
+            ups.push(key_down.keystroke.key.clone());
+            false
+        }
+        HeldInput::Event(PlatformInput::KeyUp(key_up)) => {
+            match ups.iter().position(|key| *key == key_up.keystroke.key) {
+                Some(up) => {
+                    ups.remove(up);
+                    false
+                }
+                None => true,
+            }
+        }
+        _ => true,
+    });
 }
 
 /// Input that came to a window while it was held (`Window::hold_input`).
@@ -5281,10 +5331,40 @@ impl Window {
     /// the last of them is released.
     pub fn hold_input(&mut self, cx: &App) -> InputHold {
         self.input_holds += 1;
+        self.next_input_hold += 1;
         InputHold {
             window: self.handle,
+            id: self.next_input_hold,
             cx: Some(cx.to_async()),
         }
+    }
+
+    /// Holds back the window's input as [`Window::hold_input`] does, and
+    /// hands each key pressed while the hold is out to `key_down` first,
+    /// as it comes: a key it takes, by giving back true, does not wait and
+    /// goes no further, and one it leaves waits with the rest. Changed in
+    /// elundqvist/gpui-kit (elundqvist/kvist#435): a paste that waits for
+    /// a program that does not answer is given up with Escape, where
+    /// nothing could reach the app until the read gave up four seconds
+    /// later. `key_down` may release the hold, which gives it up: the keys
+    /// like the one it took, and like the one being dispatched as the hold
+    /// was taken, that are held behind it are dropped with their key ups,
+    /// as pressed at the wait it gave up, where they came after it and
+    /// acted again, a second Escape closing the dialog that a paste was
+    /// asked for in, or a second Ctrl+V waiting again on the program that
+    /// did not answer. The hold most recently taken is asked first.
+    pub fn hold_input_with_keys(
+        &mut self,
+        cx: &App,
+        key_down: impl FnMut(&KeyDownEvent, &mut Window, &mut App) -> bool + 'static,
+    ) -> InputHold {
+        let hold = self.hold_input(cx);
+        self.held_key_downs.push(HeldKeys {
+            hold: hold.id,
+            asked_by: self.key_asking.clone(),
+            key_down: Rc::new(RefCell::new(key_down)),
+        });
+        hold
     }
 
     /// Releases a hold from [`Window::hold_input`]. When it was the last,
@@ -5295,7 +5375,7 @@ impl Window {
         if hold.window != self.handle || hold.cx.take().is_none() {
             return;
         }
-        self.end_input_hold(cx);
+        self.end_input_hold(hold.id, cx);
     }
 
     /// Whether the window's input is held ([`Window::hold_input`]).
@@ -5303,7 +5383,8 @@ impl Window {
         self.input_holds > 0
     }
 
-    fn end_input_hold(&mut self, cx: &mut App) {
+    fn end_input_hold(&mut self, id: usize, cx: &mut App) {
+        self.held_key_downs.retain(|held| held.hold != id);
         self.input_holds = self.input_holds.saturating_sub(1);
         if self.input_holds > 0 || self.held_input.is_empty() {
             return;
@@ -5330,6 +5411,37 @@ impl Window {
         }
         self.held_input.push_back(input);
         None
+    }
+
+    /// Whether a hold that looks at the keys pressed while it is out
+    /// ([`Window::hold_input_with_keys`]) takes `key_down`: the hold most
+    /// recently taken is asked first, and one already asking is not asked
+    /// again. One released as it takes the key is given up, and the keys
+    /// held behind it like that one, or like the key that asked for it, go
+    /// with it.
+    fn held_key_taken(&mut self, key_down: &KeyDownEvent, cx: &mut App) -> bool {
+        let asked: Vec<(usize, Option<Keystroke>, HeldKeyDown)> = self
+            .held_key_downs
+            .iter()
+            .rev()
+            .map(|held| (held.hold, held.asked_by.clone(), held.key_down.clone()))
+            .collect();
+        for (hold, asked_by, ask) in asked {
+            let taken = ask
+                .try_borrow_mut()
+                .is_ok_and(|mut ask| ask(key_down, self, cx));
+            if !taken {
+                continue;
+            }
+            if !self.held_key_downs.iter().any(|held| held.hold == hold) {
+                let like: Vec<Keystroke> = std::iter::once(key_down.keystroke.clone())
+                    .chain(asked_by)
+                    .collect();
+                drop_held_keys_like(&mut self.held_input, &like);
+            }
+            return true;
+        }
+        false
     }
 
     /// Whether `event` waits while the window's input is held: all of it
@@ -5448,6 +5560,15 @@ impl Window {
     /// Dispatch a mouse, keyboard, or touch event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+        if self.input_holds > 0
+            && let PlatformInput::KeyDown(key_down) = &event
+            && self.held_key_taken(key_down, cx)
+        {
+            return DispatchEventResult {
+                propagate: false,
+                default_prevented: true,
+            };
+        }
         let event = if self.waits_while_held(&event) {
             match self.hold_back(HeldInput::Event(event)) {
                 Some(HeldInput::Event(event)) => event,
@@ -5597,7 +5718,15 @@ impl Window {
         if let Some(any_mouse_event) = event.mouse_event() {
             self.dispatch_mouse_event(any_mouse_event, cx);
         } else if let Some(any_key_event) = event.keyboard_event() {
+            // a hold taken as a key down is dispatched was asked for by it
+            // (`Window::hold_input_with_keys`)
+            let asking = match &event {
+                PlatformInput::KeyDown(key_down) => Some(key_down.keystroke.clone()),
+                _ => None,
+            };
+            let asked = std::mem::replace(&mut self.key_asking, asking);
             self.dispatch_key_event(any_key_event, cx);
+            self.key_asking = asked;
         } else if let Some(touch_event) = event.touch_event() {
             self.dispatch_touch_event(touch_event, cx);
         }
@@ -8581,13 +8710,16 @@ mod held_input_tests {
 
     use crate::{
         self as gpui, App, Bounds, Context, EventEmitter, FocusHandle, InputHandler, InputHold,
-        InteractiveElement as _, IntoElement, KeyBinding, Modifiers, ModifiersChangedEvent,
-        MouseButton, MouseMoveEvent, ParentElement as _, Pixels, PlatformWindow as _, Point,
-        Render, Styled as _, TestAppContext, UTF16Selection, VisualContext as _, VisualTestContext,
-        Window, canvas, div, point, px,
+        InteractiveElement as _, IntoElement, KeyBinding, KeyUpEvent, Keystroke, Modifiers,
+        ModifiersChangedEvent, MouseButton, MouseMoveEvent, ParentElement as _, Pixels,
+        PlatformWindow as _, Point, Render, Styled as _, TestAppContext, UTF16Selection,
+        VisualContext as _, VisualTestContext, Window, canvas, div, point, px,
     };
 
-    actions!(held_input_test, [Mark, MarkAndHold, Announce]);
+    actions!(
+        held_input_test,
+        [Mark, MarkAndHold, Announce, HoldUntilSecondEscape, Escaped]
+    );
 
     /// What `Announce` emits; the view's subscriber writes `<heard>`.
     struct Announced;
@@ -8700,6 +8832,34 @@ mod held_input_tests {
                     this.log.borrow_mut().push("<announce>".to_string());
                     cx.emit(Announced);
                 }))
+                .on_action(cx.listener(|this, _: &HoldUntilSecondEscape, window, cx| {
+                    // as a paste whose read waits holds, given up with an
+                    // Escape once it has been shown, which the first is not
+                    this.log.borrow_mut().push("<hold>".to_string());
+                    let holds = this.holds.clone();
+                    let mut escapes = 0;
+                    let hold = window.hold_input_with_keys(cx, move |key_down, window, cx| {
+                        if key_down.keystroke.key != "escape" {
+                            return false;
+                        }
+                        escapes += 1;
+                        if escapes < 2 {
+                            return false;
+                        }
+                        if let Some(hold) = holds.borrow_mut().pop() {
+                            window.release_input(hold, cx);
+                        }
+                        true
+                    });
+                    this.holds.borrow_mut().push(hold);
+                }))
+                .on_action(cx.listener(|this, _: &Escaped, _, _| {
+                    this.log.borrow_mut().push("<escape>".to_string());
+                }))
+                .on_key_up(cx.listener(|this, key_up: &KeyUpEvent, _, _| {
+                    let up = format!("<up {}>", key_up.keystroke.key);
+                    this.log.borrow_mut().push(up);
+                }))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, _| this.log.borrow_mut().push("<down>".to_string())),
@@ -8727,6 +8887,8 @@ mod held_input_tests {
                 KeyBinding::new("ctrl-m", Mark, Some("Held")),
                 KeyBinding::new("ctrl-h", MarkAndHold, Some("Held")),
                 KeyBinding::new("ctrl-a", Announce, Some("Held")),
+                KeyBinding::new("ctrl-v", HoldUntilSecondEscape, Some("Held")),
+                KeyBinding::new("escape", Escaped, Some("Held")),
             ])
         });
         let log = Log::default();
@@ -8884,5 +9046,111 @@ mod held_input_tests {
         cx.update(|window, cx| window.release_input(hold, cx));
         cx.run_until_parked();
         assert_eq!(logged(&log), ["<move>", "a", "<down>", "<move>", "b"]);
+    }
+
+    /// A hold that looks at the keys pressed while it is out is handed
+    /// each as it comes: the one it takes, an Escape that gives up a paste
+    /// whose clipboard does not come, goes no further, and the ones it
+    /// leaves wait; released as it takes the key, it lets them go, and it
+    /// looks at no key once released (elundqvist/kvist#435).
+    #[gpui::test]
+    fn a_hold_that_looks_at_the_keys_takes_the_one_it_wants(cx: &mut TestAppContext) {
+        let (cx, log, holds) = held_input_view(cx);
+        let asked = Log::default();
+        let hold = cx.update(|window, cx| {
+            let asked = asked.clone();
+            let holds = holds.clone();
+            window.hold_input_with_keys(cx, move |key_down, window, cx| {
+                let key = key_down.keystroke.key.clone();
+                asked.borrow_mut().push(key.clone());
+                if key != "escape" {
+                    return false;
+                }
+                if let Some(hold) = holds.borrow_mut().pop() {
+                    window.release_input(hold, cx);
+                }
+                true
+            })
+        });
+        holds.borrow_mut().push(hold);
+        cx.simulate_keystrokes("a ctrl-m");
+        assert!(logged(&log).is_empty(), "the keys it leaves wait");
+        assert_eq!(logged(&asked), ["a", "m"]);
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, _| assert!(!window.input_held()));
+        assert_eq!(
+            logged(&log),
+            ["a", "<mark>"],
+            "the rest came once it let go"
+        );
+
+        cx.simulate_keystrokes("escape b");
+        assert_eq!(
+            logged(&asked),
+            ["a", "m", "escape"],
+            "released, it looks at no key"
+        );
+        assert_eq!(logged(&log), ["a", "<mark>", "<escape>", "b"]);
+    }
+
+    /// Under another hold, a hold that takes a key and lets itself go
+    /// leaves the input held by the other, which a key cannot let go.
+    #[gpui::test]
+    fn a_key_a_hold_takes_leaves_another_hold_holding(cx: &mut TestAppContext) {
+        let (cx, log, holds) = held_input_view(cx);
+        let outer = cx.update(|window, cx| window.hold_input(cx));
+        let inner = cx.update(|window, cx| {
+            let holds = holds.clone();
+            window.hold_input_with_keys(cx, move |key_down, window, cx| {
+                if key_down.keystroke.key != "escape" {
+                    return false;
+                }
+                if let Some(hold) = holds.borrow_mut().pop() {
+                    window.release_input(hold, cx);
+                }
+                true
+            })
+        });
+        holds.borrow_mut().push(inner);
+        cx.simulate_keystrokes("a escape b escape");
+        cx.run_until_parked();
+        assert!(logged(&log).is_empty(), "the outer hold still holds");
+        cx.update(|window, cx| window.release_input(outer, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            logged(&log),
+            ["a", "b", "<escape>"],
+            "the second Escape waited with them"
+        );
+    }
+
+    /// A hold released by the key it takes is given up, and the keys held
+    /// behind it like that one, or like the key that asked for it, are
+    /// dropped with their key ups: an Escape pressed before the wait could
+    /// be given up, which would close the dialog a paste was asked for in,
+    /// and a second Ctrl+V, which would wait again on a program that does
+    /// not answer (elundqvist/kvist#435). The rest come in order.
+    #[gpui::test]
+    fn a_hold_given_up_drops_the_like_keys_held_behind_it(cx: &mut TestAppContext) {
+        let (cx, log, _) = held_input_view(cx);
+        let up = |key: &str| KeyUpEvent {
+            keystroke: Keystroke::parse(key).unwrap(),
+        };
+        cx.simulate_keystrokes("ctrl-v");
+        assert_eq!(logged(&log), ["<hold>"]);
+        cx.simulate_keystrokes("escape");
+        cx.simulate_event(up("escape"));
+        cx.simulate_keystrokes("a ctrl-v");
+        cx.simulate_event(up("v"));
+        cx.simulate_event(up("a"));
+        cx.simulate_keystrokes("ctrl-m");
+        assert_eq!(logged(&log), ["<hold>"], "all of it waits");
+
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.update(|window, _| assert!(!window.input_held()));
+        assert_eq!(logged(&log), ["<hold>", "a", "<up a>", "<mark>"]);
     }
 }

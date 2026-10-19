@@ -67,15 +67,30 @@ impl PreparedValue {
 /// `Window::hold_input` (elundqvist/kvist#401), is handed in here:
 /// `hold` holds the window's input and gives back what releases it, and
 /// `release` is handed that once the paste is done; when the window has
-/// gone first, it is dropped instead.
+/// gone first, it is dropped instead. One whose window hands it the keys
+/// pressed while it holds (`Window::hold_input_with_keys`) is made with
+/// [`PasteInputHold::with_keys`], and a paste that has waited
+/// [`PASTE_WAIT_SHOWN_AFTER`] is then given up with Escape.
 #[derive(Clone)]
 pub struct PasteInputHold {
-    hold: Rc<dyn Fn(&mut Window, &mut App) -> Box<dyn std::any::Any>>,
+    hold: Rc<dyn Fn(&mut Window, &mut App, PasteKeyDown) -> Box<dyn std::any::Any>>,
     release: Rc<dyn Fn(Box<dyn std::any::Any>, &mut Window, &mut App)>,
     landing: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
 }
 
 impl gpui::Global for PasteInputHold {}
+
+/// What a paste that waits for the clipboard looks at the keys pressed
+/// meanwhile with ([`PasteInputHold::with_keys`]): it gives back whether
+/// it took the key, which then goes no further.
+pub type PasteKeyDown = Box<dyn FnMut(&KeyDownEvent, &mut Window, &mut App) -> bool>;
+
+/// How long a paste waits for the clipboard before its window says that
+/// its input waits ([`paste_waits`]) and Escape gives it up: a read of
+/// what another program holds takes some 70 ms under Kvist's harness, and
+/// the four seconds a read waits for an owner that does not answer went
+/// by with nothing to show for them (elundqvist/kvist#435).
+pub const PASTE_WAIT_SHOWN_AFTER: std::time::Duration = std::time::Duration::from_millis(300);
 
 impl PasteInputHold {
     /// A hold made of `hold`, which holds a window's input and gives back
@@ -85,8 +100,24 @@ impl PasteInputHold {
         hold: impl Fn(&mut Window, &mut App) -> H + 'static,
         release: impl Fn(H, &mut Window, &mut App) + 'static,
     ) -> Self {
+        Self::with_keys(move |window, cx, _| hold(window, cx), release)
+    }
+
+    /// A hold whose window hands the keys pressed while it holds to what
+    /// `hold` is handed, a [`PasteKeyDown`], before they wait, as
+    /// elundqvist/gpui-kit's `Window::hold_input_with_keys` does: a paste
+    /// that has waited [`PASTE_WAIT_SHOWN_AFTER`] takes an Escape, which
+    /// gives it up, its window's input let go at once, where it waited for
+    /// the four seconds a read gives an owner that does not answer
+    /// (elundqvist/kvist#435). An Escape before then waits with the rest,
+    /// and where the paste is given up the window drops it, and a paste
+    /// key pressed again, with the paste (`Window::hold_input_with_keys`).
+    pub fn with_keys<H: 'static>(
+        hold: impl Fn(&mut Window, &mut App, PasteKeyDown) -> H + 'static,
+        release: impl Fn(H, &mut Window, &mut App) + 'static,
+    ) -> Self {
         Self {
-            hold: Rc::new(move |window, cx| Box::new(hold(window, cx))),
+            hold: Rc::new(move |window, cx, keys| Box::new(hold(window, cx, keys))),
             release: Rc::new(move |held, window, cx| {
                 // what `hold` gave back, an `H`, and nothing else
                 if let Ok(held) = held.downcast::<H>() {
@@ -144,7 +175,9 @@ pub fn read_clipboard_for_paste<V: 'static>(
 
 /// Hand `paste` what `read` gives: at once when it has it, as for the
 /// app's own copy, and otherwise once it has come, the window's input held
-/// back until then.
+/// back until then. One that has waited [`PASTE_WAIT_SHOWN_AFTER`] is
+/// shown ([`paste_waits`]), and an Escape then gives it up, where the hold
+/// hands it the keys ([`PasteInputHold::with_keys`]).
 fn paste_when_read<V: 'static>(
     view: &mut V,
     mut read: gpui::Task<Result<Option<ClipboardItem>, gpui::ClipboardReadError>>,
@@ -157,20 +190,113 @@ fn paste_when_read<V: 'static>(
         paste(view, read.ok().flatten(), window, cx);
         return;
     }
-    let held = (hold.hold)(window, cx);
+    let wait = Rc::new(PasteWait {
+        held: std::cell::RefCell::new(None),
+        shown: Cell::new(false),
+        release: hold.release.clone(),
+    });
+    let escape: PasteKeyDown = Box::new({
+        let wait = wait.clone();
+        move |key_down, window, cx| {
+            let keystroke = &key_down.keystroke;
+            keystroke.key == "escape"
+                && !keystroke.modifiers.modified()
+                && wait.shown.get()
+                && wait.end(window, cx)
+        }
+    });
+    let held = (hold.hold)(window, cx, escape);
+    *wait.held.borrow_mut() = Some(held);
+    window
+        .spawn(cx, {
+            let wait = wait.clone();
+            async move |cx| {
+                cx.background_executor().timer(PASTE_WAIT_SHOWN_AFTER).await;
+                cx.update(|window, cx| wait.show(window, cx)).ok();
+            }
+        })
+        .detach();
     cx.spawn_in(window, async move |view, cx| {
         let item = read.await.ok().flatten();
         cx.update(|window, cx| {
+            // given up with Escape: the input has gone on without it
+            if !wait.waiting() {
+                return;
+            }
             if let Some(landing) = &hold.landing {
                 landing(window, cx);
             }
             view.update(cx, |view, cx| paste(view, item, window, cx))
                 .ok();
-            (hold.release)(held, window, cx);
+            wait.end(window, cx);
         })
         .ok();
     })
     .detach();
+}
+
+/// A paste waiting for the clipboard: what holds its window's input, until
+/// it lands or is given up, and whether its window says that it waits.
+struct PasteWait {
+    held: std::cell::RefCell<Option<Box<dyn std::any::Any>>>,
+    shown: Cell<bool>,
+    release: Rc<dyn Fn(Box<dyn std::any::Any>, &mut Window, &mut App)>,
+}
+
+/// The windows that say a paste waits in them ([`paste_waits`]), with how
+/// many do.
+#[derive(Default)]
+struct PasteWaitsShown(std::collections::HashMap<gpui::WindowId, usize>);
+
+impl gpui::Global for PasteWaitsShown {}
+
+impl PasteWait {
+    fn waiting(&self) -> bool {
+        self.held.borrow().is_some()
+    }
+
+    /// It has waited long enough for its window to say so.
+    fn show(&self, window: &mut Window, cx: &mut App) {
+        if !self.waiting() || self.shown.replace(true) {
+            return;
+        }
+        let id = window.window_handle().window_id();
+        *cx.default_global::<PasteWaitsShown>()
+            .0
+            .entry(id)
+            .or_default() += 1;
+        window.refresh();
+    }
+
+    /// It has landed or been given up: its window's input goes on. Whether
+    /// it was still waiting.
+    fn end(&self, window: &mut Window, cx: &mut App) -> bool {
+        let Some(held) = self.held.borrow_mut().take() else {
+            return false;
+        };
+        if self.shown.get() {
+            let id = window.window_handle().window_id();
+            let shown = &mut cx.default_global::<PasteWaitsShown>().0;
+            if let Some(count) = shown.get_mut(&id) {
+                *count -= 1;
+                if *count == 0 {
+                    shown.remove(&id);
+                }
+            }
+            window.refresh();
+        }
+        (self.release)(held, window, cx);
+        true
+    }
+}
+
+/// Whether a paste in `window` has waited for the clipboard long enough,
+/// [`PASTE_WAIT_SHOWN_AFTER`], for the window to say that its input waits,
+/// and that Escape gives the paste up (elundqvist/kvist#435). The window
+/// is drawn again as that begins and as it ends.
+pub fn paste_waits(window: &Window, cx: &App) -> bool {
+    cx.try_global::<PasteWaitsShown>()
+        .is_some_and(|shown| shown.0.contains_key(&window.window_handle().window_id()))
 }
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
@@ -4204,6 +4330,144 @@ mod tests {
         cx.run_until_parked();
         cx.update(|_, cx| assert_eq!(input.read(cx).value(), "one "));
         assert_eq!(*log.borrow(), ["hold", "landing", "release"]);
+    }
+
+    /// What a paste that waits looks at the keys pressed meanwhile with,
+    /// kept by [`keyed_hold`] to press them.
+    type Keys = Rc<std::cell::RefCell<Option<PasteKeyDown>>>;
+
+    /// A hold that writes down when it holds the input and when it gives it
+    /// back, as `recording_hold` does, and keeps what the paste looks at
+    /// the keys with in `keys`.
+    fn keyed_hold(log: &Rc<std::cell::RefCell<Vec<&'static str>>>, keys: &Keys) -> PasteInputHold {
+        struct Held;
+        let (held, released, landed, keys) = (log.clone(), log.clone(), log.clone(), keys.clone());
+        PasteInputHold::with_keys(
+            move |_, _, key_down| {
+                held.borrow_mut().push("hold");
+                *keys.borrow_mut() = Some(key_down);
+                Held
+            },
+            move |Held, _, _| released.borrow_mut().push("release"),
+        )
+        .on_landing(move |_, _| landed.borrow_mut().push("landing"))
+    }
+
+    /// Press `keystroke` while the paste waits: whether it took the key.
+    fn press(cx: &mut VisualTestContext, keys: &Keys, keystroke: &str) -> bool {
+        let key_down = KeyDownEvent {
+            keystroke: gpui::Keystroke::parse(keystroke).unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        };
+        cx.update(|window, cx| {
+            let mut keys = keys.borrow_mut();
+            let key_down_with = keys.as_mut().expect("the paste waits");
+            key_down_with(&key_down, window, cx)
+        })
+    }
+
+    /// A paste whose clipboard has not come in `PASTE_WAIT_SHOWN_AFTER` is
+    /// shown as waiting, and an Escape then gives it up: the input is let
+    /// go at once and the text stays as it was when the read comes after
+    /// all. Before then an Escape, and any other key, waits with the rest
+    /// (elundqvist/kvist#435).
+    #[gpui::test]
+    fn test_escape_gives_up_a_paste_that_has_waited(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let keys = Keys::default();
+        let (send, received) = futures::channel::oneshot::channel::<Option<ClipboardItem>>();
+        let read = cx
+            .executor()
+            .spawn(async move { Ok(received.await.ok().flatten()) });
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("one two", window, cx);
+                state.move_to(4, None, cx);
+                paste_when_read(
+                    state,
+                    read,
+                    keyed_hold(&log, &keys),
+                    window,
+                    cx,
+                    InputBaseState::paste_item,
+                );
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| assert!(!paste_waits(window, cx), "not yet shown"));
+        assert!(
+            !press(&mut cx, &keys, "escape"),
+            "an Escape before then waits"
+        );
+
+        cx.executor().advance_clock(PASTE_WAIT_SHOWN_AFTER);
+        cx.run_until_parked();
+        cx.update(|window, cx| assert!(paste_waits(window, cx), "shown as waiting"));
+        assert!(!press(&mut cx, &keys, "a"), "another key waits");
+        assert!(!press(&mut cx, &keys, "shift-escape"));
+        assert_eq!(*log.borrow(), ["hold"]);
+
+        assert!(press(&mut cx, &keys, "escape"), "Escape gives it up");
+        assert_eq!(
+            *log.borrow(),
+            ["hold", "release"],
+            "the input is let go at once"
+        );
+        cx.update(|window, cx| assert!(!paste_waits(window, cx)));
+        assert!(!press(&mut cx, &keys, "escape"), "given up once");
+
+        send.send(Some(ClipboardItem::new_string("late ".into())))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(input.read(cx).value(), "one two"));
+        assert_eq!(*log.borrow(), ["hold", "release"], "nothing lands");
+    }
+
+    /// A paste shown as waiting that then lands is no longer shown, and
+    /// lets the input go once.
+    #[gpui::test]
+    fn test_a_paste_shown_as_waiting_lands_and_is_shown_no_more(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let keys = Keys::default();
+        let (send, received) = futures::channel::oneshot::channel::<Option<ClipboardItem>>();
+        let read = cx
+            .executor()
+            .spawn(async move { Ok(received.await.ok().flatten()) });
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                paste_when_read(
+                    state,
+                    read,
+                    keyed_hold(&log, &keys),
+                    window,
+                    cx,
+                    InputBaseState::paste_item,
+                );
+            });
+        });
+        cx.executor().advance_clock(PASTE_WAIT_SHOWN_AFTER);
+        cx.run_until_parked();
+        cx.update(|window, cx| assert!(paste_waits(window, cx)));
+
+        send.send(Some(ClipboardItem::new_string("came".into())))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(!paste_waits(window, cx));
+            assert_eq!(input.read(cx).value(), "came");
+        });
+        assert_eq!(*log.borrow(), ["hold", "landing", "release"]);
+        assert!(
+            !press(&mut cx, &keys, "escape"),
+            "a paste that landed takes no key"
+        );
     }
 
     /// A view that pastes into something of its own, not an input, as a

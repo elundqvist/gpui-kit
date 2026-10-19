@@ -51,6 +51,19 @@ asks (section 4(b)); each says so at its top:
 - `src/platform.rs`: `PlatformInputHandler` hands the window the text,
   the composition and its end while the window's input is held, and
   the handler what waited once it is released.
+- `src/window.rs`: `Window::hold_input_with_keys` (elundqvist/kvist#435),
+  a hold that is handed each key pressed while it is out, as the key
+  comes: one it takes goes no further, and the rest wait as under any
+  hold. A paste that waits for a program that does not answer is given
+  up with Escape that way, where nothing reached the app until the read
+  gave up four seconds later. A hold released as it takes a key is
+  given up, and the keys held behind it like that one, or like the key
+  being dispatched as it was taken, go with it and their key ups: an
+  Escape pressed before the paste could be given up came after it and
+  closed the dialog it was asked for in, and a second Ctrl+V waited
+  again. The hold most recently taken is asked first, and a hold
+  released looks at no more keys. Tests of a key taken and the rest let
+  go, of a key taken under another hold, and of the like keys dropped.
 
 ## Tests
 
