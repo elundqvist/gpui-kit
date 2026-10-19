@@ -2838,6 +2838,19 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.selected_range.into()
     }
 
+    /// What an input method is composing, as a byte range into the text: in the
+    /// text and underlined, but not typed yet, a dead key's accent before its letter
+    /// or a preedit before it is committed. `None` where nothing is being composed, a
+    /// composition Escape emptied among them. Marking emits no [`InputEvent::Change`],
+    /// so an editor that saves as it is typed in asks this before it writes the text
+    /// out: Kvist's wrote a dead key's ´ to disk while it was still composing
+    /// (elundqvist/kvist#475).
+    pub fn marked_range(&self) -> Option<std::ops::Range<usize>> {
+        self.ime_marked_range
+            .map(std::ops::Range::<usize>::from)
+            .filter(|range| !range.is_empty())
+    }
+
     pub fn select_all(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         self.undo_manager.break_transaction_coalescing();
         self.selected_range = (0..self.text.len()).into();
@@ -8030,6 +8043,42 @@ mod tests {
                 assert_eq!(state.value(), "你好 sh");
                 assert_eq!(state.selected_range(), 9..9);
                 assert_eq!(state.ime_marked_range, Some((7..9).into()));
+            });
+        });
+    }
+
+    /// What is being composed is the marked range until it is committed, given up or
+    /// ended: an editor that saves as it is typed in waits for it, where Kvist's wrote
+    /// a dead key's ´ to disk while it composed (elundqvist/kvist#475).
+    #[gpui::test]
+    fn the_marked_range_is_what_is_being_composed(cx: &mut TestAppContext) {
+        let input_view = InputView::build(cx, |state| state.default_value("ab"));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_selected_range(2..2, cx);
+                assert_eq!(state.marked_range(), None);
+                // a dead key's accent, and the letter it makes
+                state.replace_and_mark_text_in_range(None, "´", None, window, cx);
+                assert_eq!(state.value(), "ab´");
+                assert_eq!(state.marked_range(), Some(2..4));
+                state.replace_text_in_range(None, "é", window, cx);
+                assert_eq!(state.value(), "abé");
+                assert_eq!(state.marked_range(), None);
+                // one Escape gives up
+                state.replace_and_mark_text_in_range(None, "´", None, window, cx);
+                assert_eq!(state.marked_range(), Some(4..6));
+                state.replace_and_mark_text_in_range(None, "", None, window, cx);
+                assert_eq!(state.value(), "abé");
+                assert_eq!(state.marked_range(), None);
+                // and one a click ends, kept as text
+                state.replace_and_mark_text_in_range(None, "明", None, window, cx);
+                assert_eq!(state.marked_range(), Some(4..7));
+                state.unmark_text(window, cx);
+                assert_eq!(state.value(), "abé明");
+                assert_eq!(state.marked_range(), None);
             });
         });
     }
