@@ -1213,6 +1213,155 @@ pub fn keystroke_underlying_dead_key(keysym: Keysym) -> Option<String> {
         _ => None,
     }
 }
+
+/// What a key in a dead key's or the Compose key's sequence has the window do
+/// with the text marked for the sequence, handed over before the key itself.
+#[cfg(any(feature = "wayland", feature = "x11"))]
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ComposeEdit {
+    /// The mark ended with its text kept, where the input has it drawn;
+    /// an input that has let go of it on its own keeps nothing, and has
+    /// nothing put in where nothing is marked.
+    Unmark,
+    /// The sequence so far, marked in place of what was; an empty one ends
+    /// the mark and leaves nothing where it was.
+    Mark(String),
+}
+
+/// A key as it goes through the client's compose state.
+#[cfg(any(feature = "wayland", feature = "x11"))]
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ComposedKey {
+    /// What the window does with the marked text, in order, first.
+    pub edits: Vec<ComposeEdit>,
+    /// Whether the key goes on to the window as a key down after them.
+    pub goes_on: bool,
+}
+
+/// Feed a key to the compose state, which follows a dead key's or the
+/// Compose key's sequence: `marked` is what the client has marked for the
+/// sequence (its `pre_edit_text`), `marked_at_shortcut` whether the focused
+/// input had it marked as a shortcut passed the sequence by,
+/// `input_marked` whether it has a mark now, asked where the client has
+/// one, and `keystroke` the key's, given the composed character where the
+/// key ends a sequence.
+///
+/// Changed in elundqvist/gpui-kit (elundqvist/kvist#482), the X11 and
+/// Wayland clients' code made one: a key with Ctrl, Alt or Super held is
+/// not fed to the sequence, which goes on past it, as GTK's input method
+/// has it (gtkimcontextsimple.c passes a key with Control or Mod1 by): a
+/// key gpui types no text for was fed and composed, Ctrl+K a ḱ, so the
+/// shortcut never ran, nothing was typed, and the dead key's ´ stayed
+/// marked with no sequence behind it. A sequence whose mark the input had
+/// as a shortcut passed it by, and has no more, ends before the key after
+/// it, which is then a key of its own: the shortcut's edit took the ´, an
+/// undo or a paste, or the focus it moved, which the input lets go of it
+/// with, as GTK's text widgets reset their input method at such an edit;
+/// and the sequence went on unseen, the next letter typed with an accent
+/// drawn nowhere and Escape swallowed with nothing to cancel. The input is
+/// asked only after a shortcut: a mark the window holds back behind a
+/// paste waiting for the clipboard is not the input's yet. Escape in a
+/// sequence ends it with nothing left and goes no further, as GTK's and
+/// ibus's do, where the sequence cancelled committed the ´ as text and the
+/// Escape went on. A dead key that begins a sequence after one it
+/// cancelled is the marked text it is marked as, where the X11 client
+/// marked it and kept none, so a click, which ends what is marked, left it
+/// marked. A key that cancels a sequence ends its mark with the text the
+/// input has marked kept (`ComposeEdit::Unmark`), where the client
+/// committed its own copy of the ´, which went in at the caret of an input
+/// that had let go of it.
+#[cfg(any(feature = "wayland", feature = "x11"))]
+pub(super) fn compose_key(
+    compose: &mut xkb::compose::State,
+    marked: &mut Option<String>,
+    marked_at_shortcut: &mut bool,
+    input_marked: Option<bool>,
+    keysym: Keysym,
+    keystroke: &mut gpui::Keystroke,
+) -> ComposedKey {
+    let mut edits = Vec::new();
+    if std::mem::take(marked_at_shortcut) && input_marked == Some(false) {
+        compose.reset();
+        marked.take();
+    }
+    // the window types no text for a key with more than Shift held
+    if !keystroke.modifiers.is_subset_of(&gpui::Modifiers::shift()) {
+        *marked_at_shortcut = marked.is_some() && input_marked == Some(true);
+        return ComposedKey {
+            edits,
+            goes_on: true,
+        };
+    }
+    if keysym == Keysym::Escape && compose.status() == xkb::Status::Composing {
+        compose.reset();
+        if marked.take().is_some() {
+            edits.push(ComposeEdit::Mark(String::new()));
+        }
+        return ComposedKey {
+            edits,
+            goes_on: false,
+        };
+    }
+    compose.feed(keysym);
+    match compose.status() {
+        xkb::Status::Composed => {
+            let was_marked = marked.take().is_some();
+            keystroke.key_char = compose.utf8();
+            if let Some(keysym) = compose.keysym() {
+                keystroke.key = xkb::keysym_get_name(keysym);
+            }
+            // the composed character takes the marked text's place as it
+            // is typed; a sequence that composes none leaves no mark
+            if was_marked && keystroke.key_char.is_none() {
+                edits.push(ComposeEdit::Mark(String::new()));
+            }
+        }
+        xkb::Status::Composing => {
+            keystroke.key_char = None;
+            *marked = compose.utf8().or(keystroke_underlying_dead_key(keysym));
+            edits.push(ComposeEdit::Mark(marked.clone().unwrap_or_default()));
+        }
+        xkb::Status::Cancelled => {
+            if marked.take().is_some() {
+                edits.push(ComposeEdit::Unmark);
+            }
+            *marked = keystroke_underlying_dead_key(keysym);
+            if let Some(text) = marked.clone() {
+                edits.push(ComposeEdit::Mark(text));
+            }
+            compose.feed(keysym);
+        }
+        xkb::Status::Nothing => {}
+    }
+    ComposedKey {
+        edits,
+        goes_on: true,
+    }
+}
+
+/// End a dead key's or the Compose key's sequence at a click, as GTK's text
+/// views and entries reset their input method at one: whether anything was
+/// marked for it, for the window to end the mark with what the input has
+/// marked kept where it is drawn (`ComposeEdit::Unmark`).
+///
+/// Changed in elundqvist/gpui-kit (elundqvist/kvist#482): the sequence was
+/// reset only where the client had text marked for it, so the Compose key's,
+/// which marks none, went on past the click; and the client committed its
+/// own copy of what it had marked, which went in at the caret of the input
+/// focused then, one that had let go of the mark or another.
+#[cfg(any(feature = "wayland", feature = "x11"))]
+pub(super) fn end_compose(
+    compose: Option<&mut xkb::compose::State>,
+    marked: &mut Option<String>,
+    marked_at_shortcut: &mut bool,
+) -> bool {
+    if let Some(compose) = compose {
+        compose.reset();
+    }
+    *marked_at_shortcut = false;
+    marked.take().is_some()
+}
+
 #[cfg(any(feature = "wayland", feature = "x11"))]
 pub(super) fn modifiers_from_xkb(keymap_state: &State) -> gpui::Modifiers {
     let shift = keymap_state.mod_name_is_active(xkb::MOD_NAME_SHIFT, xkb::STATE_MODS_EFFECTIVE);
@@ -1294,6 +1443,301 @@ mod tests {
             error.to_string(),
             "libxkbcommon failed to create an XKB context"
         );
+    }
+
+    /// A dead key's and the Compose key's sequences as the clients follow them
+    /// (elundqvist/kvist#482), on a table of a few of en_US.UTF-8's.
+    #[cfg(any(feature = "wayland", feature = "x11"))]
+    mod compose {
+        use super::super::{ComposeEdit, ComposedKey, compose_key, end_compose};
+        use gpui::{Keystroke, Modifiers};
+        use xkbcommon::xkb::{self, Keysym};
+
+        const TABLE: &str = "\
+<dead_acute> <e> : \"é\" eacute
+<dead_acute> <E> : \"É\" Eacute
+<dead_acute> <k> : \"ḱ\" U1E31
+<dead_acute> <s> : \"ś\" U015B
+<dead_grave> <e> : \"è\" egrave
+<Multi_key> <apostrophe> <e> : \"é\" eacute
+";
+
+        /// A client following a sequence, and whether the focused input has
+        /// something marked, as the client's edits leave it, or as a shortcut
+        /// leaves it (`input_marked`).
+        struct Client {
+            compose: xkb::compose::State,
+            marked: Option<String>,
+            marked_at_shortcut: bool,
+            input_marked: bool,
+        }
+
+        impl Client {
+            fn new() -> Self {
+                let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+                let table = xkb::compose::Table::new_from_buffer(
+                    &context,
+                    TABLE,
+                    "C",
+                    xkb::compose::FORMAT_TEXT_V1,
+                    xkb::compose::COMPILE_NO_FLAGS,
+                )
+                .expect("the table compiles");
+                Self {
+                    compose: xkb::compose::State::new(&table, xkb::compose::STATE_NO_FLAGS),
+                    marked: None,
+                    marked_at_shortcut: false,
+                    input_marked: false,
+                }
+            }
+
+            /// A key pressed with `modifiers` held, as the client feeds it: the
+            /// input asked where the client has something marked, and the
+            /// edits handed it.
+            fn key(
+                &mut self,
+                keysym: Keysym,
+                key: &str,
+                key_char: Option<&str>,
+                modifiers: Modifiers,
+            ) -> (ComposedKey, Keystroke) {
+                let mut keystroke = pressed(key, key_char, modifiers);
+                let input_marked = self.marked.is_some().then_some(self.input_marked);
+                let composed = compose_key(
+                    &mut self.compose,
+                    &mut self.marked,
+                    &mut self.marked_at_shortcut,
+                    input_marked,
+                    keysym,
+                    &mut keystroke,
+                );
+                for edit in &composed.edits {
+                    self.input_marked = matches!(edit, ComposeEdit::Mark(text) if !text.is_empty());
+                }
+                // the composed character typed takes the mark's place
+                if composed.goes_on && keystroke.key_char.is_some() {
+                    self.input_marked = false;
+                }
+                (composed, keystroke)
+            }
+
+            /// A key with nothing held.
+            fn typed(
+                &mut self,
+                keysym: Keysym,
+                key: &str,
+                key_char: Option<&str>,
+            ) -> (ComposedKey, Keystroke) {
+                self.key(keysym, key, key_char, Modifiers::none())
+            }
+
+            fn dead_acute(&mut self) -> (ComposedKey, Keystroke) {
+                self.typed(Keysym::dead_acute, "dead_acute", None)
+            }
+
+            fn click(&mut self) -> bool {
+                let marked = end_compose(
+                    Some(&mut self.compose),
+                    &mut self.marked,
+                    &mut self.marked_at_shortcut,
+                );
+                self.input_marked = false;
+                marked
+            }
+        }
+
+        /// The keystroke the client makes of a key, as `keystroke_from_xkb`
+        /// makes it: a key with Ctrl held types no character.
+        fn pressed(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> Keystroke {
+            Keystroke {
+                modifiers,
+                key: key.into(),
+                key_char: key_char.map(Into::into),
+            }
+        }
+
+        fn mark(text: &str) -> ComposeEdit {
+            ComposeEdit::Mark(text.into())
+        }
+
+        fn passed_by() -> ComposedKey {
+            ComposedKey {
+                edits: Vec::new(),
+                goes_on: true,
+            }
+        }
+
+        /// A shortcut after a dead key runs, and the sequence goes on past it,
+        /// as GTK's input method has it: Ctrl+K composed a ḱ, so the shortcut
+        /// never ran and the ´ stayed marked with no sequence behind it.
+        #[test]
+        fn a_shortcut_in_a_sequence_runs_and_the_sequence_goes_on() {
+            let mut client = Client::new();
+            let (dead, _) = client.dead_acute();
+            assert_eq!(dead.edits, vec![mark("´")]);
+            assert_eq!(client.marked.as_deref(), Some("´"));
+
+            for modifiers in [
+                Modifiers::control(),
+                Modifiers::alt(),
+                Modifiers::super_key(),
+            ] {
+                let (composed, shortcut) = client.key(Keysym::k, "k", None, modifiers);
+                assert_eq!(composed, passed_by(), "{modifiers:?}");
+                assert_eq!(shortcut, pressed("k", None, modifiers), "the key as it was");
+                assert_eq!(client.marked.as_deref(), Some("´"), "still marked");
+                assert_eq!(client.compose.status(), xkb::Status::Composing);
+            }
+
+            // the letter after it composes, in the ´'s place
+            let (letter, keystroke) = client.typed(Keysym::e, "e", Some("e"));
+            assert_eq!(letter.edits, Vec::new());
+            assert!(letter.goes_on);
+            assert_eq!(keystroke.key_char.as_deref(), Some("é"));
+            assert_eq!(client.marked, None);
+
+            // a key with Shift is fed, as it types a capital
+            client.dead_acute();
+            let (_, shifted) = client.key(Keysym::E, "e", Some("E"), Modifiers::shift());
+            assert_eq!(shifted.key_char.as_deref(), Some("É"));
+        }
+
+        /// A sequence whose ´ the input had as a shortcut passed it by and has
+        /// no more, taken by the shortcut's edit or the focus it moved, ends:
+        /// the letter after it is the letter, and Escape is Escape. It went on
+        /// unseen, the letter typed with an accent drawn nowhere, and Escape
+        /// swallowed with nothing on show to cancel.
+        #[test]
+        fn a_sequence_the_input_let_go_of_after_a_shortcut_ends() {
+            let mut client = Client::new();
+            client.dead_acute();
+            client.key(Keysym::z, "z", None, Modifiers::control());
+            // the undo's edit took the ´
+            client.input_marked = false;
+            let (letter, keystroke) = client.typed(Keysym::e, "e", Some("e"));
+            assert_eq!(letter, passed_by());
+            assert_eq!(keystroke.key_char.as_deref(), Some("e"));
+            assert_eq!(client.marked, None);
+
+            // the palette the shortcut opened has the focus, with no ´
+            client.dead_acute();
+            client.key(Keysym::k, "k", None, Modifiers::control());
+            client.input_marked = false;
+            let (escape, _) = client.typed(Keysym::Escape, "escape", None);
+            assert_eq!(escape, passed_by(), "Escape is Escape");
+            assert_eq!(client.compose.status(), xkb::Status::Nothing);
+
+            // a second shortcut ends it too, and the letter after that is the letter
+            client.dead_acute();
+            client.key(Keysym::k, "k", None, Modifiers::control());
+            client.input_marked = false;
+            client.key(Keysym::a, "a", None, Modifiers::control());
+            let (_, keystroke) = client.typed(Keysym::s, "s", Some("s"));
+            assert_eq!(keystroke.key_char.as_deref(), Some("s"));
+
+            // a shortcut that leaves the ´ be, Select All's, leaves the sequence
+            client.dead_acute();
+            client.key(Keysym::a, "a", None, Modifiers::control());
+            let (_, keystroke) = client.typed(Keysym::e, "e", Some("e"));
+            assert_eq!(keystroke.key_char.as_deref(), Some("é"));
+
+            // and a ´ the window holds back, behind a paste waiting for the
+            // clipboard, is the input's once it comes: not marked yet as the
+            // shortcut passes, the sequence goes on
+            client.dead_acute();
+            client.input_marked = false;
+            client.key(Keysym::x, "x", None, Modifiers::control());
+            let (_, keystroke) = client.typed(Keysym::e, "e", Some("e"));
+            assert_eq!(keystroke.key_char.as_deref(), Some("é"));
+        }
+
+        /// Escape in a sequence ends it with nothing left where the ´ was
+        /// marked, and goes no further: it committed the ´ as text, and
+        /// went on to whatever Escape does.
+        #[test]
+        fn escape_ends_a_sequence_with_nothing_left() {
+            let mut client = Client::new();
+            client.dead_acute();
+            let (escape, _) = client.typed(Keysym::Escape, "escape", None);
+            assert_eq!(
+                escape,
+                ComposedKey {
+                    edits: vec![mark("")],
+                    goes_on: false
+                }
+            );
+            assert_eq!(client.marked, None);
+            // the letter after it is the letter
+            let (_, keystroke) = client.typed(Keysym::e, "e", Some("e"));
+            assert_eq!(keystroke.key_char.as_deref(), Some("e"));
+
+            // the Compose key marks nothing, and its sequence ends too
+            client.typed(Keysym::Multi_key, "multi_key", None);
+            let (escape, _) = client.typed(Keysym::Escape, "escape", None);
+            assert_eq!(
+                escape,
+                ComposedKey {
+                    edits: Vec::new(),
+                    goes_on: false
+                }
+            );
+            assert_eq!(client.compose.status(), xkb::Status::Nothing);
+
+            // with no sequence, Escape is Escape
+            let (escape, _) = client.typed(Keysym::Escape, "escape", None);
+            assert_eq!(escape, passed_by());
+        }
+
+        /// A dead key that cancels the sequence before it begins one of its
+        /// own, marked and known to be: the X11 client marked it and kept
+        /// none, so a click, which ends what is marked, left it marked. The
+        /// mark it cancels ends with the input's text kept: the client
+        /// committed its own copy of the ´, which went in at the caret of an
+        /// input that had let go of it.
+        #[test]
+        fn a_dead_key_after_a_sequence_it_cancels_is_marked() {
+            let mut client = Client::new();
+            client.dead_acute();
+            let (grave, _) = client.typed(Keysym::dead_grave, "dead_grave", None);
+            assert_eq!(grave.edits, vec![ComposeEdit::Unmark, mark("`")]);
+            assert_eq!(client.marked.as_deref(), Some("`"));
+            let (_, keystroke) = client.typed(Keysym::e, "e", Some("e"));
+            assert_eq!(keystroke.key_char.as_deref(), Some("è"));
+
+            // a letter that composes nothing with it ends the mark the same
+            // way, and is typed after it
+            client.dead_acute();
+            let (letter, keystroke) = client.typed(Keysym::q, "q", Some("q"));
+            assert_eq!(
+                letter,
+                ComposedKey {
+                    edits: vec![ComposeEdit::Unmark],
+                    goes_on: true
+                }
+            );
+            assert_eq!(keystroke.key_char.as_deref(), Some("q"));
+            assert_eq!(client.marked, None);
+        }
+
+        /// A click ends the sequence and says whether anything is marked for
+        /// it, for the window to end the mark with its text kept; the Compose
+        /// key's, which marks nothing, went on past it.
+        #[test]
+        fn a_click_ends_a_sequence() {
+            let mut client = Client::new();
+            client.dead_acute();
+            client.key(Keysym::k, "k", None, Modifiers::control());
+            assert!(client.click());
+            assert_eq!(client.marked, None);
+            assert!(!client.marked_at_shortcut);
+            assert_eq!(client.compose.status(), xkb::Status::Nothing);
+
+            client.typed(Keysym::Multi_key, "multi_key", None);
+            client.typed(Keysym::apostrophe, "'", Some("'"));
+            assert!(!client.click());
+            let (_, keystroke) = client.typed(Keysym::e, "e", Some("e"));
+            assert_eq!(keystroke.key_char.as_deref(), Some("e"), "no sequence left");
+        }
     }
 
     #[test]

@@ -1961,7 +1961,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             EditIntent::Atomic
         };
         self.undo_manager.pending_intent = Some(intent);
-        self.replace_text_in_range(None, "", window, cx);
+        self.edit_text_in_range(None, "", window, cx);
         self.pause_blink_cursor(cx);
     }
 
@@ -1973,7 +1973,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             EditIntent::Atomic
         };
         self.undo_manager.pending_intent = Some(intent);
-        self.replace_text_in_range(None, "", window, cx);
+        self.edit_text_in_range(None, "", window, cx);
         self.pause_blink_cursor(cx);
     }
 
@@ -1984,7 +1984,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) {
         if !self.selected_range.is_empty() {
-            self.replace_text_in_range(None, "", window, cx);
+            self.edit_text_in_range(None, "", window, cx);
             self.pause_blink_cursor(cx);
             return;
         }
@@ -2010,7 +2010,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) {
         if !self.selected_range.is_empty() {
-            self.replace_text_in_range(None, "", window, cx);
+            self.edit_text_in_range(None, "", window, cx);
             self.pause_blink_cursor(cx);
             return;
         }
@@ -2036,7 +2036,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) {
         if !self.selected_range.is_empty() {
-            self.replace_text_in_range(None, "", window, cx);
+            self.edit_text_in_range(None, "", window, cx);
             self.pause_blink_cursor(cx);
             return;
         }
@@ -2059,7 +2059,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) {
         if !self.selected_range.is_empty() {
-            self.replace_text_in_range(None, "", window, cx);
+            self.edit_text_in_range(None, "", window, cx);
             self.pause_blink_cursor(cx);
             return;
         }
@@ -2591,6 +2591,8 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub(super) fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
+        // an edit of the input's own, past a composition (elundqvist/kvist#482)
+        self.let_go_of_composition(window, cx);
         self.undo_manager.set_ignoring(true);
         if let Some(changes) = self.undo_manager.undo() {
             let selection = changes.last().unwrap().selection_before;
@@ -2611,6 +2613,7 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub(super) fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+        self.let_go_of_composition(window, cx);
         self.undo_manager.set_ignoring(true);
         if let Some(changes) = self.undo_manager.redo() {
             let selection = changes.last().unwrap().selection_after;
@@ -2737,6 +2740,23 @@ impl<M: InputModeKind> InputBaseState<M> {
             edits.windows(2).all(|w| w[1].0.end <= w[0].0.start),
             "the edits are apart and the last first: {edits:?}"
         );
+        // an edit of the input's own, past a composition (elundqvist/kvist#482)
+        let moved: Vec<(Range<usize>, &str)>;
+        let edits = match self.let_go_of_composition(window, cx) {
+            Some(marked) => {
+                moved = edits
+                    .iter()
+                    .map(|(range, text)| {
+                        (
+                            past_mark(&marked, range.start)..past_mark(&marked, range.end),
+                            *text,
+                        )
+                    })
+                    .collect();
+                &moved[..]
+            }
+            None => edits,
+        };
         self.with_edits_allowed(|this| this.replace_steps_allowed(edits, window, cx));
     }
 
@@ -3146,6 +3166,16 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
 
+        // A composition goes with the keyboard, and leaves this input as it
+        // loses it, as the X11 client deletes one as the window loses the
+        // keyboard, and as GTK's input method resets as its widget loses the
+        // focus, a dead key's sequence ending with it. A dead key's ´ stayed
+        // marked here after a shortcut that moved the focus, the shortcut now
+        // passing the sequence by, its é typed in the input the shortcut
+        // opened: the mark had no composition behind it, and what was typed
+        // here next took its place (elundqvist/kvist#482).
+        self.let_go_of_composition(window, cx);
+
         self.undo_manager.break_transaction_coalescing();
 
         // NOTE: Do not cancel select, when blur.
@@ -3397,6 +3427,9 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// Replace text in range in silent.
     ///
     /// This will not trigger any UI interaction, such as auto-completion.
+    ///
+    /// An edit of the input's own, as every caller's is: a composition
+    /// marked here is let go of first (`past_composition`).
     pub(crate) fn replace_text_in_range_silent(
         &mut self,
         range_utf16: Option<Range<usize>>,
@@ -3404,9 +3437,94 @@ impl<M: InputModeKind> InputBaseState<M> {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let range_utf16 = self.past_composition(range_utf16, window, cx);
         self.silent_replace_text = true;
         self.replace_text_in_range(range_utf16, new_text, window, cx);
         self.silent_replace_text = false;
+    }
+
+    /// An edit of the input's own of `range_utf16`, or of the selection, as
+    /// typing makes one, past a composition marked here, which it lets go
+    /// of first (`past_composition`). `replace_text_in_range` is the
+    /// platform's, where no range is the marked one, and what it puts there
+    /// ends the composition.
+    fn edit_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range_utf16 = self.past_composition(range_utf16, window, cx);
+        self.replace_text_in_range(range_utf16, new_text, window, cx);
+    }
+
+    /// Let go of a composition marked here before an edit of the input's
+    /// own (`let_go_of_composition`), and give `range_utf16`, of the text
+    /// with the composition in it, as it is in the text without it.
+    ///
+    /// Added in elundqvist/gpui-kit (elundqvist/kvist#482). A shortcut after
+    /// a dead key runs with the ´ still marked, as GTK has it, and its edit
+    /// went in with the composition's: one with a range of its own was
+    /// merged into the step of undo the composition had open, which kept
+    /// the ´'s old text and took the edit's new, so Ctrl+Delete's word was
+    /// in no step and an undo did not bring it back; and one with none, as
+    /// the selection's, took the marked range for the selection. GTK's text
+    /// widgets reset their input method before such an edit, and the
+    /// preedit goes.
+    fn past_composition(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        if self.ime_marked_range.is_none() {
+            return range_utf16;
+        }
+        let range = range_utf16
+            .as_ref()
+            .map(|range_utf16| self.range_from_utf16(range_utf16));
+        let Some(marked) = self.let_go_of_composition(window, cx) else {
+            return range_utf16;
+        };
+        range.map(|range| {
+            let range = past_mark(&marked, range.start)..past_mark(&marked, range.end);
+            self.range_to_utf16(&range)
+        })
+    }
+
+    /// Let go of the composition marked here, an input method's or a dead
+    /// key's, where the input edits on its own or loses the focus: what is
+    /// marked goes, as GTK's preedit goes at its input method's reset, with
+    /// the step of undo it had open and nothing in it, and the selection
+    /// stays on its text. The range that was marked, for a range of the
+    /// text with it in to be given without it (`past_mark`); none where
+    /// nothing was marked, or where a single line's check refuses its text
+    /// without it, which keeps it as text. A dead key's sequence ends with
+    /// it: elundqvist/gpui-kit's Linux clients ask the input whether it
+    /// still has the ´ marked at the key after a shortcut.
+    ///
+    /// Added in elundqvist/gpui-kit (elundqvist/kvist#482).
+    fn let_go_of_composition(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        let marked: Range<usize> = self.ime_marked_range?.into();
+        let selection = self.selected_range;
+        // the intent the edit after this asked for is its own
+        let intent = self.undo_manager.pending_intent.take();
+        self.replace_and_mark_text_in_range(None, "", None, window, cx);
+        self.undo_manager.pending_intent = intent;
+        if self.ime_marked_range.is_some() {
+            self.unmark_text(window, cx);
+            return None;
+        }
+        self.selected_range = Selection::new(
+            past_mark(&marked, selection.start),
+            past_mark(&marked, selection.end),
+        );
+        Some(marked)
     }
 
     /// What follows the text through an edit, once the text has it:
@@ -4019,6 +4137,18 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
         // Actions only one mode handles are registered by that mode, where
         // `Self` is concrete enough to name its own entity type.
         M::register_actions(element, &entity, window)
+    }
+}
+
+/// Where `offset`, of a text with `marked` in it, is once what is marked is
+/// gone: a place in it at its start (elundqvist/kvist#482).
+fn past_mark(marked: &Range<usize>, offset: usize) -> usize {
+    if offset <= marked.start {
+        offset
+    } else if offset >= marked.end {
+        offset - marked.len()
+    } else {
+        marked.start
     }
 }
 
@@ -8079,6 +8209,104 @@ mod tests {
                 state.unmark_text(window, cx);
                 assert_eq!(state.value(), "abé明");
                 assert_eq!(state.marked_range(), None);
+            });
+        });
+    }
+
+    /// A composition leaves an input that loses the focus, as it goes with the
+    /// keyboard: a dead key's ´ stayed marked in Kvist's editor after a shortcut
+    /// that opened another input, its letter typed there, and what was typed in the
+    /// editor next took its place (elundqvist/kvist#482). The text and the
+    /// selection an input has when nothing is marked stay as they are.
+    #[gpui::test]
+    fn a_composition_leaves_an_input_that_loses_the_focus(cx: &mut TestAppContext) {
+        let input_view = InputView::build(cx, |state| state.default_value("ab"));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_selected_range(2..2, cx);
+                state.replace_and_mark_text_in_range(None, "´", None, window, cx);
+                assert_eq!(state.value(), "ab´");
+                state.on_blur(window, cx);
+                assert_eq!(state.value(), "ab");
+                assert_eq!(state.marked_range(), None);
+                assert_eq!(state.selected_range(), 2..2);
+
+                // typed here next, it goes where it is typed
+                state.on_focus(window, cx);
+                state.set_selected_range(0..0, cx);
+                state.replace_text_in_range(None, "c", window, cx);
+                assert_eq!(state.value(), "cab");
+
+                // nothing marked, the selection stays
+                state.set_selected_range(0..2, cx);
+                state.on_blur(window, cx);
+                assert_eq!(state.value(), "cab");
+                assert_eq!(state.selected_range(), 0..2);
+            });
+        });
+    }
+
+    /// An edit of the input's own, a shortcut's, lets go of a dead key's ´
+    /// first, as GTK's text widgets reset their input method before one, and
+    /// is made where it was asked for and is a step of undo of its own: a
+    /// shortcut after a dead key runs with the ´ marked, and Ctrl+Delete's
+    /// word, merged into the step the ´ had open, was in no step, so an undo
+    /// did not bring it back (elundqvist/kvist#482).
+    #[gpui::test]
+    fn an_edit_of_the_inputs_own_lets_go_of_a_composition_first(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("hello world!", window, cx);
+
+                // Ctrl+Delete: the word after the ´, and an undo brings it back
+                state.set_selected_range(6..6, cx);
+                state.replace_and_mark_text_in_range(None, "´", None, window, cx);
+                assert_eq!(state.value(), "hello ´world!");
+                state.delete_next_word(&DeleteToNextWordEnd, window, cx);
+                assert_eq!(state.value(), "hello !");
+                assert_eq!(state.marked_range(), None);
+                assert_eq!(state.selected_range(), 6..6);
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "hello world!");
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "hello world!", "the ´ was in no step");
+
+                // a paste goes in where the ´ was, the ´ gone, one step
+                state.set_selected_range(5..5, cx);
+                state.replace_and_mark_text_in_range(None, "´", None, window, cx);
+                state.paste_item(Some(ClipboardItem::new_string(",".into())), window, cx);
+                assert_eq!(state.value(), "hello, world!");
+                assert_eq!(state.selected_range(), 6..6);
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "hello world!");
+
+                // an undo takes back the step before the ´, the ´ gone
+                state.set_selected_range(12..12, cx);
+                state.replace_text_in_range(None, "?", window, cx);
+                state.replace_and_mark_text_in_range(None, "´", None, window, cx);
+                assert_eq!(state.value(), "hello world!?´");
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "hello world!");
+                assert_eq!(state.marked_range(), None);
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "hello world!?");
+
+                // an edit of the selection: the selection's text, not the ´,
+                // which went for it
+                state.set_selected_range(0..0, cx);
+                state.replace_and_mark_text_in_range(None, "´", None, window, cx);
+                state.set_selected_range(8..13, cx);
+                assert_eq!(state.value(), "´hello world!?");
+                state.backspace(&Backspace, window, cx);
+                assert_eq!(state.value(), "hello !?");
+                assert_eq!(state.selected_range(), 6..6);
             });
         });
     }

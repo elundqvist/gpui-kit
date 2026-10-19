@@ -1239,6 +1239,22 @@ impl X11WindowStatePtr {
         }
     }
 
+    /// Whether the window's input has text marked for a composition, asked
+    /// of its input handler.
+    ///
+    /// Added in elundqvist/gpui-kit (elundqvist/kvist#482), for the client to
+    /// end a dead key's sequence whose ´ the input let go of after a shortcut.
+    pub fn has_marked_text(&self) -> bool {
+        let mut state = self.state.borrow_mut();
+        let Some(mut input_handler) = state.input_handler.take() else {
+            return false;
+        };
+        drop(state);
+        let marked = input_handler.marked_text_range().is_some();
+        self.state.borrow_mut().input_handler = Some(input_handler);
+        marked
+    }
+
     pub fn handle_ime_unmark(&self) {
         if self.is_blocked() {
             return;

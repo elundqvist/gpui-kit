@@ -175,6 +175,37 @@ asks (section 4(b)); each says so at its top:
   handled as if there were no input method, where the first was lost.
   The fork's gpui-base input takes the end of a mark with its text kept
   as an edit, as a commit is. Tests of what the handler hands on.
+- `src/linux/platform.rs`, `src/linux/x11/client.rs`,
+  `src/linux/wayland/client.rs` and the two clients' `window.rs`: a
+  dead key's or the Compose key's sequence is followed by one function
+  for both clients (`compose_key`, elundqvist/kvist#482). A key with
+  Ctrl, Alt or Super held is not fed to it, and the sequence goes on
+  past the key, as GTK's input method passes a key with Control or Mod1
+  by: a key gpui types no text for was fed and composed, Ctrl+K after a
+  dead key a ḱ, so the shortcut never ran, nothing was typed, and the ´
+  stayed marked with no sequence behind it. A sequence whose ´ the
+  focused input had as a shortcut passed it by, and has no more, ends
+  before the key after it (`has_marked_text` asks the input): the
+  shortcut's edit took it, an undo or a paste, or the focus it moved,
+  as GTK's text widgets reset their input method at such an edit, where
+  the sequence went on unseen, the next letter typed with an accent
+  drawn nowhere and an Escape swallowed with nothing to cancel. The
+  input is asked only after a shortcut, so a ´ the window holds back
+  behind a paste waiting for the clipboard is not taken for one let go
+  of. Escape in a sequence ends it with nothing left where it was
+  marked, and goes no further, as GTK's and ibus's do, where the
+  sequence cancelled committed the ´ as text and the Escape went on to
+  close what it closes. A dead key that begins a sequence after one it
+  cancelled is known to be marked, where the X11 client marked it and
+  kept none; and a click ends the sequence whether or not anything is
+  marked for it (`end_compose`), where the Compose key's, which marks
+  nothing, went on past it. A mark a key or a click ends is ended with
+  what the input has marked kept where it is drawn, in the window that
+  has the keyboard, as the input method's is at a click: the client
+  committed its own copy of the ´, at the caret of an input that had
+  let go of it, the palette's field a shortcut had opened over it, or,
+  on X11, of the window clicked. Tests of each on a compose table of
+  their own, with an input that lets go of its mark.
 - `Cargo.toml`: an `[[example]]` entry for `examples/xdnd_source.rs`,
   which the fork adds (the published manifest names its targets and
   has no examples). And zed-xim, the XIM client, is taken by path from

@@ -51,9 +51,9 @@ use super::{
 };
 
 use crate::linux::{
-    DEFAULT_CURSOR_ICON_NAME, LinuxClient, capslock_from_xkb, cursor_style_to_icon_names,
-    get_xkb_compose_state, is_within_click_distance, keystroke_from_xkb,
-    keystroke_underlying_dead_key, log_cursor_icon_warning, modifiers_from_xkb, new_xkb_context,
+    ComposeEdit, DEFAULT_CURSOR_ICON_NAME, LinuxClient, capslock_from_xkb, compose_key,
+    cursor_style_to_icon_names, end_compose, get_xkb_compose_state, is_within_click_distance,
+    keystroke_from_xkb, log_cursor_icon_warning, modifiers_from_xkb, new_xkb_context,
     open_uri_internal,
     platform::{DOUBLE_CLICK_INTERVAL, SCROLL_LINES},
     reveal_path_internal,
@@ -518,6 +518,9 @@ pub struct X11ClientState {
 
     pub(crate) compose_state: Option<xkbc::compose::State>,
     pub(crate) pre_edit_text: Option<String>,
+    // Added in elundqvist/gpui-kit (elundqvist/kvist#482): whether the focused
+    // input had `pre_edit_text` marked as a shortcut passed the sequence by
+    pub(crate) compose_marked_at_shortcut: bool,
     pub(crate) composing: bool,
     pub(crate) pre_key_char_down: Option<Keystroke>,
     pub(crate) cursor_handle: cursor::Handle,
@@ -859,6 +862,7 @@ impl X11Client {
 
             compose_state,
             pre_edit_text: None,
+            compose_marked_at_shortcut: false,
             pre_key_char_down: None,
             composing: false,
 
@@ -1477,6 +1481,7 @@ impl X11Client {
                 // what the client knows of a composition, an input method's
                 // or a dead key's, before both are ended here
                 let dead_key = state.pre_edit_text.take();
+                state.compose_marked_at_shortcut = false;
                 let composing = state.composing || dead_key.is_some_and(|text| !text.is_empty());
                 state.restore_cursor_after_hide();
                 drop(state);
@@ -1559,42 +1564,42 @@ impl X11Client {
                         return Some(());
                     }
 
+                    // Changed in elundqvist/gpui-kit (elundqvist/kvist#482): the
+                    // sequence is followed by `compose_key`, which passes a
+                    // shortcut by and ends the sequence at an Escape, and the
+                    // Escape goes no further, and ends one whose mark the
+                    // input let go of after a shortcut, which the input is
+                    // asked of with the client let go of first
+                    let input_marked = if state.pre_edit_text.is_some() {
+                        drop(state);
+                        let marked = window.has_marked_text();
+                        state = self.0.borrow_mut();
+                        Some(marked)
+                    } else {
+                        None
+                    };
                     if let Some(mut compose_state) = state.compose_state.take() {
-                        compose_state.feed(keysym);
-                        match compose_state.status() {
-                            xkbc::Status::Composed => {
-                                state.pre_edit_text.take();
-                                keystroke.key_char = compose_state.utf8();
-                                if let Some(keysym) = compose_state.keysym() {
-                                    keystroke.key = xkbc::keysym_get_name(keysym);
-                                }
-                            }
-                            xkbc::Status::Composing => {
-                                keystroke.key_char = None;
-                                state.pre_edit_text = compose_state
-                                    .utf8()
-                                    .or(keystroke_underlying_dead_key(keysym));
-                                let pre_edit =
-                                    state.pre_edit_text.clone().unwrap_or(String::default());
-                                drop(state);
-                                window.handle_ime_preedit(pre_edit);
-                                state = self.0.borrow_mut();
-                            }
-                            xkbc::Status::Cancelled => {
-                                let pre_edit = state.pre_edit_text.take();
-                                drop(state);
-                                if let Some(pre_edit) = pre_edit {
-                                    window.handle_ime_commit(pre_edit);
-                                }
-                                if let Some(current_key) = keystroke_underlying_dead_key(keysym) {
-                                    window.handle_ime_preedit(current_key);
-                                }
-                                state = self.0.borrow_mut();
-                                compose_state.feed(keysym);
-                            }
-                            _ => {}
-                        }
+                        let client = &mut *state;
+                        let composed = compose_key(
+                            &mut compose_state,
+                            &mut client.pre_edit_text,
+                            &mut client.compose_marked_at_shortcut,
+                            input_marked,
+                            keysym,
+                            &mut keystroke,
+                        );
                         state.compose_state = Some(compose_state);
+                        drop(state);
+                        for edit in composed.edits {
+                            match edit {
+                                ComposeEdit::Unmark => window.handle_ime_unmark(),
+                                ComposeEdit::Mark(text) => window.handle_ime_preedit(text),
+                            }
+                        }
+                        if !composed.goes_on {
+                            return Some(());
+                        }
+                        state = self.0.borrow_mut();
                     }
                     keystroke
                 };
@@ -1656,13 +1661,29 @@ impl X11Client {
                         .unwrap_or_else(|| window.clone())
                         .handle_ime_unmark();
                     state = self.0.borrow_mut();
-                } else if let Some(text) = state.pre_edit_text.take() {
-                    if let Some(compose_state) = state.compose_state.as_mut() {
-                        compose_state.reset();
+                } else {
+                    // Changed in elundqvist/gpui-kit (elundqvist/kvist#482): the
+                    // sequence ends whether or not anything is marked for it,
+                    // and a mark ends with what the input has marked kept, in
+                    // the window that has the keyboard, as the input method's
+                    // above: the client's own copy of the ´ was committed, in
+                    // the window clicked, so it went in at the caret of an
+                    // input that had let go of it, or of another window's
+                    let client = &mut *state;
+                    let marked = end_compose(
+                        client.compose_state.as_mut(),
+                        &mut client.pre_edit_text,
+                        &mut client.compose_marked_at_shortcut,
+                    );
+                    if marked {
+                        let composed = state.keyboard_focused_window;
+                        drop(state);
+                        composed
+                            .and_then(|composed| self.get_window(composed))
+                            .unwrap_or_else(|| window.clone())
+                            .handle_ime_unmark();
+                        state = self.0.borrow_mut();
                     }
-                    drop(state);
-                    window.handle_ime_commit(text);
-                    state = self.0.borrow_mut();
                 }
                 match button_or_scroll_from_event_detail(event.detail) {
                     Some(ButtonOrScroll::Button(button)) => {

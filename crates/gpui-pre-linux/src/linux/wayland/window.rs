@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre-linux 0.3.3 as published to crates.io: FORK.md at
+// the crate's root lists the changes.
 use std::{
     cell::{Cell, Ref, RefCell, RefMut},
     ffi::c_void,
@@ -1435,6 +1437,22 @@ impl WaylandWindowStatePtr {
             }
             self.state.borrow_mut().input_handler = Some(input_handler);
         }
+    }
+
+    /// Whether the window's input has text marked for a composition, asked
+    /// of its input handler.
+    ///
+    /// Added in elundqvist/gpui-kit (elundqvist/kvist#482), for the client to
+    /// end a dead key's sequence whose ´ the input let go of after a shortcut.
+    pub fn has_marked_text(&self) -> bool {
+        let mut state = self.state.borrow_mut();
+        let Some(mut input_handler) = state.input_handler.take() else {
+            return false;
+        };
+        drop(state);
+        let marked = input_handler.marked_text_range().is_some();
+        self.state.borrow_mut().input_handler = Some(input_handler);
+        marked
     }
 
     pub fn get_ime_area(&self) -> Option<Bounds<Pixels>> {

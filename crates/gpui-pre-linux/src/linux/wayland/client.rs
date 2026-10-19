@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre-linux 0.3.3 as published to crates.io: FORK.md at
+// the crate's root lists the changes.
 use std::{
     cell::{RefCell, RefMut},
     hash::Hash,
@@ -81,9 +83,9 @@ use super::{
 };
 
 use crate::linux::{
-    DOUBLE_CLICK_INTERVAL, LinuxClient, LinuxCommon, LinuxKeyboardLayout, PIPE_READ_TIMEOUT,
-    SCROLL_LINES, capslock_from_xkb, cursor_style_to_icon_names, get_xkb_compose_state,
-    is_within_click_distance, keystroke_from_xkb, keystroke_underlying_dead_key,
+    ComposeEdit, DOUBLE_CLICK_INTERVAL, LinuxClient, LinuxCommon, LinuxKeyboardLayout,
+    PIPE_READ_TIMEOUT, SCROLL_LINES, capslock_from_xkb, compose_key, cursor_style_to_icon_names,
+    end_compose, get_xkb_compose_state, is_within_click_distance, keystroke_from_xkb,
     modifiers_from_xkb, new_xkb_context, open_uri_internal, read_fd_with_timeout,
     reveal_path_internal,
     wayland::{
@@ -325,6 +327,9 @@ pub(crate) struct WaylandClientState {
     primary_selection: Option<zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1>,
     text_input: Option<zwp_text_input_v3::ZwpTextInputV3>,
     pre_edit_text: Option<String>,
+    // Added in elundqvist/gpui-kit (elundqvist/kvist#482): whether the focused
+    // input had `pre_edit_text` marked as a shortcut passed the sequence by
+    compose_marked_at_shortcut: bool,
     ime_pre_edit: Option<String>,
     composing: bool,
     last_ime_cursor_rectangle: Option<ImeCursorRectangle>,
@@ -908,6 +913,7 @@ impl WaylandClient {
             primary_selection,
             text_input: None,
             pre_edit_text: None,
+            compose_marked_at_shortcut: false,
             ime_pre_edit: None,
             composing: false,
             last_ime_cursor_rectangle: None,
@@ -1812,6 +1818,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                         compose.reset();
                     }
                     state.pre_edit_text.take();
+                    state.compose_marked_at_shortcut = false;
                     drop(state);
                     window.handle_ime(ImeInput::DeleteText);
                     window.set_focused(false);
@@ -1871,45 +1878,46 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                     wl_keyboard::KeyState::Pressed if !keysym.is_modifier_key() => {
                         let mut keystroke =
                             keystroke_from_xkb(keymap_state, state.modifiers, keycode);
+                        // Changed in elundqvist/gpui-kit (elundqvist/kvist#482): the
+                        // sequence is followed by `compose_key`, which passes a
+                        // shortcut by and ends the sequence at an Escape, and the
+                        // Escape goes no further, and ends one whose mark the
+                        // input let go of after a shortcut, which the input is
+                        // asked of with the client let go of first
+                        let input_marked = if state.pre_edit_text.is_some() {
+                            drop(state);
+                            let marked = focused_window.has_marked_text();
+                            state = client.borrow_mut();
+                            Some(marked)
+                        } else {
+                            None
+                        };
                         if let Some(mut compose) = state.compose_state.take() {
-                            compose.feed(keysym);
-                            match compose.status() {
-                                xkb::Status::Composing => {
-                                    keystroke.key_char = None;
-                                    state.pre_edit_text =
-                                        compose.utf8().or(keystroke_underlying_dead_key(keysym));
-                                    let pre_edit =
-                                        state.pre_edit_text.clone().unwrap_or(String::default());
-                                    drop(state);
-                                    focused_window.handle_ime(ImeInput::SetMarkedText(pre_edit));
-                                    state = client.borrow_mut();
-                                }
-
-                                xkb::Status::Composed => {
-                                    state.pre_edit_text.take();
-                                    keystroke.key_char = compose.utf8();
-                                    if let Some(keysym) = compose.keysym() {
-                                        keystroke.key = xkb::keysym_get_name(keysym);
-                                    }
-                                }
-                                xkb::Status::Cancelled => {
-                                    let pre_edit = state.pre_edit_text.take();
-                                    let new_pre_edit = keystroke_underlying_dead_key(keysym);
-                                    state.pre_edit_text = new_pre_edit.clone();
-                                    drop(state);
-                                    if let Some(pre_edit) = pre_edit {
-                                        focused_window.handle_ime(ImeInput::InsertText(pre_edit));
-                                    }
-                                    if let Some(current_key) = new_pre_edit {
-                                        focused_window
-                                            .handle_ime(ImeInput::SetMarkedText(current_key));
-                                    }
-                                    compose.feed(keysym);
-                                    state = client.borrow_mut();
-                                }
-                                _ => {}
-                            }
+                            let client_state = &mut *state;
+                            let composed = compose_key(
+                                &mut compose,
+                                &mut client_state.pre_edit_text,
+                                &mut client_state.compose_marked_at_shortcut,
+                                input_marked,
+                                keysym,
+                                &mut keystroke,
+                            );
                             state.compose_state = Some(compose);
+                            if !composed.goes_on {
+                                // nor does a key held before it repeat
+                                state.repeat.current_id += 1;
+                            }
+                            drop(state);
+                            for edit in composed.edits {
+                                focused_window.handle_ime(match edit {
+                                    ComposeEdit::Unmark => ImeInput::UnmarkText,
+                                    ComposeEdit::Mark(text) => ImeInput::SetMarkedText(text),
+                                });
+                            }
+                            if !composed.goes_on {
+                                return;
+                            }
+                            state = client.borrow_mut();
                         }
                         let input = PlatformInput::KeyDown(KeyDownEvent {
                             keystroke: keystroke.clone(),
@@ -2229,13 +2237,24 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                                 this.enable_ime();
                                 window.handle_ime(ImeInput::UnmarkText);
                                 state = client.borrow_mut();
-                            } else if let (Some(text), Some(compose)) =
-                                (state.pre_edit_text.take(), state.compose_state.as_mut())
-                            {
-                                compose.reset();
-                                drop(state);
-                                window.handle_ime(ImeInput::InsertText(text));
-                                state = client.borrow_mut();
+                            } else {
+                                // Changed in elundqvist/gpui-kit (elundqvist/kvist#482):
+                                // the sequence ends whether or not anything is marked
+                                // for it, and a mark ends with what the input has
+                                // marked kept, where its own copy of the ´ was
+                                // committed, at the caret of an input that had let go
+                                // of it
+                                let client_state = &mut *state;
+                                let marked = end_compose(
+                                    client_state.compose_state.as_mut(),
+                                    &mut client_state.pre_edit_text,
+                                    &mut client_state.compose_marked_at_shortcut,
+                                );
+                                if marked {
+                                    drop(state);
+                                    window.handle_ime(ImeInput::UnmarkText);
+                                    state = client.borrow_mut();
+                                }
                             }
                         }
                         let click_elapsed = state.click.last_click.elapsed();
