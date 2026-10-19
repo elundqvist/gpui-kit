@@ -384,28 +384,42 @@ fn extract_fold_ranges(tree: &tree_sitter::Tree) -> Vec<FoldRange> {
     extract_fold_ranges_in_range(tree, 0..usize::MAX)
 }
 
+/// The fold candidates of the nodes of `tree` that `byte_range` reaches,
+/// each node of two lines or more and those within it. The nodes still to
+/// look at are kept on a stack of their own, in the order a call a level
+/// took them: tree-sitter's error recovery nests the tree of a 1.4 MB
+/// paste of Rust with a key typed before it some 7,700 levels deep, and a
+/// call a level ran out of the stack of the worker thread the parse after
+/// the pause runs this on, which took the whole app down.
 fn extract_fold_ranges_in_range(
     tree: &tree_sitter::Tree,
     byte_range: Range<usize>,
 ) -> Vec<FoldRange> {
-    fn collect(node: tree_sitter::Node, bytes: &Range<usize>, ranges: &mut Vec<FoldRange>) {
-        if node.end_byte() <= bytes.start || node.start_byte() >= bytes.end {
-            return;
+    fn push_children<'t>(
+        node: tree_sitter::Node<'t>,
+        bytes: &Range<usize>,
+        nodes: &mut Vec<tree_sitter::Node<'t>>,
+    ) {
+        let first = nodes.len();
+        for_children_reached(node, bytes, |child| nodes.push(child));
+        nodes[first..].reverse();
+    }
+
+    let mut ranges = Vec::new();
+    let mut nodes = Vec::new();
+    push_children(tree.root_node(), &byte_range, &mut nodes);
+    while let Some(node) = nodes.pop() {
+        if node.end_byte() <= byte_range.start || node.start_byte() >= byte_range.end {
+            continue;
         }
         let start = node.start_position().row;
         let end = node.end_position().row;
         if end.saturating_sub(start) < 2 {
-            return;
+            continue;
         }
         ranges.push(FoldRange::new(start, end));
-        for_children_reached(node, bytes, |child| collect(child, bytes, ranges));
+        push_children(node, &byte_range, &mut nodes);
     }
-
-    let root = tree.root_node();
-    let mut ranges = Vec::new();
-    for_children_reached(root, &byte_range, |child| {
-        collect(child, &byte_range, &mut ranges)
-    });
     ranges.sort_by_key(|range| range.start_line);
     ranges.dedup_by_key(|range| range.start_line);
     ranges
@@ -746,5 +760,48 @@ mod tests {
             looked_at.push(child.start_position().row)
         });
         assert_eq!(looked_at, [2_500 * 6], "the function typed in, of 5,000");
+    }
+
+    /// The fold candidates of a tree nested thousands of levels deep are
+    /// found on a thread's stack as those of a flat one are: tree-sitter's
+    /// error recovery nests the tree of a 1.4 MB paste of Rust with a key
+    /// typed before it some 7,700 levels deep, and the walk, a call a
+    /// level, ran out of the stack of the worker thread the parse after the
+    /// pause runs on, which took the whole app down. Parentheses nested a
+    /// line each nest a tree as deep, and on a thread of 256 KB of stack the
+    /// walk found as it did before.
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_folds_of_a_tree_nested_deep_are_found_on_a_small_stack() {
+        const DEPTH: usize = 20_000;
+        let source = format!(
+            "fn deep() {{\n    let v = {}1{};\n}}\nfn after() {{\n\n}}\n",
+            "(\n".repeat(DEPTH),
+            "\n)".repeat(DEPTH)
+        );
+        let config = LanguageRegistry::singleton().language("rust").unwrap();
+        let mut parser = Parser::new();
+        parser.set_language(config.language.as_ref().unwrap()).unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        let middle = source.find("1\n").unwrap();
+        let (whole, reached) = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                (
+                    extract_fold_ranges(&tree),
+                    extract_fold_ranges_in_range(&tree, middle..middle + 1),
+                )
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        // the function, each parenthesis from the `let`'s on, and the
+        // function after it, on lines of their own
+        let lines = 2 * DEPTH + 2;
+        let mut expected = vec![FoldRange::new(0, lines)];
+        expected.extend((1..=DEPTH).map(|row| FoldRange::new(row, 2 * DEPTH + 2 - row)));
+        expected.push(FoldRange::new(lines + 1, lines + 3));
+        assert_eq!(whole, expected);
+        assert_eq!(reached, expected[..=DEPTH]);
     }
 }

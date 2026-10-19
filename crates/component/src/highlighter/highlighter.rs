@@ -2588,38 +2588,35 @@ pub(crate) fn unique_styles(
 /// longer than the view or `(function_item (identifier) @function)` on a
 /// long function, is found by no query of its children, and they are to be
 /// queried at themselves alone.
+///
+/// The nodes still to look at are kept on a stack of their own, in the
+/// order a call a level took them: tree-sitter's error recovery nests the
+/// tree of a 1.4 MB paste of Rust with a key typed before it some 7,700
+/// levels deep, each far larger than the view.
 fn collect_query_nodes<'a>(
     root: tree_sitter::Node<'a>,
     range: &Range<usize>,
 ) -> (Vec<tree_sitter::Node<'a>>, Vec<tree_sitter::Node<'a>>) {
     let mut nodes = Vec::new();
     let mut gone_into = Vec::new();
-    collect_query_nodes_inner(root, range, &mut nodes, &mut gone_into);
-    if nodes.is_empty() {
-        // the root, whole, has every pattern the nodes gone into have
-        return (vec![root], Vec::new());
-    }
-    (nodes, gone_into)
-}
+    let mut to_look_at = vec![root];
+    while let Some(node) = to_look_at.pop() {
+        // Skip nodes entirely outside the range.
+        if node.end_byte() <= range.start || node.start_byte() >= range.end {
+            continue;
+        }
 
-fn collect_query_nodes_inner<'a>(
-    node: tree_sitter::Node<'a>,
-    range: &Range<usize>,
-    out: &mut Vec<tree_sitter::Node<'a>>,
-    gone_into: &mut Vec<tree_sitter::Node<'a>>,
-) {
-    // Skip nodes entirely outside the range.
-    if node.end_byte() <= range.start || node.start_byte() >= range.end {
-        return;
-    }
+        let node_span = node.end_byte() - node.start_byte();
+        let range_span = range.end - range.start;
+        if node_span <= range_span + LARGE_NODE_THRESHOLD || node.child_count() == 0 {
+            nodes.push(node);
+            continue;
+        }
 
-    let node_span = node.end_byte() - node.start_byte();
-    let range_span = range.end - range.start;
-
-    // Use `goto_first_child_for_byte` to seek directly to the first
-    // overlapping child instead of iterating all children from the start.
-    if node_span > range_span + LARGE_NODE_THRESHOLD && node.child_count() > 0 {
+        // Use `goto_first_child_for_byte` to seek directly to the first
+        // overlapping child instead of iterating all children from the start.
         gone_into.push(node);
+        let first = to_look_at.len();
         let mut cursor = node.walk();
         if cursor.goto_first_child_for_byte(range.start).is_some() {
             loop {
@@ -2627,16 +2624,19 @@ fn collect_query_nodes_inner<'a>(
                 if child.start_byte() >= range.end {
                     break;
                 }
-                collect_query_nodes_inner(child, range, out, gone_into);
+                to_look_at.push(child);
                 if !cursor.goto_next_sibling() {
                     break;
                 }
             }
         }
-        return;
+        to_look_at[first..].reverse();
     }
-
-    out.push(node);
+    if nodes.is_empty() {
+        // the root, whole, has every pattern the nodes gone into have
+        return (vec![root], Vec::new());
+    }
+    (nodes, gone_into)
 }
 
 /// Merge other style (Other on top)
@@ -5093,6 +5093,55 @@ $x = 1;
             !highlights.iter().any(|h| h.name.as_ref() == "string"),
             "{highlights:?}"
         );
+    }
+
+    /// The nodes in view of a tree nested thousands of levels deep are
+    /// found on a thread's stack as those of a flat one are: tree-sitter's
+    /// error recovery nests the tree of a 1.4 MB paste of Rust with a key
+    /// typed before it some 7,700 levels deep, each level far larger than
+    /// the view, and a walk a call a level runs out of a thread's stack.
+    /// Parentheses nested a line each nest a tree as deep.
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_the_nodes_in_view_of_a_tree_nested_deep_are_found_on_a_small_stack() {
+        const DEPTH: usize = 20_000;
+        let source = format!(
+            "fn deep() {{\n    let v = {}1{};\n}}\n",
+            "(\n".repeat(DEPTH),
+            "\n)".repeat(DEPTH)
+        );
+        let config = LanguageRegistry::singleton().language("rust").unwrap();
+        let mut parser = Parser::new();
+        parser.set_language(config.language.as_ref().unwrap()).unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        let middle = source.find("1\n").unwrap();
+        let range = middle..middle + 1;
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let (nodes, gone_into) = collect_query_nodes(tree.root_node(), &range);
+                // gone into, each within the one before it and far larger
+                // than the view, down to the parenthesis queried whole
+                assert!(gone_into.len() > DEPTH / 2, "{}", gone_into.len());
+                let child_of = |child: tree_sitter::Node, parent: tree_sitter::Node| {
+                    let mut cursor = parent.walk();
+                    parent.children(&mut cursor).any(|c| c == child)
+                };
+                assert_eq!(gone_into[0], tree.root_node());
+                for pair in gone_into.windows(2) {
+                    assert!(child_of(pair[1], pair[0]));
+                }
+                assert!(gone_into.iter().all(|node| node.byte_range().len() > 1 + LARGE_NODE_THRESHOLD));
+                let [node] = nodes.as_slice() else {
+                    panic!("one node queried whole: {nodes:?}");
+                };
+                assert!(child_of(*node, *gone_into.last().unwrap()));
+                assert_eq!(node.kind(), "parenthesized_expression");
+                assert!(node.byte_range().len() <= 1 + LARGE_NODE_THRESHOLD);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
