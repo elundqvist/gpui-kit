@@ -805,3 +805,131 @@ mod tests {
         assert_eq!(reached, expected[..=DEPTH]);
     }
 }
+
+/// Keys typed into a large Rust file and into a Markdown fence at any pace
+/// end coloured as a fresh parse colours the text (elundqvist/kvist#423).
+#[cfg(test)]
+#[cfg(feature = "tree-sitter-languages")]
+mod typing_at_any_pace {
+    use super::super::HighlightTheme;
+    use super::super::highlighter::tests::fresh_highlighter;
+    use super::*;
+
+    /// A character typed at `at` of `text`: the edit the editor hands its
+    /// highlighter for it.
+    fn typed(text: &mut String, at: usize, c: char) -> BaseInputEdit {
+        let row = text[..at].matches('\n').count();
+        let column = at - text[..at].rfind('\n').map_or(0, |n| n + 1);
+        text.insert(at, c);
+        BaseInputEdit {
+            start_byte: at,
+            old_end_byte: at,
+            new_end_byte: at + c.len_utf8(),
+            start_position: gpui_base::input::Point::new(row, column),
+            old_end_position: gpui_base::input::Point::new(row, column),
+            new_end_position: gpui_base::input::Point::new(row, column + c.len_utf8()),
+        }
+    }
+
+    const LITERALS: &str = "fn literals(value: i32) -> i32 {\n    let doubled = value * 2;\n    doubled\n}\n";
+
+    /// A Rust file of 97 KB, too large to parse at the key.
+    fn big_rust() -> String {
+        let mut rust = String::from(LITERALS);
+        for i in 0.. {
+            if rust.len() >= 97_000 {
+                break;
+            }
+            rust += &format!("/// doc {i}\nfn f{i}(x: u32) -> u32 {{\n    let y = x + {i};\n    y * 2\n}}\n");
+        }
+        rust
+    }
+
+    /// A Markdown file of 34 KB with a Rust fence of 10 KB, QA's SMALL.md.
+    fn small_md() -> String {
+        let mut fence = String::from(LITERALS);
+        for i in 0.. {
+            if fence.len() >= 10_000 {
+                break;
+            }
+            fence += &format!("fn f{i}(x: u32) -> u32 {{\n    let y = x + {i};\n    y * 2\n}}\n");
+        }
+        let mut md = format!("# Small\n\nSome text first.\n\n```rust\n{fence}```\n\n");
+        while md.len() < 34_000 {
+            md += "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod.\n\n";
+        }
+        md
+    }
+
+    /// ` 42 "s" true 7` typed after `let doubled = value * 2;` in `source`,
+    /// for each of `seeds` at its own pace: between two keys 30 or 70 ms go
+    /// by, or 200, the parse after the pause begun and some of the tasks
+    /// after it run, or all of them, or only some of the tasks with no
+    /// time going by. Once the typing has paused, the line is coloured as
+    /// a fresh parse of the text colours it.
+    fn typed_at_any_pace(cx: &mut gpui::TestAppContext, language: &str, source: String, seeds: std::ops::Range<u64>) {
+        cx.update(crate::init);
+        let (editor, cx) = cx.add_window_view(|window, cx| EditorState::new(window, cx));
+        let theme = HighlightTheme::default_dark();
+        let typing = " 42 \"s\" true 7";
+        let mut failures = Vec::new();
+        for seed in seeds {
+            let mut state = seed;
+            let mut next = |n: u64| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 33) % n
+            };
+            let mut text = source.clone();
+            let mut h = TreeSitterInputHighlighter::new(language);
+            let rope = Rope::from(text.as_str());
+            cx.update(|window, cx| editor.update(cx, |_, cx| h.update(None, &rope, true, window, cx)));
+            cx.executor().advance_clock(Duration::from_secs(1));
+            cx.run_until_parked();
+            let at = text.find("value * 2;").unwrap() + "value * 2;".len();
+            for (i, c) in typing.chars().enumerate() {
+                let edit = typed(&mut text, at + i, c);
+                let rope = Rope::from(text.as_str());
+                cx.update(|window, cx| editor.update(cx, |_, cx| h.update(Some(edit), &rope, true, window, cx)));
+                match next(5) {
+                    0 => cx.executor().advance_clock(Duration::from_millis(30)),
+                    1 => cx.executor().advance_clock(Duration::from_millis(70)),
+                    2 => {
+                        cx.executor().advance_clock(Duration::from_millis(200));
+                        for _ in 0..next(6) {
+                            cx.executor().tick();
+                        }
+                    }
+                    3 => {
+                        cx.executor().advance_clock(Duration::from_millis(200));
+                        cx.run_until_parked();
+                    }
+                    _ => {
+                        for _ in 0..next(4) {
+                            cx.executor().tick();
+                        }
+                    }
+                }
+            }
+            cx.executor().advance_clock(Duration::from_secs(1));
+            cx.run_until_parked();
+            let fresh = fresh_highlighter(language, &text);
+            let line = at - "    let doubled = value * 2;".len()..at + typing.len();
+            let got = h.inner.borrow().styles(&line, theme.as_ref());
+            let want = fresh.styles(&line, theme.as_ref());
+            if got != want {
+                failures.push(format!("seed {seed}:\n got {got:?}\nwant {want:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{} paces:\n{}", failures.len(), failures.join("\n"));
+    }
+
+    #[gpui::test]
+    fn in_a_large_rust_file(cx: &mut gpui::TestAppContext) {
+        typed_at_any_pace(cx, "rust", big_rust(), 0..40);
+    }
+
+    #[gpui::test]
+    fn in_a_markdown_fence(cx: &mut gpui::TestAppContext) {
+        typed_at_any_pace(cx, "markdown", small_md(), 0..40);
+    }
+}
