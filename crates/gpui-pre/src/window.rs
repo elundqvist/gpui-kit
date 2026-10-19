@@ -8,8 +8,8 @@ use crate::Inspector;
 use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+    AsyncApp, AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds,
+    BoxShadow, Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
@@ -1263,6 +1263,11 @@ pub struct Window {
     pending_input: Option<PendingInput>,
     pending_modifier: ModifierState,
     pub(crate) pending_input_observers: SubscriberSet<(), AnyObserver>,
+    /// How many holds on the window's keyboard input are out
+    /// ([`Window::hold_input`]).
+    pub(crate) input_holds: usize,
+    /// The keyboard input that came while it was held, in the order it came.
+    pub(crate) held_input: std::collections::VecDeque<HeldInput>,
     prompt: Option<RenderablePromptHandle>,
     pub(crate) client_inset: Option<Pixels>,
     /// The hitbox that has captured the pointer, if any.
@@ -2087,6 +2092,8 @@ impl Window {
             pending_input: None,
             pending_modifier: ModifierState::default(),
             pending_input_observers: SubscriberSet::new(),
+            input_holds: 0,
+            held_input: Default::default(),
             prompt: None,
             client_inset: None,
             image_cache_stack: Vec::new(),
@@ -2116,6 +2123,66 @@ impl Window {
 pub struct DispatchEventResult {
     pub propagate: bool,
     pub default_prevented: bool,
+}
+
+/// A hold on a window's input, from [`Window::hold_input`].
+///
+/// Changed in elundqvist/gpui-kit (elundqvist/kvist#401). While a hold is
+/// out, the keys that come to the window (key downs, key ups and changes
+/// of the modifiers), the presses and releases of the mouse's buttons, the
+/// wheel, the moves of a button held down and drops, the text the platform
+/// hands its input handler and what an input method composes and commits
+/// all wait; only the pointer's moves with no button down pass, so that
+/// what is under it still lights up. Once the last hold is released they
+/// are dispatched in the order they came, one an effect cycle, as if they
+/// had come then. An editor whose paste waits for another program's
+/// clipboard holds the input until the paste has landed, so that the keys
+/// typed after the paste land after it, and a click after them lands after
+/// them, as they did when the read held the frame. Released with
+/// [`Window::release_input`]; a hold dropped instead is released a turn of
+/// the foreground executor later.
+#[must_use = "the window's input waits until the hold is released"]
+pub struct InputHold {
+    window: AnyWindowHandle,
+    cx: Option<AsyncApp>,
+}
+
+impl Drop for InputHold {
+    fn drop(&mut self) {
+        let Some(mut cx) = self.cx.take() else {
+            return;
+        };
+        let window = self.window;
+        cx.foreground_executor()
+            .clone()
+            .spawn(async move {
+                window
+                    .update(&mut cx, |_, window, cx| window.end_input_hold(cx))
+                    .ok();
+            })
+            .detach();
+    }
+}
+
+/// Input that came to a window while it was held (`Window::hold_input`).
+pub(crate) enum HeldInput {
+    /// A key down, key up, change of the modifiers, or anything the mouse
+    /// did but move with no button down ([`InputHold`]).
+    Event(PlatformInput),
+    /// Text for the input handler (`replace_text_in_range`): typed, or
+    /// committed by an input method.
+    Text {
+        range: Option<Range<usize>>,
+        text: String,
+    },
+    /// Text an input method is composing (`replace_and_mark_text_in_range`).
+    MarkedText {
+        range: Option<Range<usize>>,
+        text: String,
+        selected: Option<Range<usize>>,
+    },
+    /// The end of a composition (`unmark_text`).
+    Unmark,
 }
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
@@ -5209,6 +5276,133 @@ impl Window {
         }
     }
 
+    /// Holds back the window's input until the returned hold is released
+    /// ([`InputHold`] says what waits). Holds nest: the input waits until
+    /// the last of them is released.
+    pub fn hold_input(&mut self, cx: &App) -> InputHold {
+        self.input_holds += 1;
+        InputHold {
+            window: self.handle,
+            cx: Some(cx.to_async()),
+        }
+    }
+
+    /// Releases a hold from [`Window::hold_input`]. When it was the last,
+    /// the input that waited is dispatched in the order it came, at the
+    /// end of the current effect cycle, so that what the caller has done
+    /// (a paste, its notifications and the events they emit) comes first.
+    pub fn release_input(&mut self, mut hold: InputHold, cx: &mut App) {
+        if hold.window != self.handle || hold.cx.take().is_none() {
+            return;
+        }
+        self.end_input_hold(cx);
+    }
+
+    /// Whether the window's input is held ([`Window::hold_input`]).
+    pub fn input_held(&self) -> bool {
+        self.input_holds > 0
+    }
+
+    fn end_input_hold(&mut self, cx: &mut App) {
+        self.input_holds = self.input_holds.saturating_sub(1);
+        if self.input_holds > 0 || self.held_input.is_empty() {
+            return;
+        }
+        self.replay_held_input_next(cx);
+    }
+
+    /// Dispatches the next input that waited at the end of this effect
+    /// cycle, after the effects queued so far.
+    fn replay_held_input_next(&mut self, cx: &mut App) {
+        let handle = self.handle;
+        cx.defer(move |cx| {
+            handle
+                .update(cx, |_, window, cx| window.replay_held_input(cx))
+                .ok();
+        });
+    }
+
+    /// Keeps `input` for when the window's input is no longer held, if it
+    /// is held; gives it back if not.
+    pub(crate) fn hold_back(&mut self, input: HeldInput) -> Option<HeldInput> {
+        if self.input_holds == 0 {
+            return Some(input);
+        }
+        self.held_input.push_back(input);
+        None
+    }
+
+    /// Whether `event` waits while the window's input is held: all of it
+    /// but the pointer's moves with no button down, and its leaving the
+    /// window, which pass while nothing the mouse did waits, so that what
+    /// is under it still lights up; after a click that waits they wait
+    /// too, to come in the order they came.
+    fn waits_while_held(&self, event: &PlatformInput) -> bool {
+        let hover = match event {
+            PlatformInput::MouseMove(event) => event.pressed_button.is_none(),
+            PlatformInput::MouseExited(event) => event.pressed_button.is_none(),
+            _ => false,
+        };
+        !hover
+            || self.held_input.iter().any(
+                |input| matches!(input, HeldInput::Event(event) if event.mouse_event().is_some()),
+            )
+    }
+
+    /// Dispatches the first input that waited while the window's input was
+    /// held, as the platform would have when it came, and the next at the
+    /// end of the effect cycle, after the effects this one queued, as the
+    /// platform hands each in an update of its own: what a key's action
+    /// emits is heard, and the focus it moves has moved, before the key
+    /// after it. A key down that no handler stopped, with no modifier but
+    /// shift, gives its character to the input handler next, as the Linux
+    /// clients do. A key that holds the input again, another paste, leaves
+    /// the rest waiting behind it.
+    fn replay_held_input(&mut self, cx: &mut App) {
+        if self.input_holds > 0 {
+            return;
+        }
+        let Some(input) = self.held_input.pop_front() else {
+            return;
+        };
+        if self.invalidator.is_dirty() {
+            self.draw(cx).clear(cx);
+        }
+        match input {
+            HeldInput::Event(event) => {
+                let key_char = match &event {
+                    PlatformInput::KeyDown(key_down)
+                        if key_down
+                            .keystroke
+                            .modifiers
+                            .is_subset_of(&Modifiers::shift()) =>
+                    {
+                        key_down.keystroke.key_char.clone()
+                    }
+                    _ => None,
+                };
+                let result = self.dispatch_event(event, cx);
+                if let Some(text) = key_char
+                    && result.propagate
+                {
+                    // the key's text comes next, ahead of anything a hold the
+                    // key took leaves waiting
+                    self.held_input
+                        .push_front(HeldInput::Text { range: None, text });
+                }
+            }
+            input => {
+                if let Some(mut input_handler) = self.platform_window.take_input_handler() {
+                    input_handler.replay_held(input, self, cx);
+                    self.platform_window.set_input_handler(input_handler);
+                }
+            }
+        }
+        if self.input_holds == 0 && !self.held_input.is_empty() {
+            self.replay_held_input_next(cx);
+        }
+    }
+
     /// Dispatch a given keystroke as though the user had typed it.
     /// You can create a keystroke with Keystroke::parse("").
     pub fn dispatch_keystroke(&mut self, keystroke: Keystroke, cx: &mut App) -> bool {
@@ -5254,6 +5448,19 @@ impl Window {
     /// Dispatch a mouse, keyboard, or touch event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+        let event = if self.waits_while_held(&event) {
+            match self.hold_back(HeldInput::Event(event)) {
+                Some(HeldInput::Event(event)) => event,
+                _ => {
+                    return DispatchEventResult {
+                        propagate: false,
+                        default_prevented: true,
+                    };
+                }
+            }
+        } else {
+            event
+        };
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input(event.kind_name());
         let update_count_before = self.invalidator.update_count();
@@ -8363,5 +8570,319 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+}
+
+/// Tests of a window's input held back while it waits (`Window::hold_input`,
+/// elundqvist/kvist#401).
+#[cfg(test)]
+mod held_input_tests {
+    use std::{cell::RefCell, ops::Range, rc::Rc};
+
+    use crate::{
+        self as gpui, App, Bounds, Context, EventEmitter, FocusHandle, InputHandler, InputHold,
+        InteractiveElement as _, IntoElement, KeyBinding, Modifiers, ModifiersChangedEvent,
+        MouseButton, MouseMoveEvent, ParentElement as _, Pixels, PlatformWindow as _, Point,
+        Render, Styled as _, TestAppContext, UTF16Selection, VisualContext as _, VisualTestContext,
+        Window, canvas, div, point, px,
+    };
+
+    actions!(held_input_test, [Mark, MarkAndHold, Announce]);
+
+    /// What `Announce` emits; the view's subscriber writes `<heard>`.
+    struct Announced;
+
+    /// What came to the view, in the order it came: text as it is, an
+    /// action as `<name>`, an input method's composition as `[text]`, the
+    /// mouse as `<down>` and `<move>`.
+    type Log = Rc<RefCell<Vec<String>>>;
+
+    #[derive(Clone)]
+    struct Recorder {
+        log: Log,
+    }
+
+    impl InputHandler for Recorder {
+        fn selected_text_range(
+            &mut self,
+            _: bool,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<UTF16Selection> {
+            None
+        }
+
+        fn marked_text_range(&mut self, _: &mut Window, _: &mut App) -> Option<Range<usize>> {
+            None
+        }
+
+        fn text_for_range(
+            &mut self,
+            _: Range<usize>,
+            _: &mut Option<Range<usize>>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<String> {
+            None
+        }
+
+        fn replace_text_in_range(
+            &mut self,
+            _: Option<Range<usize>>,
+            text: &str,
+            _: &mut Window,
+            _: &mut App,
+        ) {
+            self.log.borrow_mut().push(text.to_string());
+        }
+
+        fn replace_and_mark_text_in_range(
+            &mut self,
+            _: Option<Range<usize>>,
+            text: &str,
+            _: Option<Range<usize>>,
+            _: &mut Window,
+            _: &mut App,
+        ) {
+            self.log.borrow_mut().push(format!("[{text}]"));
+        }
+
+        fn unmark_text(&mut self, _: &mut Window, _: &mut App) {
+            self.log.borrow_mut().push("[]".to_string());
+        }
+
+        fn bounds_for_range(
+            &mut self,
+            _: Range<usize>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<Bounds<Pixels>> {
+            None
+        }
+
+        fn character_index_for_point(
+            &mut self,
+            _: Point<Pixels>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<usize> {
+            None
+        }
+    }
+
+    struct HeldInputView {
+        focus_handle: FocusHandle,
+        log: Log,
+        /// The holds `MarkAndHold` took, as a paste whose read waits does.
+        holds: Rc<RefCell<Vec<InputHold>>>,
+    }
+
+    impl EventEmitter<Announced> for HeldInputView {}
+
+    impl Render for HeldInputView {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let recorder = Recorder {
+                log: self.log.clone(),
+            };
+            let focus_handle = self.focus_handle.clone();
+            div()
+                .size_full()
+                .key_context("Held")
+                .track_focus(&self.focus_handle)
+                .on_action(cx.listener(|this, _: &Mark, _, _| {
+                    this.log.borrow_mut().push("<mark>".to_string());
+                }))
+                .on_action(cx.listener(|this, _: &MarkAndHold, window, cx| {
+                    this.log.borrow_mut().push("<hold>".to_string());
+                    this.holds.borrow_mut().push(window.hold_input(cx));
+                }))
+                .on_action(cx.listener(|this, _: &Announce, _, cx| {
+                    this.log.borrow_mut().push("<announce>".to_string());
+                    cx.emit(Announced);
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, _| this.log.borrow_mut().push("<down>".to_string())),
+                )
+                .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, _| {
+                    this.log.borrow_mut().push("<move>".to_string());
+                }))
+                .child(
+                    canvas(
+                        |_, _, _| {},
+                        move |_, _, window, cx| {
+                            window.handle_input(&focus_handle, recorder.clone(), cx);
+                        },
+                    )
+                    .size_full(),
+                )
+        }
+    }
+
+    fn held_input_view(
+        cx: &mut TestAppContext,
+    ) -> (&mut VisualTestContext, Log, Rc<RefCell<Vec<InputHold>>>) {
+        cx.update(|cx| {
+            cx.bind_keys([
+                KeyBinding::new("ctrl-m", Mark, Some("Held")),
+                KeyBinding::new("ctrl-h", MarkAndHold, Some("Held")),
+                KeyBinding::new("ctrl-a", Announce, Some("Held")),
+            ])
+        });
+        let log = Log::default();
+        let holds = Rc::new(RefCell::new(Vec::new()));
+        let (view, cx) = cx.add_window_view({
+            let log = log.clone();
+            let holds = holds.clone();
+            move |_, cx| HeldInputView {
+                focus_handle: cx.focus_handle(),
+                log,
+                holds,
+            }
+        });
+        let focus_handle = cx.update(|_, cx| view.read(cx).focus_handle.clone());
+        cx.update(|window, cx| {
+            window.focus(&focus_handle, cx);
+            window.activate_window();
+            let heard = log.clone();
+            cx.subscribe(&view, move |_, _: &Announced, _| {
+                heard.borrow_mut().push("<heard>".to_string());
+            })
+            .detach();
+        });
+        cx.run_until_parked();
+        (cx, log, holds)
+    }
+
+    /// Text handed to the window's input handler as the platform hands it
+    /// an input method's commit or composition.
+    fn input_method(cx: &mut VisualTestContext, f: impl FnOnce(&mut crate::PlatformInputHandler)) {
+        let mut platform_window = cx.test_window(cx.window_handle());
+        let mut input_handler = platform_window
+            .take_input_handler()
+            .expect("an input handler");
+        f(&mut input_handler);
+        platform_window.set_input_handler(input_handler);
+    }
+
+    fn logged(log: &Log) -> Vec<String> {
+        log.borrow().clone()
+    }
+
+    #[gpui::test]
+    fn held_keys_text_and_commits_wait_and_come_in_order(cx: &mut TestAppContext) {
+        let (cx, log, _) = held_input_view(cx);
+        cx.simulate_keystrokes("a");
+        assert_eq!(logged(&log), ["a"]);
+
+        let hold = cx.update(|window, cx| window.hold_input(cx));
+        cx.update(|window, _| assert!(window.input_held()));
+        cx.simulate_keystrokes("b ctrl-m c");
+        input_method(cx, |handler| {
+            handler.replace_and_mark_text_in_range(None, "e", None);
+            handler.replace_text_in_range(None, "é");
+        });
+        cx.simulate_event(ModifiersChangedEvent {
+            modifiers: Modifiers::shift(),
+            capslock: Default::default(),
+        });
+        cx.simulate_keystrokes("shift-d");
+        assert_eq!(logged(&log), ["a"], "nothing comes while the input is held");
+
+        cx.update(|window, cx| window.release_input(hold, cx));
+        cx.run_until_parked();
+        cx.update(|window, _| assert!(!window.input_held()));
+        assert_eq!(logged(&log), ["a", "b", "<mark>", "c", "[e]", "é", "D"]);
+
+        cx.simulate_keystrokes("f");
+        assert_eq!(
+            logged(&log),
+            ["a", "b", "<mark>", "c", "[e]", "é", "D", "f"]
+        );
+    }
+
+    #[gpui::test]
+    fn a_key_that_holds_again_leaves_the_rest_waiting_behind_it(cx: &mut TestAppContext) {
+        let (cx, log, holds) = held_input_view(cx);
+        let hold = cx.update(|window, cx| window.hold_input(cx));
+        cx.simulate_keystrokes("a ctrl-h b ctrl-m");
+        assert!(logged(&log).is_empty());
+
+        cx.update(|window, cx| window.release_input(hold, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            logged(&log),
+            ["a", "<hold>"],
+            "the second paste holds the rest"
+        );
+        cx.update(|window, _| assert!(window.input_held()));
+
+        cx.simulate_keystrokes("c");
+        let second = holds.borrow_mut().pop().unwrap();
+        cx.update(|window, cx| window.release_input(second, cx));
+        cx.run_until_parked();
+        assert_eq!(logged(&log), ["a", "<hold>", "b", "<mark>", "c"]);
+    }
+
+    #[gpui::test]
+    fn holds_nest_and_a_dropped_hold_is_released(cx: &mut TestAppContext) {
+        let (cx, log, _) = held_input_view(cx);
+        let outer = cx.update(|window, cx| window.hold_input(cx));
+        let inner = cx.update(|window, cx| window.hold_input(cx));
+        cx.simulate_keystrokes("a");
+        cx.update(|window, cx| window.release_input(inner, cx));
+        cx.run_until_parked();
+        assert!(logged(&log).is_empty(), "the outer hold still holds");
+
+        drop(outer);
+        cx.run_until_parked();
+        assert_eq!(logged(&log), ["a"]);
+        cx.simulate_keystrokes("b");
+        assert_eq!(logged(&log), ["a", "b"]);
+    }
+
+    /// Each key that waited is dispatched in an effect cycle of its own, as
+    /// the platform hands each in an update of its own: what a key's action
+    /// emits is heard before the key after it comes, where it was heard
+    /// after every key that waited (a Return that opens a file, and the
+    /// key after it typed into the box it left).
+    #[gpui::test]
+    fn what_a_held_key_sets_off_comes_before_the_key_after_it(cx: &mut TestAppContext) {
+        let (cx, log, _) = held_input_view(cx);
+        cx.simulate_keystrokes("ctrl-a");
+        assert_eq!(logged(&log), ["<announce>", "<heard>"]);
+        log.borrow_mut().clear();
+
+        let hold = cx.update(|window, cx| window.hold_input(cx));
+        cx.simulate_keystrokes("ctrl-a x ctrl-a y");
+        assert!(logged(&log).is_empty());
+        cx.update(|window, cx| window.release_input(hold, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            logged(&log),
+            ["<announce>", "<heard>", "x", "<announce>", "<heard>", "y"]
+        );
+    }
+
+    /// The mouse's clicks wait with the keys, in the order they came, so a
+    /// click after keys that wait is not dispatched ahead of them, to move
+    /// the focus they were typed into; the pointer's moves pass while no
+    /// click waits, and wait behind one.
+    #[gpui::test]
+    fn a_click_waits_with_the_keys_and_a_move_passes(cx: &mut TestAppContext) {
+        let (cx, log, _) = held_input_view(cx);
+        let at = point(px(10.), px(10.));
+        let hold = cx.update(|window, cx| window.hold_input(cx));
+        cx.simulate_mouse_move(at, None, Modifiers::none());
+        assert_eq!(logged(&log), ["<move>"], "a move passes");
+        cx.simulate_keystrokes("a");
+        cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(point(px(12.), px(10.)), None, Modifiers::none());
+        cx.simulate_keystrokes("b");
+        assert_eq!(logged(&log), ["<move>"], "the rest waits");
+
+        cx.update(|window, cx| window.release_input(hold, cx));
+        cx.run_until_parked();
+        assert_eq!(logged(&log), ["<move>", "a", "<down>", "<move>", "b"]);
     }
 }

@@ -28,6 +28,29 @@ asks (section 4(b)); each says so at its top:
   the end of a line and "+Space" at the start of the next
   (elundqvist/kvist#386). A plus with spaces around it is still a place
   to break. Tests of both.
+- `src/window.rs`: `Window::hold_input`, `Window::release_input` and
+  `Window::input_held` (elundqvist/kvist#401). While a hold
+  (`InputHold`) is out, the keys that come to the window, a key down, a
+  key up or a change of the modifiers, wait, and so do the mouse's
+  presses, releases, wheel and drops, the text the platform hands the
+  input handler and what an input method composes and commits; the
+  pointer's moves with no button down pass while no click waits, so
+  that what is under it lights up. Once the last hold is released they
+  are dispatched in the order they came, one an effect cycle, as the
+  platform hands each in an update of its own, so that what a key's
+  action emits is heard, and the focus it moves has moved, before the
+  key after it; a key down that no handler stopped gives its character
+  to the input handler next, as the Linux clients do. A key that holds
+  the input again, a second paste, leaves the rest waiting behind it; a
+  hold dropped is released a turn of the foreground executor later. An
+  editor whose paste waits for another program's clipboard holds its
+  window's input meanwhile, so that what is typed and clicked after the
+  paste lands after it. Tests of the order, of what a key sets off
+  before the key after it, of a click among the keys and a move that
+  passes, of a key that holds again, and of nested and dropped holds.
+- `src/platform.rs`: `PlatformInputHandler` hands the window the text,
+  the composition and its end while the window's input is held, and
+  the handler what waited once it is released.
 
 ## Tests
 

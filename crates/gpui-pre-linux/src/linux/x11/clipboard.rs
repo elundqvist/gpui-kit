@@ -25,8 +25,8 @@ use std::{
     cell::RefCell,
     collections::{HashMap, hash_map::Entry},
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::JoinHandle,
     thread_local,
@@ -139,6 +139,10 @@ struct Inner {
     handover_cv: Condvar,
 
     serve_stopped: AtomicBool,
+
+    /// How many reads on other threads hold this (`ClipboardReader`), for
+    /// the last `Clipboard` to tell itself from them when it is dropped.
+    reads: AtomicUsize,
 }
 
 impl XContext {
@@ -247,6 +251,7 @@ impl Inner {
             handover_state: Mutex::new(ManagerHandoverState::Idle),
             handover_cv: Condvar::new(),
             serve_stopped: AtomicBool::new(false),
+            reads: AtomicUsize::new(0),
         })
     }
 
@@ -324,6 +329,11 @@ impl Inner {
 
         let highest_precedence_format =
             match self.read_single(&reader, selection, self.atoms.TARGETS) {
+                // Changed in elundqvist/gpui-kit (elundqvist/kvist#401): an
+                // owner that does not answer for its targets does not answer
+                // for any of the formats either, and asking for each of them
+                // in turn, four seconds apiece, held a paste a minute
+                Err(Error::TimedOut) => return Err(Error::TimedOut),
                 Err(err) => {
                     log::trace!("Clipboard TARGETS query failed with {err:?}");
                     None
@@ -377,6 +387,7 @@ impl Inner {
                     continue;
                 }
                 Err(e) => {
+                    // a time-out among them: the owner answers no more
                     log::trace!("Conversion to {} failed: {}", self.atom_name(*format), e);
                     return Err(e);
                 }
@@ -483,7 +494,7 @@ impl Inner {
             }
         }
         log::info!("Time-out hit while reading the clipboard.");
-        Err(Error::ContentNotAvailable)
+        Err(Error::TimedOut)
     }
 
     fn atom_of(&self, selection: ClipboardKind) -> Atom {
@@ -1013,20 +1024,6 @@ impl Clipboard {
         self.inner.write(data, selection, wait)
     }
 
-    fn image_format_atom(&self, format: ImageFormat) -> Atom {
-        match format {
-            ImageFormat::Png => self.inner.atoms.PNG__MIME,
-            ImageFormat::Jpeg => self.inner.atoms.JPEG_MIME,
-            ImageFormat::Webp => self.inner.atoms.WEBP_MIME,
-            ImageFormat::Gif => self.inner.atoms.GIF__MIME,
-            ImageFormat::Svg => self.inner.atoms.SVG__MIME,
-            ImageFormat::Bmp => self.inner.atoms.BMP__MIME,
-            ImageFormat::Tiff => self.inner.atoms.TIFF_MIME,
-            ImageFormat::Ico => self.inner.atoms.ICO__MIME,
-            ImageFormat::Pnm => self.inner.atoms.PNM__MIME,
-        }
-    }
-
     #[allow(unused)]
     pub(crate) fn set_image(
         &self,
@@ -1034,7 +1031,7 @@ impl Clipboard {
         selection: ClipboardKind,
         wait: WaitConfig,
     ) -> Result<()> {
-        let format = self.image_format_atom(image.format);
+        let format = self.inner.image_format_atom(image.format);
         let data = vec![ClipboardData {
             bytes: image.bytes,
             format: self.inner.atoms.PNG__MIME,
@@ -1043,17 +1040,75 @@ impl Clipboard {
     }
 
     pub(crate) fn get_any(&self, selection: ClipboardKind) -> Result<ClipboardItem> {
+        self.inner.get_any(selection)
+    }
+
+    /// A reader of the clipboard for another thread
+    /// (elundqvist/kvist#401).
+    pub(crate) fn reader(&self) -> ClipboardReader {
+        ClipboardReader {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
+    pub fn is_owner(&self, selection: ClipboardKind) -> bool {
+        self.inner.is_owner(selection).unwrap_or(false)
+    }
+}
+
+/// Reads the clipboard on a thread other than the one that draws.
+///
+/// Changed in elundqvist/gpui-kit (elundqvist/kvist#401): the clipboard
+/// another program owns was read on the drawing thread, which a paste of
+/// 1.4 MB held for about 35 ms while the owner handed it over. The reader
+/// asks the owner on a connection of its own, as before, from a
+/// background thread; a `Clipboard`'s handover to the clipboard manager
+/// when the last is dropped is not this one's to make, so it is a handle
+/// of its own rather than a `Clipboard`, and one the last `Clipboard`
+/// does not take for another while it reads: an app that quit while a
+/// paste was read handed the clipboard manager nothing.
+pub(crate) struct ClipboardReader {
+    inner: Weak<Inner>,
+}
+
+impl ClipboardReader {
+    pub(crate) fn get_any(&self, selection: ClipboardKind) -> Result<ClipboardItem> {
+        let inner = self.inner.upgrade().ok_or(Error::ContentNotAvailable)?;
+        inner.reads.fetch_add(1, Ordering::SeqCst);
+        let _read = gpui_util::defer(|| {
+            inner.reads.fetch_sub(1, Ordering::SeqCst);
+        });
+        inner.get_any(selection)
+    }
+}
+
+impl Inner {
+    fn image_format_atom(&self, format: ImageFormat) -> Atom {
+        match format {
+            ImageFormat::Png => self.atoms.PNG__MIME,
+            ImageFormat::Jpeg => self.atoms.JPEG_MIME,
+            ImageFormat::Webp => self.atoms.WEBP_MIME,
+            ImageFormat::Gif => self.atoms.GIF__MIME,
+            ImageFormat::Svg => self.atoms.SVG__MIME,
+            ImageFormat::Bmp => self.atoms.BMP__MIME,
+            ImageFormat::Tiff => self.atoms.TIFF_MIME,
+            ImageFormat::Ico => self.atoms.ICO__MIME,
+            ImageFormat::Pnm => self.atoms.PNM__MIME,
+        }
+    }
+
+    fn get_any(&self, selection: ClipboardKind) -> Result<ClipboardItem> {
         let image_entries = ImageFormat::iter()
             .map(|format| (self.image_format_atom(format), format))
             .collect::<Vec<_>>();
 
         let text_format_atoms: &[Atom] = &[
-            self.inner.atoms.UTF8_STRING,
-            self.inner.atoms.UTF8_MIME_0,
-            self.inner.atoms.UTF8_MIME_1,
-            self.inner.atoms.STRING,
-            self.inner.atoms.TEXT,
-            self.inner.atoms.TEXT_MIME_UNKNOWN,
+            self.atoms.UTF8_STRING,
+            self.atoms.UTF8_MIME_0,
+            self.atoms.UTF8_MIME_1,
+            self.atoms.STRING,
+            self.atoms.TEXT,
+            self.atoms.TEXT_MIME_UNKNOWN,
         ];
 
         // image formats first, as they are more specific, and read will return the first
@@ -1062,11 +1117,11 @@ impl Clipboard {
         format_atoms.extend(image_entries.iter().map(|(atom, _)| *atom));
         format_atoms.extend_from_slice(text_format_atoms);
 
-        let result = self.inner.read(&format_atoms, selection)?;
+        let result = self.read(&format_atoms, selection)?;
 
         log::trace!(
             "read clipboard as format {:?}",
-            self.inner.atom_name(result.format)
+            self.atom_name(result.format)
         );
 
         for (format_atom, image_format) in image_entries {
@@ -1081,7 +1136,7 @@ impl Clipboard {
             }
         }
 
-        let text = if result.format == self.inner.atoms.STRING {
+        let text = if result.format == self.atoms.STRING {
             // ISO Latin-1
             // See: https://stackoverflow.com/questions/28169745/what-are-the-options-to-convert-iso-8859-1-latin-1-to-a-string-utf-8
             result.bytes.into_iter().map(|c| c as char).collect()
@@ -1089,10 +1144,6 @@ impl Clipboard {
             String::from_utf8(result.bytes).map_err(|_| Error::ConversionFailure)?
         };
         Ok(ClipboardItem::new_string(text))
-    }
-
-    pub fn is_owner(&self, selection: ClipboardKind) -> bool {
-        self.inner.is_owner(selection).unwrap_or(false)
     }
 }
 
@@ -1105,7 +1156,9 @@ impl Drop for Clipboard {
         // We start with locking the global guard to prevent race
         // conditions below.
         let mut global_cb = CLIPBOARD.lock();
-        if Arc::strong_count(&self.inner) == MIN_OWNERS {
+        // a read on another thread holds it too while it reads (elundqvist/kvist#401)
+        let reads = self.inner.reads.load(Ordering::SeqCst);
+        if Arc::strong_count(&self.inner).saturating_sub(reads) == MIN_OWNERS {
             // If the are the only owners of the clipboard are ourselves and
             // the global object, then we should destroy the global object,
             // and send the data to the clipboard manager
@@ -1227,6 +1280,13 @@ pub enum Error {
     /// converted to the appropriate format.
     ConversionFailure,
 
+    /// The owner of the clipboard did not answer in time.
+    ///
+    /// Changed in elundqvist/gpui-kit (elundqvist/kvist#401): a time-out
+    /// was taken for content not available, and the reader went on to ask
+    /// for every other format, waiting as long for each.
+    TimedOut,
+
     /// Any error that doesn't fit the other error types.
     ///
     /// The `description` field is only meant to help the developer and should not be relied on as a
@@ -1240,6 +1300,7 @@ impl std::fmt::Display for Error {
 			Error::ContentNotAvailable => f.write_str("The clipboard contents were not available in the requested format or the clipboard is empty."),
 			Error::ClipboardOccupied => f.write_str("The native clipboard is not accessible due to being held by an other party."),
 			Error::ConversionFailure => f.write_str("The image or the text that was about the be transferred to/from the clipboard could not be converted to the appropriate format."),
+			Error::TimedOut => f.write_str("The owner of the clipboard did not answer in time."),
 			Error::Unknown { description } => f.write_fmt(format_args!("Unknown error while interacting with the clipboard: {description}")),
 		}
     }
@@ -1263,6 +1324,7 @@ impl std::fmt::Debug for Error {
             ContentNotAvailable,
             ClipboardOccupied,
             ConversionFailure,
+            TimedOut,
             Unknown { .. }
         );
         f.write_fmt(format_args!("{name} - \"{self}\""))

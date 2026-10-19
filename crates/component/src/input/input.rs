@@ -459,9 +459,14 @@ impl RenderOnce for Input {
                         !capabilities.is_copyable(),
                         Box::new(gpui_base::input::Copy),
                     )
+                    // Paste is there wherever the text can change, as in VS
+                    // Code: asking the clipboard whether it held anything
+                    // read it whole on the drawing thread at every
+                    // right-click, another program's handed over in pieces
+                    // (elundqvist/kvist#401). A paste of nothing does nothing.
                     .menu_with_disabled(
                         t!("Input.Paste"),
-                        !(editable && cx.read_from_clipboard().is_some()),
+                        !editable,
                         Box::new(gpui_base::input::Paste),
                     )
                     .separator()

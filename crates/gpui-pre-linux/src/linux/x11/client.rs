@@ -65,7 +65,7 @@ use gpui::{
     AnyWindowHandle, Bounds, ClipboardItem, CursorStyle, DisplayId, FileDropEvent, Keystroke,
     Modifiers, ModifiersChangedEvent, MouseButton, Pixels, PlatformDisplay, PlatformInput,
     PlatformKeyboardLayout, PlatformWindow, Point, RequestFrameOptions, ScrollDelta, Size,
-    TouchPhase, WindowButtonLayout, WindowParams, point, px,
+    Task, TouchPhase, WindowButtonLayout, WindowParams, point, px,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 
@@ -2256,6 +2256,48 @@ impl LinuxClient for X11Client {
             .get_any(clipboard::ClipboardKind::Clipboard)
             .context("X11: Failed to read from clipboard (clipboard)")
             .log_with_level(log::Level::Debug)
+    }
+
+    /// Changed in elundqvist/gpui-kit (elundqvist/kvist#401): the clipboard
+    /// another program owns is read on a thread of its own, where the read
+    /// held the frame while the owner handed it over (about 35 ms for 1.4
+    /// MB): a read waits on the owner, four seconds at most where it does
+    /// not answer, and is not to take a worker of the background executor
+    /// meanwhile. The app's own copy, with its metadata, is at hand and is
+    /// given at once, as before.
+    fn read_from_clipboard_async(
+        &self,
+    ) -> Task<std::result::Result<Option<gpui::ClipboardItem>, gpui::ClipboardReadError>> {
+        let state = self.0.borrow();
+        if state
+            .clipboard
+            .is_owner(clipboard::ClipboardKind::Clipboard)
+        {
+            return Task::ready(Ok(state.clipboard_item.clone()));
+        }
+        let reader = state.clipboard.reader();
+        let executor = state.common.background_executor.clone();
+        drop(state);
+        let (read, item) = futures::channel::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name("Clipboard read".to_owned())
+            .spawn(move || {
+                read.send(
+                    reader
+                        .get_any(clipboard::ClipboardKind::Clipboard)
+                        .context("X11: Failed to read from clipboard (clipboard)")
+                        .log_with_level(log::Level::Debug),
+                )
+                .ok();
+            });
+        if let Err(error) = spawned {
+            log::warn!("X11: no thread to read the clipboard on: {error}");
+            return Task::ready(Err(gpui::ClipboardReadError::Unavailable));
+        }
+        executor.spawn(async move {
+            item.await
+                .map_err(|_| gpui::ClipboardReadError::Unavailable)
+        })
     }
 
     fn run(&self) {

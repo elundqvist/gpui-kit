@@ -83,6 +83,23 @@ asks (section 4(b)); each says so at its top:
   0.44 s to paste 1.4 MB from another program (elundqvist/kvist#384).
   It waits on the connection's socket now (`wait_for_server`), and
   wakes as the next piece comes.
+
+  The clipboard another program owns is read off the drawing thread
+  (elundqvist/kvist#401): the read, on a connection of its own, held
+  the frame about 35 ms for a paste of 1.4 MB while the owner handed it
+  over. `ClipboardReader` reads it from another thread, and is not
+  counted among the clipboard's owners while it reads, so that the app
+  that quits meanwhile still hands the clipboard manager its copy. An
+  owner that does not answer for its targets in the four seconds a read
+  waits is given up (`Error::TimedOut`): the reader went on to ask it
+  for each of fifteen formats, four seconds apiece, and a paste waited a
+  minute.
+- `src/linux/x11/client.rs` and `src/linux/platform.rs`:
+  `read_from_clipboard_async` reads the clipboard on a thread of its
+  own where another program owns it, not on a worker of the background
+  executor, which a read that waits on its owner would take, and gives
+  the app's own copy at once (elundqvist/kvist#401); the Wayland and
+  headless clients read it as before.
 - `Cargo.toml`: an `[[example]]` entry for `examples/xdnd_source.rs`,
   which the fork adds (the published manifest names its targets and
   has no examples).

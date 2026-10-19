@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre 0.3.3 as published to crates.io: FORK.md at the
+// crate's root lists the changes.
 mod app_menu;
 mod keyboard;
 mod keystroke;
@@ -34,6 +36,7 @@ pub(crate) type PlatformScreenCaptureFrame = ();
 #[cfg(all(target_os = "macos", feature = "screen-capture"))]
 pub(crate) type PlatformScreenCaptureFrame = core_video::image_buffer::CVImageBuffer;
 
+use crate::window::HeldInput;
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload, Font,
@@ -1436,6 +1439,22 @@ impl From<TileId> for etagere::AllocId {
     }
 }
 
+/// Hands `handler` text input, now or once the window's input is no longer
+/// held (`Window::hold_input`, elundqvist/kvist#401). A key event is the
+/// window's to dispatch, and is never handed here.
+fn hand_over(handler: &mut dyn InputHandler, input: HeldInput, window: &mut Window, cx: &mut App) {
+    match input {
+        HeldInput::Text { range, text } => handler.replace_text_in_range(range, &text, window, cx),
+        HeldInput::MarkedText {
+            range,
+            text,
+            selected,
+        } => handler.replace_and_mark_text_in_range(range, &text, selected, window, cx),
+        HeldInput::Unmark => handler.unmark_text(window, cx),
+        HeldInput::Event(_) => {}
+    }
+}
+
 #[expect(missing_docs)]
 pub struct PlatformInputHandler {
     cx: AsyncWindowContext,
@@ -1494,8 +1513,13 @@ impl PlatformInputHandler {
     pub fn replace_text_in_range(&mut self, replacement_range: Option<Range<usize>>, text: &str) {
         self.cx
             .update(|window, cx| {
-                self.handler
-                    .replace_text_in_range(replacement_range, text, window, cx);
+                let input = HeldInput::Text {
+                    range: replacement_range,
+                    text: text.to_string(),
+                };
+                if let Some(input) = window.hold_back(input) {
+                    hand_over(&mut *self.handler, input, window, cx);
+                }
             })
             .ok();
     }
@@ -1508,13 +1532,14 @@ impl PlatformInputHandler {
     ) {
         self.cx
             .update(|window, cx| {
-                self.handler.replace_and_mark_text_in_range(
-                    range_utf16,
-                    new_text,
-                    new_selected_range,
-                    window,
-                    cx,
-                )
+                let input = HeldInput::MarkedText {
+                    range: range_utf16,
+                    text: new_text.to_string(),
+                    selected: new_selected_range,
+                };
+                if let Some(input) = window.hold_back(input) {
+                    hand_over(&mut *self.handler, input, window, cx);
+                }
             })
             .ok();
     }
@@ -1522,8 +1547,18 @@ impl PlatformInputHandler {
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn unmark_text(&mut self) {
         self.cx
-            .update(|window, cx| self.handler.unmark_text(window, cx))
+            .update(|window, cx| {
+                if let Some(input) = window.hold_back(HeldInput::Unmark) {
+                    hand_over(&mut *self.handler, input, window, cx);
+                }
+            })
             .ok();
+    }
+
+    /// Hands the handler text input that waited while the window's input
+    /// was held (`Window::hold_input`, elundqvist/kvist#401).
+    pub(crate) fn replay_held(&mut self, input: HeldInput, window: &mut Window, cx: &mut App) {
+        hand_over(&mut *self.handler, input, window, cx);
     }
 
     pub fn paste(&mut self, item: ClipboardItem) {

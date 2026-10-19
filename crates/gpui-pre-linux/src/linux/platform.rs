@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre-linux 0.3.3 as published to crates.io: FORK.md at
+// the crate's root lists the changes.
 use std::{
     env,
     path::{Path, PathBuf},
@@ -24,8 +26,8 @@ use xkbcommon::xkb::{self, Keycode, Keysym, State};
 
 use crate::linux::{LinuxDispatcher, PriorityQueueCalloopReceiver};
 use gpui::{
-    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DisplayId,
-    ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
+    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, ClipboardReadError, CursorStyle,
+    DisplayId, ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
     PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
     PlatformWindow, Result, RunnableVariant, Task, ThermalState, WindowAppearance,
     WindowButtonLayout, WindowParams,
@@ -91,6 +93,14 @@ pub(crate) trait LinuxClient {
     fn write_to_clipboard(&self, item: ClipboardItem);
     fn read_from_primary(&self) -> Option<ClipboardItem>;
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
+    /// Reads the clipboard, resolving once its contents are there. A client
+    /// that can read it off the drawing thread does (elundqvist/kvist#401);
+    /// the others read it here.
+    fn read_from_clipboard_async(
+        &self,
+    ) -> Task<std::result::Result<Option<ClipboardItem>, ClipboardReadError>> {
+        Task::ready(Ok(self.read_from_clipboard()))
+    }
     fn active_window(&self) -> Option<AnyWindowHandle>;
     fn window_stack(&self) -> Option<Vec<AnyWindowHandle>>;
     fn run(&self);
@@ -746,6 +756,12 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         self.inner.read_from_clipboard()
+    }
+
+    fn read_from_clipboard_async(
+        &self,
+    ) -> Task<std::result::Result<Option<ClipboardItem>, ClipboardReadError>> {
+        self.inner.read_from_clipboard_async()
     }
 
     fn add_recent_document(&self, _path: &Path) {}

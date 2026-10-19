@@ -57,6 +57,61 @@ impl PreparedValue {
     }
 }
 
+/// How the application holds a window's keyboard input back while a paste
+/// waits for the clipboard, and gives it back once the paste has landed.
+///
+/// A paste reads the clipboard on the drawing thread unless one is set
+/// ([`PasteInputHold::set`]): read off it, the keys typed after the paste
+/// would come before it. The gpui this crate builds on has no way to hold
+/// a window's input; one that has, such as elundqvist/gpui-kit's
+/// `Window::hold_input` (elundqvist/kvist#401), is handed in here:
+/// `hold` holds the window's input and gives back what releases it, and
+/// `release` is handed that once the paste is done; when the window has
+/// gone first, it is dropped instead.
+#[derive(Clone)]
+pub struct PasteInputHold {
+    hold: Rc<dyn Fn(&mut Window, &mut App) -> Box<dyn std::any::Any>>,
+    release: Rc<dyn Fn(Box<dyn std::any::Any>, &mut Window, &mut App)>,
+    landing: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
+}
+
+impl gpui::Global for PasteInputHold {}
+
+impl PasteInputHold {
+    /// A hold made of `hold`, which holds a window's input and gives back
+    /// what releases it, an `H`, and `release`, which is handed that `H`
+    /// and releases it.
+    pub fn new<H: 'static>(
+        hold: impl Fn(&mut Window, &mut App) -> H + 'static,
+        release: impl Fn(H, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            hold: Rc::new(move |window, cx| Box::new(hold(window, cx))),
+            release: Rc::new(move |held, window, cx| {
+                // what `hold` gave back, an `H`, and nothing else
+                if let Ok(held) = held.downcast::<H>() {
+                    release(*held, window, cx);
+                }
+            }),
+            landing: None,
+        }
+    }
+
+    /// Calls `landing` as a paste that waited for the clipboard lands, just
+    /// before it is made: an application that times what a key costs the
+    /// drawing thread starts the paste's work there, and not at the key
+    /// whose read the drawing thread did not wait for.
+    pub fn on_landing(mut self, landing: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.landing = Some(Rc::new(landing));
+        self
+    }
+
+    /// Make this the way every input's paste holds its window's input.
+    pub fn set(self, cx: &mut App) {
+        cx.set_global(self);
+    }
+}
+
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
 #[action(namespace = input, no_json)]
 pub struct Enter {
@@ -2207,13 +2262,70 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.reveal_typed_caret(cx);
     }
 
+    /// Paste what the clipboard holds. With a way to hold the window's
+    /// input back ([`PasteInputHold`]), the clipboard is read as the
+    /// platform reads it when it can wait, which on X11 is off the drawing
+    /// thread when another program owns it: a paste of 1.4 MB from another
+    /// program held the frame about 35 ms while the owner handed it over
+    /// (elundqvist/kvist#401). Without one it is read here, as before, so
+    /// that the keys typed after the paste come after it.
     pub(super) fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(clipboard) = cx.read_from_clipboard() {
-            let new_text = clipboard.text().unwrap_or_default();
-            self.undo_manager.pending_intent = Some(EditIntent::Atomic);
-            self.replace_text_in_range_silent(None, &new_text, window, cx);
-            self.scroll_to_edited(self.cursor(), cx);
+        let Some(hold) = cx.try_global::<PasteInputHold>().cloned() else {
+            let item = cx.read_from_clipboard();
+            self.paste_item(item, window, cx);
+            return;
+        };
+        let read = cx.read_from_clipboard_async();
+        self.paste_when_read(read, hold, window, cx);
+    }
+
+    /// Paste what `read` gives: at once when it has it, as for the app's
+    /// own copy, and otherwise once it has come, the window's input held
+    /// back until then, so that what was typed meanwhile lands after the
+    /// paste, in the order it was typed.
+    fn paste_when_read(
+        &mut self,
+        mut read: gpui::Task<Result<Option<ClipboardItem>, gpui::ClipboardReadError>>,
+        hold: PasteInputHold,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(read) = futures::FutureExt::now_or_never(&mut read) {
+            self.paste_item(read.ok().flatten(), window, cx);
+            return;
         }
+        let held = (hold.hold)(window, cx);
+        cx.spawn_in(window, async move |state, cx| {
+            let item = read.await.ok().flatten();
+            cx.update(|window, cx| {
+                if let Some(landing) = &hold.landing {
+                    landing(window, cx);
+                }
+                state
+                    .update(cx, |state, cx| state.paste_item(item, window, cx))
+                    .ok();
+                (hold.release)(held, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Paste the text `item` holds. A clipboard with no text, an image
+    /// alone, leaves the text and its selection as they are, as VS Code
+    /// and IntelliJ leave them: it replaced the selection with nothing.
+    fn paste_item(
+        &mut self,
+        item: Option<ClipboardItem>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(new_text) = item.and_then(|item| item.text()) else {
+            return;
+        };
+        self.undo_manager.pending_intent = Some(EditIntent::Atomic);
+        self.replace_text_in_range_silent(None, &new_text, window, cx);
+        self.scroll_to_edited(self.cursor(), cx);
     }
 
     fn push_history(
@@ -3971,6 +4083,118 @@ mod tests {
                 assert_eq!(state.text.offset_to_point(state.cursor()).row, 4100);
                 assert_caret_in_view(state, "after the paste");
             });
+        });
+    }
+
+    /// A hold that writes down when it holds the input and when it gives it
+    /// back.
+    fn recording_hold(log: &Rc<std::cell::RefCell<Vec<&'static str>>>) -> PasteInputHold {
+        /// What the hold gives back for its release.
+        struct Held(&'static str);
+        let held = log.clone();
+        let released = log.clone();
+        let landed = log.clone();
+        PasteInputHold::new(
+            move |_, _| {
+                held.borrow_mut().push("hold");
+                Held("release")
+            },
+            move |Held(release), _, _| released.borrow_mut().push(release),
+        )
+        .on_landing(move |_, _| landed.borrow_mut().push("landing"))
+    }
+
+    /// A paste whose clipboard is not at hand, another program's on X11,
+    /// lands once the read has come, the window's input held until then,
+    /// so the frame is not held while the owner hands it over and what is
+    /// typed meanwhile still comes after the paste (elundqvist/kvist#401).
+    #[gpui::test]
+    fn test_a_paste_that_waits_for_the_clipboard_lands_when_it_comes(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (send, received) = futures::channel::oneshot::channel::<Option<ClipboardItem>>();
+        let read = cx
+            .executor()
+            .spawn(async move { Ok(received.await.ok().flatten()) });
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("one two", window, cx);
+                state.move_to(4, None, cx);
+                state.paste_when_read(read, recording_hold(&log), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(input.read(cx).value(), "one two"));
+        assert_eq!(*log.borrow(), ["hold"], "the input waits for the paste");
+
+        send.send(Some(ClipboardItem::new_string("and ".into())))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let state = input.read(cx);
+            assert_eq!(state.value(), "one and two");
+            assert_eq!(state.cursor(), 8);
+        });
+        assert_eq!(*log.borrow(), ["hold", "landing", "release"]);
+    }
+
+    /// The app's own copy is at hand: it is pasted at once, and the input
+    /// is never held. A read that fails pastes nothing and gives the input
+    /// back.
+    #[gpui::test]
+    fn test_a_paste_of_a_clipboard_at_hand_holds_nothing(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update(|window, cx| {
+            recording_hold(&log).set(cx);
+            cx.write_to_clipboard(ClipboardItem::new_string("one ".into()));
+            input.update(cx, |state, cx| state.paste(&Paste, window, cx));
+            assert_eq!(input.read(cx).value(), "one ");
+        });
+        assert!(log.borrow().is_empty());
+
+        let (send, received) = futures::channel::oneshot::channel::<Option<ClipboardItem>>();
+        let read = cx.executor().spawn(async move {
+            received
+                .await
+                .map_err(|_| gpui::ClipboardReadError::Unavailable)
+        });
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.paste_when_read(read, recording_hold(&log), window, cx)
+            });
+        });
+        drop(send);
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(input.read(cx).value(), "one "));
+        assert_eq!(*log.borrow(), ["hold", "landing", "release"]);
+    }
+
+    /// A clipboard that holds an image and no text leaves the text and its
+    /// selection as they are, as VS Code and IntelliJ do: it replaced the
+    /// selection with nothing.
+    #[gpui::test]
+    fn test_a_paste_of_an_image_alone_leaves_the_text(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        cx.update(|window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_image(&gpui::Image::from_bytes(
+                gpui::ImageFormat::Png,
+                vec![0x89, b'P', b'N', b'G'],
+            )));
+            input.update(cx, |state, cx| {
+                state.set_value("hello world", window, cx);
+                state.selected_range = (0..5).into();
+                state.paste(&Paste, window, cx);
+            });
+            let state = input.read(cx);
+            assert_eq!(state.value(), "hello world");
+            assert_eq!(state.selected_range, (0..5).into());
         });
     }
 
