@@ -40,9 +40,9 @@ use x11rb::{
     protocol::{
         Event,
         xproto::{
-            Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, PropMode, Property,
-            PropertyNotifyEvent, SELECTION_NOTIFY_EVENT, SelectionNotifyEvent,
-            SelectionRequestEvent, Time, WindowClass,
+            Atom, AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, CreateWindowAux,
+            EventMask, PropMode, Property, PropertyNotifyEvent, SELECTION_NOTIFY_EVENT,
+            SelectionNotifyEvent, SelectionRequestEvent, Time, WindowClass,
         },
     },
     rust_connection::RustConnection,
@@ -126,6 +126,9 @@ struct XContext {
 }
 
 struct Inner {
+    /// The display this is the clipboard of, `$DISPLAY`'s where it is
+    /// `None`: a read connects to it too.
+    display: Option<String>,
     /// The context for the thread which serves clipboard read
     /// requests coming to us.
     server: XContext,
@@ -146,10 +149,11 @@ struct Inner {
 }
 
 impl XContext {
-    fn new() -> Result<Self> {
+    /// A connection to `display`, or to `$DISPLAY`'s where it is `None`.
+    fn on(display: Option<&str>) -> Result<Self> {
         // create a new connection to an X11 server
         let (conn, screen_num): (RustConnection, _) =
-            RustConnection::connect(None).map_err(|_| {
+            RustConnection::connect(display).map_err(|_| {
                 Error::unknown("X11 server connection timed out because it was unreachable")
             })?;
         let screen = conn
@@ -236,13 +240,19 @@ fn wait_for_server(conn: &RustConnection, until: Instant) {
 
 impl Inner {
     fn new() -> Result<Self> {
-        let server = XContext::new()?;
+        Self::on(None)
+    }
+
+    /// The clipboard of `display`, or of `$DISPLAY`'s where it is `None`.
+    fn on(display: Option<&str>) -> Result<Self> {
+        let server = XContext::on(display)?;
         let atoms = Atoms::new(&server.conn)
             .map_err(into_unknown)?
             .reply()
             .map_err(into_unknown)?;
 
         Ok(Self {
+            display: display.map(str::to_owned),
             server,
             atoms,
             clipboard: Selection::default(),
@@ -325,7 +335,7 @@ impl Inner {
             }
             return Err(Error::ContentNotAvailable);
         }
-        let reader = XContext::new()?;
+        let reader = XContext::on(self.display.as_deref())?;
 
         let highest_precedence_format =
             match self.read_single(&reader, selection, self.atoms.TARGETS) {
@@ -699,18 +709,36 @@ impl Inner {
         Ok(false)
     }
 
-    fn handle_selection_request(&self, event: SelectionRequestEvent) -> Result<()> {
+    /// The most a property set in one request holds: the server's largest
+    /// request without the BIG-REQUESTS extension, less room for the
+    /// request's own fields. A selection larger than this is handed over
+    /// in pieces of this size (`IncrSend`), as ICCCM has an owner do: a
+    /// requestor reads a property with a bound of its own, Tk's 400 KB,
+    /// and took 1.4 MB set whole as an error, "selection property too
+    /// large" (elundqvist/kvist#424).
+    fn largest_property(&self) -> usize {
+        largest_property(self.server.conn.setup().maximum_request_length)
+    }
+
+    /// Answers `event`; returns whether the data goes in pieces, the
+    /// hand-over begun and not yet done.
+    fn handle_selection_request(
+        &self,
+        event: SelectionRequestEvent,
+        transfers: &mut Vec<IncrSend>,
+    ) -> Result<bool> {
         let selection = match self.kind_of(event.selection) {
             Some(kind) => kind,
             None => {
                 log::warn!(
                     "Received a selection request to a selection other than the CLIPBOARD, PRIMARY or SECONDARY. This is unexpected."
                 );
-                return Ok(());
+                return Ok(false);
             }
         };
 
         let success;
+        let mut in_pieces = false;
         // we are asked for a list of supported conversion targets
         if event.target == self.atoms.TARGETS {
             log::trace!(
@@ -750,6 +778,11 @@ impl Inner {
             let data = self.selection_of(selection).data.read();
             if let Some(data_list) = &*data {
                 success = match data_list.iter().find(|d| d.format == event.target) {
+                    Some(data) if data.bytes.len() > self.largest_property() => {
+                        self.begin_incr(&event, &data.bytes, transfers)?;
+                        in_pieces = true;
+                        true
+                    }
                     Some(data) => {
                         self.server
                             .conn
@@ -798,7 +831,101 @@ impl Inner {
             )
             .map_err(into_unknown)?;
 
-        self.server.conn.flush().map_err(into_unknown)
+        self.server.conn.flush().map_err(into_unknown)?;
+        Ok(in_pieces)
+    }
+
+    /// Begin handing `bytes` over to the requestor of `event` in pieces
+    /// (ICCCM 2.7.2, elundqvist/kvist#424): its property is set to the type
+    /// `INCR` and the size, and the requestor's property changes are
+    /// listened to; each time it deletes the property, the next piece goes
+    /// in, and an empty one ends it (`send_incr_piece`). A request for the
+    /// same property of the same window ends the one before it.
+    fn begin_incr(
+        &self,
+        event: &SelectionRequestEvent,
+        bytes: &[u8],
+        transfers: &mut Vec<IncrSend>,
+    ) -> Result<()> {
+        let conn = &self.server.conn;
+        conn.change_window_attributes(
+            event.requestor,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+        )
+        .map_err(into_unknown)?;
+        conn.change_property32(
+            PropMode::REPLACE,
+            event.requestor,
+            event.property,
+            self.atoms.INCR,
+            &[u32::try_from(bytes.len()).unwrap_or(u32::MAX)],
+        )
+        .map_err(into_unknown)?;
+        conn.flush().map_err(into_unknown)?;
+        transfers.retain(|t| !t.is_for(event.requestor, event.property));
+        transfers.push(IncrSend::new(
+            event.requestor,
+            event.property,
+            event.target,
+            bytes.to_vec(),
+            self.largest_property(),
+        ));
+        log::trace!(
+            "Handing {} bytes over in pieces to window {}",
+            bytes.len(),
+            event.requestor
+        );
+        Ok(())
+    }
+
+    /// The requestor of a selection handed over in pieces deleted its
+    /// property: the next piece goes in, or the empty one that ends it.
+    /// Returns the hand-over `event` moved on, if it moved one, and
+    /// whether that ended it.
+    fn send_incr_piece(
+        &self,
+        event: &PropertyNotifyEvent,
+        transfers: &mut Vec<IncrSend>,
+    ) -> Result<Option<(u32, Atom, bool)>> {
+        if event.state != Property::DELETE {
+            return Ok(None);
+        }
+        let Some(at) = transfers
+            .iter()
+            .position(|t| t.is_for(event.window, event.atom))
+        else {
+            return Ok(None);
+        };
+        let transfer = &mut transfers[at];
+        let moved = (transfer.requestor, transfer.property);
+        let Some(piece) = transfer.next_piece() else {
+            transfers.remove(at);
+            return Ok(Some((moved.0, moved.1, true)));
+        };
+        let conn = &self.server.conn;
+        conn.change_property8(
+            PropMode::REPLACE,
+            transfer.requestor,
+            transfer.property,
+            transfer.target,
+            &transfer.bytes[piece.clone()],
+        )
+        .map_err(into_unknown)?;
+        if piece.is_empty() {
+            let window = transfer.requestor;
+            transfers.remove(at);
+            // the requestor's property changes are listened to no more,
+            // unless another piece is on its way to it
+            if !transfers.iter().any(|t| t.requestor == window) {
+                conn.change_window_attributes(
+                    window,
+                    &ChangeWindowAttributesAux::new().event_mask(EventMask::NO_EVENT),
+                )
+                .map_err(into_unknown)?;
+            }
+        }
+        conn.flush().map_err(into_unknown)?;
+        Ok(Some((moved.0, moved.1, piece.is_empty())))
     }
 
     fn ask_clipboard_manager_to_request_our_data(&self) -> Result<()> {
@@ -842,26 +969,30 @@ impl Inner {
 
         *handover_state = ManagerHandoverState::InProgress;
         let max_handover_duration = Duration::from_millis(100);
+        // Changed in elundqvist/gpui-kit (elundqvist/kvist#424): contents
+        // handed over in pieces take the manager longer than one wait, and
+        // the serve thread wakes this one at each piece it takes, for as
+        // long again; within a bound, the app being on its way out.
+        let give_up = Instant::now() + MAX_HANDOVER_IN_PIECES;
 
-        // Note that we are using a parking_lot condvar here, which doesn't wake up
-        // spuriously
-        let result = self
-            .handover_cv
-            .wait_for(&mut handover_state, max_handover_duration);
+        loop {
+            // Note that we are using a parking_lot condvar here, which doesn't wake up
+            // spuriously
+            let result = self
+                .handover_cv
+                .wait_for(&mut handover_state, max_handover_duration);
 
-        if *handover_state == ManagerHandoverState::Finished {
-            return Ok(());
+            if *handover_state == ManagerHandoverState::Finished {
+                return Ok(());
+            }
+            if result.timed_out() || Instant::now() >= give_up {
+                log::warn!(
+                    "Could not hand the clipboard contents over to the clipboard manager. The request timed out."
+                );
+                return Ok(());
+            }
+            // woken by a piece the manager took: it is still at it
         }
-        if result.timed_out() {
-            log::warn!(
-                "Could not hand the clipboard contents over to the clipboard manager. The request timed out."
-            );
-            return Ok(());
-        }
-
-        Err(Error::unknown(
-            "The handover was not finished and the condvar didn't time out, yet the condvar wait ended. This should be unreachable.",
-        ))
     }
 }
 
@@ -884,9 +1015,18 @@ fn serve_requests(context: Arc<Inner>) -> Result<(), Box<dyn std::error::Error>>
 
     let mut written = false;
     let mut notified = false;
+    // the selections being handed over in pieces (elundqvist/kvist#424)
+    let mut transfers: Vec<IncrSend> = Vec::new();
+    // those of them that hand the contents to the clipboard manager as the
+    // app quits: the contents are written once the last piece has gone
+    let mut to_manager: Vec<(u32, Atom)> = Vec::new();
 
     loop {
-        match context.server.conn.wait_for_event().map_err(into_unknown)? {
+        let event = context.server.conn.wait_for_event().map_err(into_unknown)?;
+        // a requestor that went before it took the last piece, its window
+        // gone, never deletes its property again
+        transfers.retain(|t| !t.abandoned(Instant::now()));
+        match event {
             Event::DestroyNotify(_) => {
                 // This window is being destroyed.
                 log::trace!("Clipboard server window is being destroyed x_x");
@@ -919,8 +1059,8 @@ fn serve_requests(context: Arc<Inner>) -> Result<(), Box<dyn std::error::Error>>
                     context.atom_name(event.target),
                 );
                 // Someone is requesting the clipboard content from us.
-                context
-                    .handle_selection_request(event)
+                let in_pieces = context
+                    .handle_selection_request(event, &mut transfers)
                     .map_err(into_unknown)?;
 
                 // if we are in the progress of saving to the clipboard manager
@@ -930,11 +1070,19 @@ fn serve_requests(context: Arc<Inner>) -> Result<(), Box<dyn std::error::Error>>
                     // Only set written, when the actual contents were written,
                     // not just a response to what TARGETS we have.
                     if event.target != context.atoms.TARGETS {
-                        log::trace!("The contents were written to the clipboard manager.");
-                        written = true;
-                        // if we have written and notified, make sure to notify that we are done
-                        if notified {
-                            handover_finished(&context, handover_state);
+                        if in_pieces {
+                            // Changed in elundqvist/gpui-kit (elundqvist/kvist#424):
+                            // written once the last piece has gone; a manager
+                            // that notified first, as KDE's does, got the
+                            // window destroyed under its first piece.
+                            to_manager.push((event.requestor, event.property));
+                        } else {
+                            log::trace!("The contents were written to the clipboard manager.");
+                            written = true;
+                            // if we have written and notified, make sure to notify that we are done
+                            if notified {
+                                handover_finished(&context, handover_state);
+                            }
                         }
                     }
                 }
@@ -971,11 +1119,104 @@ fn serve_requests(context: Arc<Inner>) -> Result<(), Box<dyn std::error::Error>>
                     }
                 }
             }
+            Event::PropertyNotify(event) => {
+                let moved = context
+                    .send_incr_piece(&event, &mut transfers)
+                    .map_err(into_unknown)?;
+                let Some((requestor, property, done)) = moved else {
+                    continue;
+                };
+                if !to_manager.contains(&(requestor, property)) {
+                    continue;
+                }
+                let handover_state = context.handover_state.lock();
+                if *handover_state != ManagerHandoverState::InProgress {
+                    continue;
+                }
+                if !done {
+                    // the manager is taking the pieces: let the app wait on
+                    drop(handover_state);
+                    context.handover_cv.notify_all();
+                    continue;
+                }
+                to_manager.retain(|&to| to != (requestor, property));
+                log::trace!("The contents were written to the clipboard manager in pieces.");
+                written = true;
+                if notified {
+                    handover_finished(&context, handover_state);
+                }
+            }
             _event => {
                 // May be useful for debugging but nothing else really.
                 //log::trace!("Received unwanted event: {:?}", event);
             }
         }
+    }
+}
+
+/// The most a property set in one request holds, for a server whose
+/// largest request is `maximum_request_length` four-byte units without
+/// the BIG-REQUESTS extension: a `ChangeProperty` request takes 24 bytes
+/// of its own, and some room is left besides, as other owners leave it.
+fn largest_property(maximum_request_length: u16) -> usize {
+    (usize::from(maximum_request_length) * 4)
+        .saturating_sub(100)
+        .max(4096)
+}
+
+/// A selection handed over in pieces to one requestor's property (ICCCM
+/// 2.7.2, elundqvist/kvist#424): each deletion of the property by the
+/// requestor takes the next piece, at most `piece` bytes, and the empty
+/// piece after the last ends it.
+struct IncrSend {
+    requestor: u32,
+    property: Atom,
+    target: Atom,
+    bytes: Vec<u8>,
+    piece: usize,
+    /// How much of `bytes` has gone; `None` once the empty piece has.
+    sent: Option<usize>,
+    /// When the requestor last took a piece, or the hand-over began.
+    last: Instant,
+}
+
+/// How long a requestor may leave a piece untaken before the hand-over is
+/// given up, its window gone or its reading stopped.
+const INCR_ABANDONED_AFTER: Duration = Duration::from_secs(10);
+
+/// How long the app, quitting, waits at most for the clipboard manager to
+/// take contents handed over in pieces, as long as it keeps taking them.
+const MAX_HANDOVER_IN_PIECES: Duration = Duration::from_secs(2);
+
+impl IncrSend {
+    fn new(requestor: u32, property: Atom, target: Atom, bytes: Vec<u8>, piece: usize) -> Self {
+        Self {
+            requestor,
+            property,
+            target,
+            bytes,
+            piece: piece.max(1),
+            sent: Some(0),
+            last: Instant::now(),
+        }
+    }
+
+    fn is_for(&self, window: u32, property: Atom) -> bool {
+        self.requestor == window && self.property == property
+    }
+
+    /// The range of `bytes` the next piece is: the empty range after the
+    /// last, which ends the hand-over, and `None` after that.
+    fn next_piece(&mut self) -> Option<std::ops::Range<usize>> {
+        let sent = self.sent?;
+        let end = (sent + self.piece).min(self.bytes.len());
+        self.sent = (sent < end).then_some(end);
+        self.last = Instant::now();
+        Some(sent..end)
+    }
+
+    fn abandoned(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last) > INCR_ABANDONED_AFTER
     }
 }
 
@@ -1336,5 +1577,394 @@ impl Error {
         Error::Unknown {
             description: message.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 1.4 MB of text, the paste of elundqvist/kvist#424.
+    fn large_text() -> Vec<u8> {
+        (0..40_000)
+            .map(|i| format!("fn f{i}(x: u64) -> u64 {{ x * {i} }}\n"))
+            .collect::<String>()
+            .into_bytes()
+    }
+
+    #[test]
+    fn the_largest_property_is_the_servers_largest_request_less_its_fields() {
+        // a server's usual largest request, 65,535 units of four bytes
+        assert_eq!(largest_property(u16::MAX), 262_040);
+        // Tk reads a property 100,000 units of four bytes at a time
+        assert!(largest_property(u16::MAX) < 400_000);
+        assert_eq!(largest_property(0), 4096);
+    }
+
+    #[test]
+    fn a_selection_in_pieces_is_handed_over_whole_and_ended_by_an_empty_piece() {
+        let text = large_text();
+        let piece = largest_property(u16::MAX);
+        let mut transfer = IncrSend::new(7, 8, 9, text.clone(), piece);
+        assert!(transfer.is_for(7, 8));
+        assert!(!transfer.is_for(7, 9) && !transfer.is_for(6, 8));
+        let mut got = Vec::new();
+        let mut pieces = 0;
+        loop {
+            let range = transfer.next_piece().expect("a piece until the empty one");
+            assert!(range.len() <= piece);
+            if range.is_empty() {
+                break;
+            }
+            pieces += 1;
+            got.extend_from_slice(&text[range]);
+        }
+        assert_eq!(got, text);
+        assert_eq!(pieces, text.len().div_ceil(piece));
+        assert_eq!(transfer.next_piece(), None, "nothing after the empty piece");
+    }
+
+    #[test]
+    fn a_hand_over_whose_requestor_takes_nothing_is_given_up() {
+        let transfer = IncrSend::new(7, 8, 9, vec![1; 10], 4);
+        let now = Instant::now();
+        assert!(!transfer.abandoned(now));
+        assert!(transfer.abandoned(now + INCR_ABANDONED_AFTER + Duration::from_secs(1)));
+    }
+
+    /// An X server of the test's own, never the desktop's, whose clipboard
+    /// a test would take: an Xvfb on a display it picks (`-displayfd`),
+    /// stopped when this is dropped, or the server `GPUI_X11_TEST_DISPLAY`
+    /// names. `None` where there is neither, and the test is skipped, as
+    /// tests that need a program the machine may not have are.
+    struct TestDisplay {
+        name: String,
+        xvfb: Option<std::process::Child>,
+    }
+
+    impl TestDisplay {
+        fn start() -> Option<Self> {
+            use std::io::BufRead as _;
+            use std::os::fd::{FromRawFd as _, OwnedFd};
+            if let Ok(name) = std::env::var("GPUI_X11_TEST_DISPLAY") {
+                return Some(Self { name, xvfb: None });
+            }
+            let mut ends = [0; 2];
+            // SAFETY: `ends` holds the two descriptors `pipe` writes.
+            if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
+                return None;
+            }
+            // SAFETY: both are open, and owned here alone.
+            let (read, write) =
+                unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+            // SAFETY: `read` is open; the server is not to hold it.
+            unsafe { libc::fcntl(ends[0], libc::F_SETFD, libc::FD_CLOEXEC) };
+            let xvfb = std::process::Command::new("Xvfb")
+                .args(["-displayfd", &ends[1].to_string()])
+                .args(["-nolisten", "tcp", "-screen", "0", "64x64x24"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            drop(write);
+            let Ok(xvfb) = xvfb else {
+                eprintln!("no Xvfb to run an X server on: skipped");
+                return None;
+            };
+            let mut display = Self {
+                name: String::new(),
+                xvfb: Some(xvfb),
+            };
+            // the server writes its display's number once it takes
+            // connections, and the pipe ends if it ends first
+            let mut number = String::new();
+            std::io::BufReader::new(std::fs::File::from(read))
+                .read_line(&mut number)
+                .ok()?;
+            let number = number.trim();
+            assert!(!number.is_empty(), "Xvfb ended before it took connections");
+            display.name = format!(":{number}");
+            Some(display)
+        }
+    }
+
+    impl Drop for TestDisplay {
+        /// Ends the server as it ends itself, so that it takes its socket
+        /// in `/tmp/.X11-unix` with it, which one killed leaves behind;
+        /// killed only where it has not ended in five seconds.
+        fn drop(&mut self) {
+            let Some(xvfb) = &mut self.xvfb else {
+                return;
+            };
+            if let Ok(pid) = libc::pid_t::try_from(xvfb.id()) {
+                // SAFETY: `pid` is the server's, which has not been waited
+                // for, so it is still this process's child.
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+            }
+            let until = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < until {
+                if let Ok(Some(_)) = xvfb.try_wait() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            xvfb.kill().ok();
+            xvfb.wait().ok();
+        }
+    }
+
+    /// Reads the selection as ICCCM has a requestor read it, with Tk's
+    /// bound on a property, from a client of its own on `display`: the
+    /// data, and whether it came in pieces.
+    fn read_as_tk(display: &str, atoms: &Atoms) -> (Vec<u8>, bool) {
+        const TK_PROPERTY_WORDS: u32 = 100_000;
+        let reader = XContext::on(Some(display)).expect("a connection");
+        let conn = &reader.conn;
+        conn.change_window_attributes(
+            reader.win_id,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+        )
+        .unwrap();
+        conn.convert_selection(
+            reader.win_id,
+            atoms.CLIPBOARD,
+            atoms.UTF8_STRING,
+            atoms.ARBOARD_CLIPBOARD,
+            Time::CURRENT_TIME,
+        )
+        .unwrap();
+        conn.flush().unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        let next_event = || loop {
+            assert!(Instant::now() < until, "the owner stopped answering");
+            match conn.poll_for_event().unwrap() {
+                Some(event) => return event,
+                None => wait_for_server(conn, until),
+            }
+        };
+        loop {
+            if let Event::SelectionNotify(notify) = next_event() {
+                assert_ne!(notify.property, NONE, "the owner refused the request");
+                break;
+            }
+        }
+        let get = |delete: bool| {
+            conn.get_property(
+                delete,
+                reader.win_id,
+                atoms.ARBOARD_CLIPBOARD,
+                AtomEnum::ANY,
+                0,
+                TK_PROPERTY_WORDS,
+            )
+            .unwrap()
+            .reply()
+            .unwrap()
+        };
+        let first = get(false);
+        if first.type_ != atoms.INCR {
+            assert_eq!(
+                first.bytes_after, 0,
+                "the selection was set whole, larger than Tk reads a property: \"selection property too large\""
+            );
+            return (first.value, false);
+        }
+        // deleting the INCR property asks for the first piece
+        get(true);
+        conn.flush().unwrap();
+        let mut data = Vec::new();
+        loop {
+            match next_event() {
+                Event::PropertyNotify(event)
+                    if event.atom == atoms.ARBOARD_CLIPBOARD
+                        && event.state == Property::NEW_VALUE =>
+                {
+                    let piece = get(true);
+                    conn.flush().unwrap();
+                    assert_eq!(piece.bytes_after, 0, "a piece larger than Tk reads");
+                    assert_eq!(piece.type_, atoms.UTF8_STRING);
+                    if piece.value.is_empty() {
+                        return (data, true);
+                    }
+                    data.extend_from_slice(&piece.value);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The owner hands a selection larger than a request holds over in
+    /// pieces, as Tk and xclip read one, where it set it whole and Tk took
+    /// it for an error (elundqvist/kvist#424); a small one goes whole.
+    /// On an X server of its own (`TestDisplay`).
+    #[test]
+    fn a_large_selection_is_served_in_pieces_to_a_requestor_that_reads_as_tk_does() {
+        let Some(server) = TestDisplay::start() else {
+            return;
+        };
+        let display = server.name.clone();
+        let owner = Arc::new(Inner::on(Some(&display)).expect("a connection"));
+        let serving = std::thread::spawn({
+            let owner = owner.clone();
+            move || serve_requests(owner).is_ok()
+        });
+        let atoms = owner.atoms;
+        let write = |bytes: Vec<u8>| {
+            owner
+                .write(
+                    vec![ClipboardData {
+                        bytes,
+                        format: atoms.UTF8_STRING,
+                    }],
+                    ClipboardKind::Clipboard,
+                    WaitConfig::None,
+                )
+                .unwrap()
+        };
+
+        let text = large_text();
+        write(text.clone());
+        let (got, in_pieces) = read_as_tk(&display, &atoms);
+        assert!(in_pieces, "1.4 MB set whole");
+        assert_eq!(got.len(), text.len());
+        assert!(got == text, "the pieces are the text");
+
+        // twice, the first hand-over over and done with
+        let (again, _) = read_as_tk(&display, &atoms);
+        assert!(again == text);
+
+        write(b"small".to_vec());
+        assert_eq!(read_as_tk(&display, &atoms), (b"small".to_vec(), false));
+
+        owner
+            .server
+            .conn
+            .destroy_window(owner.server.win_id)
+            .unwrap();
+        owner.server.conn.flush().unwrap();
+        assert!(serving.join().unwrap());
+    }
+
+    /// A clipboard manager that says it is done before it asks for the
+    /// contents, as KDE's does, still gets a large selection whole as the
+    /// app quits: the hand-over was taken for done once its pieces had
+    /// begun, the app went, and the manager got none of them
+    /// (elundqvist/kvist#424). On an X server of its own (`TestDisplay`).
+    #[test]
+    fn a_manager_that_answers_first_gets_a_large_selection_whole_at_quit() {
+        let Some(server) = TestDisplay::start() else {
+            return;
+        };
+        let display = server.name.clone();
+        let owner = Arc::new(Inner::on(Some(&display)).expect("a connection"));
+        let serving = std::thread::spawn({
+            let owner = owner.clone();
+            move || serve_requests(owner).is_ok()
+        });
+        let atoms = owner.atoms;
+        let text = large_text();
+        owner
+            .write(
+                vec![ClipboardData {
+                    bytes: text.clone(),
+                    format: atoms.UTF8_STRING,
+                }],
+                ClipboardKind::Clipboard,
+                WaitConfig::None,
+            )
+            .unwrap();
+
+        // the manager: it owns CLIPBOARD_MANAGER, answers the app's
+        // SAVE_TARGETS at once, and only then reads the clipboard
+        let (owns, owned) = std::sync::mpsc::channel();
+        let manager = std::thread::spawn({
+            let display = display.clone();
+            move || {
+                let manager = XContext::on(Some(&display)).expect("a connection");
+                let conn = &manager.conn;
+                conn.set_selection_owner(
+                    manager.win_id,
+                    atoms.CLIPBOARD_MANAGER,
+                    Time::CURRENT_TIME,
+                )
+                .unwrap();
+                conn.sync().unwrap();
+                owns.send(()).unwrap();
+                let until = Instant::now() + Duration::from_secs(10);
+                let request = loop {
+                    assert!(Instant::now() < until, "the app never asked the manager");
+                    match conn.poll_for_event().unwrap() {
+                        Some(Event::SelectionRequest(request))
+                            if request.target == atoms.SAVE_TARGETS =>
+                        {
+                            break request;
+                        }
+                        Some(_) => {}
+                        None => wait_for_server(conn, until),
+                    }
+                };
+                conn.send_event(
+                    false,
+                    request.requestor,
+                    EventMask::NO_EVENT,
+                    SelectionNotifyEvent {
+                        response_type: SELECTION_NOTIFY_EVENT,
+                        sequence: 0,
+                        time: request.time,
+                        requestor: request.requestor,
+                        selection: request.selection,
+                        target: request.target,
+                        property: NONE,
+                    },
+                )
+                .unwrap();
+                conn.flush().unwrap();
+                read_as_tk(&display, &atoms)
+            }
+        });
+        owned.recv().unwrap();
+
+        // the app quits: it asks the manager to take the clipboard, and
+        // its window goes once that is done, as `Clipboard`'s drop does
+        owner.ask_clipboard_manager_to_request_our_data().unwrap();
+        owner
+            .server
+            .conn
+            .destroy_window(owner.server.win_id)
+            .unwrap();
+        owner.server.conn.flush().unwrap();
+
+        let (got, in_pieces) = manager.join().expect("the manager read it all");
+        assert!(in_pieces, "1.4 MB set whole");
+        assert!(got == text, "the manager got the text");
+        assert!(serving.join().unwrap());
+    }
+
+    /// A read of a clipboard whose owner does not answer gives up after
+    /// one wait, where it went on to ask for each of the formats in turn,
+    /// as long for each, and a paste waited a minute for nothing
+    /// (elundqvist/kvist#401). On an X server of its own (`TestDisplay`).
+    #[test]
+    fn a_read_from_an_owner_that_does_not_answer_gives_up_once() {
+        let Some(server) = TestDisplay::start() else {
+            return;
+        };
+        let display = server.name.clone();
+        let reader = Inner::on(Some(&display)).expect("a connection");
+        // an owner that never reads its events, as one stopped or hung
+        let hung = XContext::on(Some(&display)).expect("a connection");
+        hung.conn
+            .set_selection_owner(hung.win_id, reader.atoms.CLIPBOARD, Time::CURRENT_TIME)
+            .unwrap();
+        hung.conn.sync().unwrap();
+
+        let began = Instant::now();
+        let read = reader.get_any(ClipboardKind::Clipboard);
+        assert!(matches!(read, Err(Error::TimedOut)), "{:?}", read.err());
+        assert!(
+            began.elapsed() < LONG_TIMEOUT_DUR * 2,
+            "gave up after {:?}",
+            began.elapsed()
+        );
     }
 }

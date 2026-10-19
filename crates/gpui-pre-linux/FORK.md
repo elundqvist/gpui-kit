@@ -94,6 +94,26 @@ asks (section 4(b)); each says so at its top:
   waits is given up (`Error::TimedOut`): the reader went on to ask it
   for each of fifteen formats, four seconds apiece, and a paste waited a
   minute.
+
+  A selection the app owns that is larger than the server's largest
+  request, less room for the request's fields (262,040 bytes as servers
+  usually have it), is handed over in pieces of that size, as ICCCM
+  2.7.2 has an owner do (elundqvist/kvist#424): it was set whole, and a
+  requestor that reads a property with a bound of its own, as Tk does,
+  could not take it, "selection property too large". The requestor is
+  answered `INCR` and the size, its property changes are listened to,
+  and each time it deletes the property the next piece goes in, an
+  empty one ending it (`IncrSend`); a requestor that takes no piece for
+  10 s is given up. Handed to the clipboard manager as the app quits,
+  the contents are written once the last piece has gone, and the app
+  waits on while the manager takes them: a manager that says it is done
+  first, as KDE's does, had the window go under its first piece. A
+  read connects to the display of the clipboard it reads. Tests of the
+  pieces, of a requestor that reads 1.4 MB as Tk does, of a manager that
+  answers first, and of a read from an owner that does not answer, on
+  an X server of their own: an Xvfb the test starts (`-displayfd`), or
+  the one `GPUI_X11_TEST_DISPLAY` names, never the desktop's, whose
+  clipboard they would take; with neither they are skipped.
 - `src/linux/x11/client.rs` and `src/linux/platform.rs`:
   `read_from_clipboard_async` reads the clipboard on a thread of its
   own where another program owns it, not on a worker of the background
