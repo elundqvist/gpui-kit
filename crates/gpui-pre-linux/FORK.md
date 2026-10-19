@@ -114,6 +114,13 @@ asks (section 4(b)); each says so at its top:
   an X server of their own: an Xvfb the test starts (`-displayfd`), or
   the one `GPUI_X11_TEST_DISPLAY` names, never the desktop's, whose
   clipboard they would take; with neither they are skipped.
+
+  Text the app owns is handed over as each target the owner lists
+  (`served_as`): the two MIME types of UTF-8 were listed and refused,
+  and `STRING`, the Latin-1 that older programs ask for, a character
+  outside it as `?`, was not there: Tk asked for it by name said `form
+  "STRING" not defined`. In pieces too where it is large. Tests of each
+  target, on an X server of its own.
 - `src/linux/x11/client.rs` and `src/linux/platform.rs`:
   `read_from_clipboard_async` reads the clipboard on a thread of its
   own where another program owns it, not on a worker of the background

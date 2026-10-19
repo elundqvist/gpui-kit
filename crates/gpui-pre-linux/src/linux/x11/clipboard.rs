@@ -754,9 +754,12 @@ impl Inner {
                     targets.push(data.format);
                     if data.format == self.atoms.UTF8_STRING {
                         // When we are storing a UTF8 string,
-                        // add all equivalent formats to the supported targets
+                        // add all equivalent formats to the supported targets,
+                        // and Latin-1, which older programs ask for
+                        // (`served_as`)
                         targets.push(self.atoms.UTF8_MIME_0);
                         targets.push(self.atoms.UTF8_MIME_1);
+                        targets.push(self.atoms.STRING);
                     }
                 }
             }
@@ -777,13 +780,13 @@ impl Inner {
             log::trace!("Handling request for (probably) the clipboard contents.");
             let data = self.selection_of(selection).data.read();
             if let Some(data_list) = &*data {
-                success = match data_list.iter().find(|d| d.format == event.target) {
-                    Some(data) if data.bytes.len() > self.largest_property() => {
-                        self.begin_incr(&event, &data.bytes, transfers)?;
+                success = match self.served_as(data_list, event.target) {
+                    Some(bytes) if bytes.len() > self.largest_property() => {
+                        self.begin_incr(&event, &bytes, transfers)?;
                         in_pieces = true;
                         true
                     }
-                    Some(data) => {
+                    Some(bytes) => {
                         self.server
                             .conn
                             .change_property8(
@@ -791,7 +794,7 @@ impl Inner {
                                 event.requestor,
                                 event.property,
                                 event.target,
-                                &data.bytes,
+                                &bytes,
                             )
                             .map_err(into_unknown)?;
                         self.server.conn.flush().map_err(into_unknown)?;
@@ -833,6 +836,32 @@ impl Inner {
 
         self.server.conn.flush().map_err(into_unknown)?;
         Ok(in_pieces)
+    }
+
+    /// What the owner hands over for a request for `target`: the data held
+    /// in that format, and for a text held as `UTF8_STRING` the same bytes
+    /// as `text/plain;charset=utf-8` and `text/plain;charset=UTF-8`, and
+    /// the text in Latin-1 as `STRING`, a character outside it as `?`, as
+    /// Qt hands it over.
+    ///
+    /// Changed in elundqvist/gpui-kit: the two MIME types were among the
+    /// targets the owner listed, and a request for either was refused; and
+    /// there was no `STRING`, which older programs ask for: Tk asked for it
+    /// by name said `form "STRING" not defined`.
+    fn served_as<'a>(&self, data_list: &'a [ClipboardData], target: Atom) -> Option<Cow<'a, [u8]>> {
+        if let Some(data) = data_list.iter().find(|d| d.format == target) {
+            return Some(Cow::Borrowed(&data.bytes));
+        }
+        let text = data_list
+            .iter()
+            .find(|d| d.format == self.atoms.UTF8_STRING)?;
+        if target == self.atoms.UTF8_MIME_0 || target == self.atoms.UTF8_MIME_1 {
+            return Some(Cow::Borrowed(&text.bytes));
+        }
+        if target == self.atoms.STRING {
+            return Some(Cow::Owned(latin1(&text.bytes)));
+        }
+        None
     }
 
     /// Begin handing `bytes` over to the requestor of `event` in pieces
@@ -1152,6 +1181,15 @@ fn serve_requests(context: Arc<Inner>) -> Result<(), Box<dyn std::error::Error>>
             }
         }
     }
+}
+
+/// UTF-8 `bytes` in Latin-1, the `STRING` of ICCCM 2.7.1: a character
+/// outside it is `?`.
+fn latin1(bytes: &[u8]) -> Vec<u8> {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|c| u8::try_from(u32::from(c)).unwrap_or(b'?'))
+        .collect()
 }
 
 /// The most a property set in one request holds, for a server whose
@@ -1717,6 +1755,14 @@ mod tests {
     /// bound on a property, from a client of its own on `display`: the
     /// data, and whether it came in pieces.
     fn read_as_tk(display: &str, atoms: &Atoms) -> (Vec<u8>, bool) {
+        let (data, in_pieces, type_) = read_target(display, atoms, atoms.UTF8_STRING);
+        assert_eq!(type_, atoms.UTF8_STRING);
+        (data, in_pieces)
+    }
+
+    /// Reads the selection converted to `target` as `read_as_tk` does: the
+    /// data, whether it came in pieces, and its type.
+    fn read_target(display: &str, atoms: &Atoms, target: Atom) -> (Vec<u8>, bool, Atom) {
         const TK_PROPERTY_WORDS: u32 = 100_000;
         let reader = XContext::on(Some(display)).expect("a connection");
         let conn = &reader.conn;
@@ -1728,7 +1774,7 @@ mod tests {
         conn.convert_selection(
             reader.win_id,
             atoms.CLIPBOARD,
-            atoms.UTF8_STRING,
+            target,
             atoms.ARBOARD_CLIPBOARD,
             Time::CURRENT_TIME,
         )
@@ -1767,7 +1813,7 @@ mod tests {
                 first.bytes_after, 0,
                 "the selection was set whole, larger than Tk reads a property: \"selection property too large\""
             );
-            return (first.value, false);
+            return (first.value, false, first.type_);
         }
         // deleting the INCR property asks for the first piece
         get(true);
@@ -1782,9 +1828,9 @@ mod tests {
                     let piece = get(true);
                     conn.flush().unwrap();
                     assert_eq!(piece.bytes_after, 0, "a piece larger than Tk reads");
-                    assert_eq!(piece.type_, atoms.UTF8_STRING);
+                    assert_eq!(piece.type_, target);
                     if piece.value.is_empty() {
-                        return (data, true);
+                        return (data, true, target);
                     }
                     data.extend_from_slice(&piece.value);
                 }
@@ -1966,5 +2012,77 @@ mod tests {
             "gave up after {:?}",
             began.elapsed()
         );
+    }
+
+    /// Text the app owns is handed over as every target it lists: the two
+    /// MIME types of UTF-8 as `UTF8_STRING` is, and `STRING` in Latin-1,
+    /// which older programs ask for: the first two were refused, and Tk
+    /// asked for the third said `form "STRING" not defined`. In pieces too
+    /// where it is large. On an X server of its own (`TestDisplay`).
+    #[test]
+    fn text_is_served_as_every_target_the_owner_lists() {
+        let Some(server) = TestDisplay::start() else {
+            return;
+        };
+        let display = server.name.clone();
+        let owner = Arc::new(Inner::on(Some(&display)).expect("a connection"));
+        let serving = std::thread::spawn({
+            let owner = owner.clone();
+            move || serve_requests(owner).is_ok()
+        });
+        let atoms = owner.atoms;
+        let write = |text: &str| {
+            owner
+                .write(
+                    vec![ClipboardData {
+                        bytes: text.as_bytes().to_vec(),
+                        format: atoms.UTF8_STRING,
+                    }],
+                    ClipboardKind::Clipboard,
+                    WaitConfig::None,
+                )
+                .unwrap()
+        };
+
+        write("héllo ✓");
+        let (targets, _, type_) = read_target(&display, &atoms, atoms.TARGETS);
+        assert_eq!(type_, atoms.ATOM);
+        let targets = Inner::parse_formats(&targets);
+        for target in [
+            atoms.UTF8_STRING,
+            atoms.UTF8_MIME_0,
+            atoms.UTF8_MIME_1,
+            atoms.STRING,
+        ] {
+            assert!(targets.contains(&target), "{target} listed");
+        }
+        for mime in [atoms.UTF8_MIME_0, atoms.UTF8_MIME_1] {
+            let (got, in_pieces, type_) = read_target(&display, &atoms, mime);
+            assert_eq!(
+                (got, in_pieces, type_),
+                ("héllo ✓".as_bytes().to_vec(), false, mime)
+            );
+        }
+        let (got, _, type_) = read_target(&display, &atoms, atoms.STRING);
+        assert_eq!((got, type_), (b"h\xe9llo ?".to_vec(), atoms.STRING));
+
+        let text = String::from_utf8(large_text()).unwrap();
+        write(&text);
+        let (got, in_pieces, _) = read_target(&display, &atoms, atoms.STRING);
+        assert!(in_pieces, "1.4 MB of Latin-1 set whole");
+        assert!(got == text.as_bytes(), "the pieces are the text");
+
+        owner
+            .server
+            .conn
+            .destroy_window(owner.server.win_id)
+            .unwrap();
+        owner.server.conn.flush().unwrap();
+        assert!(serving.join().unwrap());
+    }
+
+    #[test]
+    fn latin1_is_the_text_with_a_character_outside_it_as_a_question_mark() {
+        assert_eq!(latin1("héllo ✓ ÿ".as_bytes()), b"h\xe9llo ? \xff");
     }
 }
