@@ -147,6 +147,19 @@ asks (section 4(b)); each says so at its top:
   elundqvist/kvist#435), where it gave nothing, as an empty clipboard
   does, and a paste that waited four seconds ended with nothing to say
   why. A test of what each read gives.
+- `src/linux/x11/client.rs`: the cursor hidden over a window while it is
+  typed into is given back only to a window still there, and is hidden
+  and set only over one (`still_there`, elundqvist/kvist#444). A
+  window's drop sends DestroyWindow at once and the client lets go of
+  the window later (`drop_window`), so a window closed with its cursor
+  hidden had the next event of another window's, the pointer coming
+  onto the window under it or the focus moving on, ask the server to
+  restore the cursor of a window it no longer had: BadWindow, logged as
+  an error ("Failed to restore cursor style after hide"); a key or a
+  cursor style in between would have asked the same of hiding or
+  setting it. A test of which windows are asked about; the requests
+  themselves need gpui's own windows on a connection, and were checked
+  under Kvist's harness on Xvfb.
 - `Cargo.toml`: an `[[example]]` entry for `examples/xdnd_source.rs`,
   which the fork adds (the published manifest names its targets and
   has no examples).

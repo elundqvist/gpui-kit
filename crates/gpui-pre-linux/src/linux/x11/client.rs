@@ -2163,6 +2163,10 @@ impl LinuxClient for X11Client {
         if state.cursor_hidden_window == Some(focused_window) {
             return;
         }
+        // Nor ask the server about a window being destroyed (elundqvist/kvist#444).
+        if !state.still_there(focused_window) {
+            return;
+        }
 
         let Some(cursor) = state.get_cursor_icon(style) else {
             return;
@@ -2602,8 +2606,12 @@ impl X11ClientState {
         if self.cursor_hidden_window.is_some() {
             return;
         }
-        let Some(focused_window) = self.mouse_focused_window else {
-            // No window to apply the per-window invisible cursor to.
+        // No window to apply the per-window invisible cursor to, or one
+        // being destroyed (elundqvist/kvist#444).
+        let Some(focused_window) = self
+            .mouse_focused_window
+            .filter(|w| self.still_there(*w))
+        else {
             return;
         };
         let Some(invisible_cursor) = self.get_or_create_invisible_cursor() else {
@@ -2624,8 +2632,28 @@ impl X11ClientState {
         self.cursor_hidden_window = Some(focused_window);
     }
 
+    /// Whether the client may still ask the server about `window`: one it
+    /// has and is not destroying (`still_there`).
+    fn still_there(&self, window: xproto::Window) -> bool {
+        still_there(
+            self.windows
+                .get(&window)
+                .map(|r| r.window.state.borrow().destroyed),
+        )
+    }
+
     fn restore_cursor_after_hide(&mut self) {
-        let Some(hidden_window) = self.cursor_hidden_window.take() else {
+        // A window being destroyed has no cursor to give back: its drop
+        // sends DestroyWindow at once and lets go of it here later
+        // (`drop_window`), and the event that came between, the pointer
+        // onto the window under it or the focus moving on, asked the server
+        // to restore a window it no longer had, which it answered with a
+        // BadWindow logged as an error (elundqvist/kvist#444).
+        let Some(hidden_window) = self
+            .cursor_hidden_window
+            .take()
+            .filter(|w| self.still_there(*w))
+        else {
             return;
         };
         let style = self
@@ -3077,6 +3105,20 @@ fn create_invisible_cursor(
     Ok(cursor)
 }
 
+/// Whether a window whose state in the client is `destroyed`, `None` for
+/// one the client no longer has, may still be asked about of the server:
+/// only one it has and is not destroying. A window's drop sends
+/// DestroyWindow at once and lets go of it in the client later
+/// (`drop_window`), and a cursor given back, hidden or set on such a
+/// window in between was answered with a BadWindow, logged as an error.
+///
+/// Added in elundqvist/gpui-kit (elundqvist/kvist#444): a window popped out
+/// of Kvist and closed with its cursor hidden logged "Failed to restore
+/// cursor style after hide" as the pointer came onto the window under it.
+fn still_there(destroyed: Option<bool>) -> bool {
+    destroyed == Some(false)
+}
+
 enum DpiMode {
     Randr,
     Scale(f32),
@@ -3401,6 +3443,20 @@ mod tests {
         );
         let text = gpui::ClipboardItem::new_string("text".into());
         assert_eq!(read_for_paste(Ok(text.clone())), Ok(Some(text)));
+    }
+
+    /// A window the client has and is not destroying is asked about; one
+    /// it is destroying, or has let go of, is not: a cursor given back to
+    /// one being destroyed was answered with a BadWindow logged as an
+    /// error (elundqvist/kvist#444). Only this choice is tested here; the
+    /// windows it is asked of need a connection and gpui's own windows,
+    /// and the three requests that ask it were checked under Kvist's
+    /// harness on Xvfb.
+    #[test]
+    fn only_a_window_still_there_is_asked_about() {
+        assert!(still_there(Some(false)));
+        assert!(!still_there(Some(true)), "being destroyed");
+        assert!(!still_there(None), "let go of");
     }
 
     fn test_keymap(layouts: &str) -> xkbc::Keymap {
