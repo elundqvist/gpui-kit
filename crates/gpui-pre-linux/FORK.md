@@ -127,6 +127,20 @@ asks (section 4(b)); each says so at its top:
   executor, which a read that waits on its owner would take, and gives
   the app's own copy at once (elundqvist/kvist#401); the Wayland and
   headless clients read it as before.
+- `src/linux/x11/client.rs` and `src/linux/x11/window.rs`: a
+  composition the window loses the keyboard in, one the client knows of
+  from its input method or a dead key, is deleted by the marked text
+  replaced with nothing and the mark ended, handed over behind what came
+  before them (elundqvist/kvist#435): the marked range was asked of the
+  input handler as the focus went, and where the window's input was
+  held behind a paste waiting for the clipboard (the fork's gpui-pre),
+  a composition begun meanwhile was not marked yet, so the deletion took
+  the range marked before it, other text or none. With no composition
+  known, what the handler has marked goes, as before. The handler is to
+  take an empty mark where nothing is marked as no edit, as the fork's
+  gpui-base input does: the focus may have moved to a field whose
+  selection it would delete. Tests of a field whose input is held, and
+  of one with a selection and nothing marked.
 - `Cargo.toml`: an `[[example]]` entry for `examples/xdnd_source.rs`,
   which the fork adds (the published manifest names its targets and
   has no examples).

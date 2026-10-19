@@ -1451,11 +1451,14 @@ impl X11Client {
                 if let Some(compose_state) = state.compose_state.as_mut() {
                     compose_state.reset();
                 }
-                state.pre_edit_text.take();
+                // what the client knows of a composition, an input method's
+                // or a dead key's, before both are ended here
+                let dead_key = state.pre_edit_text.take();
+                let composing = state.composing || dead_key.is_some_and(|text| !text.is_empty());
                 state.restore_cursor_after_hide();
                 drop(state);
                 self.reset_ime();
-                window.handle_ime_delete();
+                window.handle_ime_delete(composing);
             }
             Event::XkbNewKeyboardNotify(_) | Event::XkbMapNotify(_) => {
                 let mut state = self.0.borrow_mut();

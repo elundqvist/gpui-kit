@@ -3619,6 +3619,14 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
         if !self.is_editable() {
             return;
         }
+        // an empty composition where nothing is marked ends none, and
+        // leaves the text be: the X11 client deletes a composition it knows
+        // of so as the window loses the keyboard, behind a paste that holds
+        // the input, and the focus may have moved to a field with nothing
+        // marked, whose selection it deleted (elundqvist/kvist#435)
+        if new_text.is_empty() && range_utf16.is_none() && self.ime_marked_range.is_none() {
+            return;
+        }
         let selection_before = self.selected_range;
 
         let starts_composition = self.ime_marked_range.is_none();
@@ -7824,6 +7832,38 @@ mod tests {
 
                 assert_eq!(state.value(), "a");
                 assert!(!state.undo_manager.has_undos());
+            });
+        });
+    }
+
+    /// An empty composition where nothing is marked, then its end, leaves
+    /// the text and its selection be, as the X11 client hands them over
+    /// for a composition it knows of as the window loses the keyboard: the
+    /// focus may have moved to a field with nothing marked, whose selection
+    /// was deleted. With something marked, the mark goes, as before
+    /// (elundqvist/kvist#435).
+    #[gpui::test]
+    fn test_an_empty_mark_with_nothing_marked_leaves_the_selection(cx: &mut TestAppContext) {
+        let input_view = InputView::build(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("rename me", window, cx);
+                state.set_selected_range(0..6, cx);
+                state.replace_and_mark_text_in_range(None, "", None, window, cx);
+                state.unmark_text(window, cx);
+                assert_eq!(state.value(), "rename me");
+                assert_eq!(state.selected_range(), 0..6);
+                assert!(!state.undo_manager.has_undos());
+
+                state.set_selected_range(9..9, cx);
+                state.replace_and_mark_text_in_range(None, "ni", None, window, cx);
+                state.replace_and_mark_text_in_range(None, "", None, window, cx);
+                state.unmark_text(window, cx);
+                assert_eq!(state.value(), "rename me");
+                assert_eq!(state.selected_range(), 9..9);
             });
         });
     }

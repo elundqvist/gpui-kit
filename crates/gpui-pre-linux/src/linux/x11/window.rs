@@ -1252,16 +1252,29 @@ impl X11WindowStatePtr {
         }
     }
 
-    pub fn handle_ime_delete(&self) {
+    /// Delete the composition an input method left as the window lost the
+    /// keyboard, where `composing` says the client knows of one.
+    ///
+    /// Changed in elundqvist/gpui-kit (elundqvist/kvist#435): the marked
+    /// range was asked of the input handler as the focus went, and the
+    /// deletion of that range handed over. Where the window's input is held
+    /// behind a paste waiting for the clipboard (gpui's `hold_input`, in
+    /// the fork's gpui-pre), a composition begun meanwhile waits too: the
+    /// handler had not marked it yet, and the deletion, at the range it
+    /// marked before, took other text or none once the input went on. A
+    /// composition the client knows of is now deleted by what is handed
+    /// over in order behind it, the marked text replaced with nothing and
+    /// the mark ended, so whatever is marked when it comes is what goes.
+    /// The handler is asked for its marked range only where the client
+    /// knows of no composition, as before.
+    pub fn handle_ime_delete(&self, composing: bool) {
         if self.is_blocked() {
             return;
         }
         let mut state = self.state.borrow_mut();
         if let Some(mut input_handler) = state.input_handler.take() {
             drop(state);
-            if let Some(marked) = input_handler.marked_text_range() {
-                input_handler.replace_text_in_range(Some(marked), "");
-            }
+            delete_composition(&mut input_handler, composing);
             let mut state = self.state.borrow_mut();
             state.input_handler = Some(input_handler);
         }
@@ -2024,5 +2037,195 @@ struct TrivialDeactivationHandler {
 impl accesskit::DeactivationHandler for TrivialDeactivationHandler {
     fn deactivate_accessibility(&mut self) {
         (self.callback)();
+    }
+}
+
+/// What deleting a composition asks of an input handler
+/// (`handle_ime_delete`), so that what it hands over
+/// is tested.
+trait ComposedText {
+    fn marked_text_range(&mut self) -> Option<std::ops::Range<usize>>;
+    fn replace_text_in_range(&mut self, range: Option<std::ops::Range<usize>>, text: &str);
+    fn replace_and_mark_text_in_range(&mut self, range: Option<std::ops::Range<usize>>, text: &str);
+    fn unmark_text(&mut self);
+}
+
+impl ComposedText for PlatformInputHandler {
+    fn marked_text_range(&mut self) -> Option<std::ops::Range<usize>> {
+        PlatformInputHandler::marked_text_range(self)
+    }
+
+    fn replace_text_in_range(&mut self, range: Option<std::ops::Range<usize>>, text: &str) {
+        PlatformInputHandler::replace_text_in_range(self, range, text)
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+    ) {
+        PlatformInputHandler::replace_and_mark_text_in_range(self, range, text, None)
+    }
+
+    fn unmark_text(&mut self) {
+        PlatformInputHandler::unmark_text(self)
+    }
+}
+
+/// Delete the composition the window loses the keyboard in: one the
+/// client knows of (`composing`) by the marked text replaced with nothing
+/// and the mark ended, handed over behind what came before them, so that
+/// what is marked when they come is what goes; else what the handler says
+/// is marked now, as before.
+fn delete_composition(handler: &mut impl ComposedText, composing: bool) {
+    if composing {
+        handler.replace_and_mark_text_in_range(None, "");
+        handler.unmark_text();
+    } else if let Some(marked) = handler.marked_text_range() {
+        handler.replace_text_in_range(Some(marked), "");
+    }
+}
+
+#[cfg(test)]
+mod composition_tests {
+    use super::{ComposedText, delete_composition};
+    use std::ops::Range;
+
+    /// What the window hands a text field.
+    enum Handed {
+        Mark(Option<Range<usize>>, String),
+        Replace(Option<Range<usize>>, String),
+        Unmark,
+    }
+
+    /// A text field whose window holds its input, as the fork's gpui-pre
+    /// holds it behind a paste that waits for the clipboard
+    /// (elundqvist/kvist#401): what is handed over waits in `held` until
+    /// `release` hands it on in order. What it is handed with no range goes
+    /// where text is marked, else over the selection, as gpui-base's input
+    /// does; with no selection the caret is at the end, where an edit
+    /// leaves it. An empty mark where nothing is marked leaves it be.
+    #[derive(Default)]
+    struct HeldField {
+        text: String,
+        marked: Option<Range<usize>>,
+        selected: Option<Range<usize>>,
+        held: Vec<Handed>,
+    }
+
+    impl HeldField {
+        fn apply(&mut self, handed: Handed) {
+            let caret = self.text.len();
+            let (range, text, marks) = match handed {
+                Handed::Mark(None, text) if text.is_empty() && self.marked.is_none() => return,
+                Handed::Mark(range, text) => (range, text, true),
+                Handed::Replace(range, text) => (range, text, false),
+                Handed::Unmark => {
+                    self.marked = None;
+                    return;
+                }
+            };
+            let range = range
+                .or(self.marked.clone())
+                .or(self.selected.take())
+                .unwrap_or(caret..caret);
+            self.text.replace_range(range.clone(), &text);
+            self.marked =
+                (marks && !text.is_empty()).then(|| range.start..range.start + text.len());
+        }
+
+        fn release(&mut self) {
+            for handed in std::mem::take(&mut self.held) {
+                self.apply(handed);
+            }
+        }
+    }
+
+    impl ComposedText for HeldField {
+        fn marked_text_range(&mut self) -> Option<Range<usize>> {
+            self.marked.clone()
+        }
+
+        fn replace_text_in_range(&mut self, range: Option<Range<usize>>, text: &str) {
+            self.held.push(Handed::Replace(range, text.to_string()));
+        }
+
+        fn replace_and_mark_text_in_range(&mut self, range: Option<Range<usize>>, text: &str) {
+            self.held.push(Handed::Mark(range, text.to_string()));
+        }
+
+        fn unmark_text(&mut self) {
+            self.held.push(Handed::Unmark);
+        }
+    }
+
+    /// A composition begun, or changed, while the window's input is held
+    /// behind a paste is deleted as the window loses the keyboard, and
+    /// nothing else with it: the range the field had marked before the
+    /// hold was deleted, which was other text or none (elundqvist/kvist#435).
+    #[test]
+    fn a_composition_held_behind_a_paste_is_deleted_as_the_focus_goes() {
+        let mut field = HeldField {
+            text: "hello ".to_string(),
+            ..Default::default()
+        };
+        field.held.push(Handed::Mark(None, "ni".to_string()));
+        delete_composition(&mut field, true);
+        field.release();
+        assert_eq!(
+            (field.text.as_str(), field.marked.clone()),
+            ("hello ", None)
+        );
+
+        // marked before the hold, and changed while it held
+        field.apply(Handed::Mark(None, "ni".to_string()));
+        assert_eq!(field.marked, Some(6..8));
+        field.held.push(Handed::Mark(None, "nihao".to_string()));
+        delete_composition(&mut field, true);
+        field.release();
+        assert_eq!(
+            (field.text.as_str(), field.marked.clone()),
+            ("hello ", None)
+        );
+    }
+
+    /// With no composition the client knows of, what the field has marked
+    /// is deleted, as before, and a field with nothing marked is left be.
+    #[test]
+    fn with_no_composition_known_what_is_marked_goes() {
+        let mut field = HeldField {
+            text: "hello ".to_string(),
+            ..Default::default()
+        };
+        delete_composition(&mut field, false);
+        field.release();
+        assert_eq!(field.text, "hello ");
+        field.apply(Handed::Mark(None, "ni".to_string()));
+        delete_composition(&mut field, false);
+        field.release();
+        assert_eq!(
+            (field.text.as_str(), field.marked.clone()),
+            ("hello ", None)
+        );
+    }
+
+    /// The client may take a composition to be under way where the field
+    /// the focus has gone to has nothing marked, a box whose text is
+    /// selected, as Rename's, that a key the input method let through
+    /// opened: what it hands that field leaves the text and the selection
+    /// be, where the selection was deleted (elundqvist/kvist#435).
+    #[test]
+    fn a_field_with_nothing_marked_keeps_its_selection() {
+        let mut field = HeldField {
+            text: "name".to_string(),
+            selected: Some(0..4),
+            ..Default::default()
+        };
+        delete_composition(&mut field, true);
+        field.release();
+        assert_eq!(
+            (field.text.as_str(), field.selected.clone()),
+            ("name", Some(0..4))
+        );
     }
 }
