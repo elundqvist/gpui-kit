@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from zed-xim 0.4.0-zed as published to crates.io: FORK.md at the
+// crate's root lists the changes.
 mod attribute_builder;
 
 pub use self::attribute_builder::AttributeBuilder;
@@ -140,10 +142,8 @@ pub fn handle_request<C: ClientCore>(
             input_context_id,
             preedit_string,
         } => {
-            let preedit_string =
-                xim_ctext::compound_text_to_utf8(&preedit_string).expect("Encoding error");
-            handler.handle_reset_ic(client, input_method_id, input_context_id, &preedit_string);
-            Ok(())
+            let preedit_string = crate::ctext::compound_text_to_utf8_lossy(&preedit_string);
+            handler.handle_reset_ic(client, input_method_id, input_context_id, &preedit_string)
         }
         Request::Error { code, detail, .. } => Err(ClientError::XimError(code, detail)),
         Request::ForwardEvent {
@@ -187,7 +187,7 @@ pub fn handle_request<C: ClientCore>(
                     client,
                     input_method_id,
                     input_context_id,
-                    &xim_ctext::compound_text_to_utf8(&commited).expect("Encoding Error"),
+                    &crate::ctext::compound_text_to_utf8_lossy(&commited),
                 )?;
 
                 if syncronous {
@@ -233,8 +233,7 @@ pub fn handle_request<C: ClientCore>(
             status,
             feedbacks,
         } => {
-            let preedit_string =
-                xim_ctext::compound_text_to_utf8(&preedit_string).expect("Encoding Error");
+            let preedit_string = crate::ctext::compound_text_to_utf8_lossy(&preedit_string);
             handler.handle_preedit_draw(
                 client,
                 input_method_id,
@@ -292,8 +291,8 @@ pub trait ClientCore {
 pub trait Client {
     type XEvent;
 
-    fn build_ic_attributes(&self) -> AttributeBuilder;
-    fn build_im_attributes(&self) -> AttributeBuilder;
+    fn build_ic_attributes(&self) -> AttributeBuilder<'_>;
+    fn build_im_attributes(&self) -> AttributeBuilder<'_>;
 
     fn disconnect(&mut self) -> Result<(), ClientError>;
     fn open(&mut self, locale: &str) -> Result<(), ClientError>;
@@ -347,11 +346,11 @@ where
 {
     type XEvent = C::XEvent;
 
-    fn build_ic_attributes(&self) -> AttributeBuilder {
+    fn build_ic_attributes(&self) -> AttributeBuilder<'_> {
         AttributeBuilder::new(self.ic_attributes())
     }
 
-    fn build_im_attributes(&self) -> AttributeBuilder {
+    fn build_im_attributes(&self) -> AttributeBuilder<'_> {
         AttributeBuilder::new(self.im_attributes())
     }
 
@@ -603,5 +602,116 @@ pub trait ClientHandler<C: Client> {
         preedit_text: &str,
     ) -> Result<(), ClientError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{handle_request, ClientCore, ClientError, ClientHandler};
+    use crate::AHashMap;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use xim_parser::{
+        Attr, AttributeName, CommitData, Feedback, PreeditDrawStatus, Request, XEvent,
+    };
+
+    /// A client that sends nothing anywhere: what it was asked to send is
+    /// kept.
+    #[derive(Default)]
+    struct Quiet {
+        attributes: AHashMap<AttributeName, u16>,
+        sent: Vec<Request>,
+    }
+
+    impl ClientCore for Quiet {
+        type XEvent = ();
+        fn set_attrs(&mut self, _: Vec<Attr>, _: Vec<Attr>) {}
+        fn ic_attributes(&self) -> &AHashMap<AttributeName, u16> {
+            &self.attributes
+        }
+        fn im_attributes(&self) -> &AHashMap<AttributeName, u16> {
+            &self.attributes
+        }
+        fn serialize_event(&self, _: &()) -> XEvent {
+            unreachable!()
+        }
+        fn deserialize_event(&self, _: &XEvent) {}
+        fn send_req(&mut self, req: Request) -> Result<(), ClientError> {
+            self.sent.push(req);
+            Ok(())
+        }
+    }
+
+    /// The text a handler was handed, by what it came as.
+    #[derive(Default)]
+    struct Texts(Vec<(&'static str, String)>);
+
+    impl ClientHandler<Quiet> for Texts {
+        fn handle_commit(&mut self, _: &mut Quiet, _: u16, _: u16, text: &str) -> Result<(), ClientError> {
+            self.0.push(("commit", text.into()));
+            Ok(())
+        }
+        fn handle_preedit_draw(
+            &mut self,
+            _: &mut Quiet,
+            _: u16,
+            _: u16,
+            _: i32,
+            _: i32,
+            _: i32,
+            _: PreeditDrawStatus,
+            text: &str,
+            _: Vec<Feedback>,
+        ) -> Result<(), ClientError> {
+            self.0.push(("preedit", text.into()));
+            Ok(())
+        }
+        fn handle_reset_ic(&mut self, _: &mut Quiet, _: u16, _: u16, text: &str) -> Result<(), ClientError> {
+            self.0.push(("reset", text.into()));
+            Ok(())
+        }
+    }
+
+    fn draw(bytes: &[u8]) -> Request {
+        Request::PreeditDraw {
+            input_method_id: 1,
+            input_context_id: 1,
+            caret: 1,
+            chg_first: 0,
+            chg_length: 0,
+            status: PreeditDrawStatus::empty(),
+            preedit_string: bytes.into(),
+            feedbacks: Vec::new(),
+        }
+    }
+
+    /// A preedit, a commit and a reset's preedit that xim-ctext 0.3 could
+    /// not decode reach the handler decoded, where the client panicked on
+    /// them ("Encoding Error"): a letter of Latin-1 as libX11 writes it,
+    /// Korean, and a charset there is no table for.
+    #[test]
+    fn text_that_did_not_decode_reaches_the_handler() {
+        let (mut client, mut handler) = (Quiet::default(), Texts::default());
+        let requests = [
+            draw(&[0xE9]),
+            draw(&[0x1B, 0x24, 0x28, 0x43, 0x47, 0x51, 0x31, 0x39]),
+            draw(&[0x1B, 0x24, 0x28, 0x47, 0x44, 0x21]),
+            Request::Commit {
+                input_method_id: 1,
+                input_context_id: 1,
+                data: CommitData::Chars { commited: [0x1B, 0x24, 0x28, 0x43, 0x47, 0x51, 0x31, 0x39].into(), syncronous: true },
+            },
+            Request::ResetIcReply { input_method_id: 1, input_context_id: 1, preedit_string: [0x61, 0xE9].into() },
+        ];
+        for request in requests {
+            handle_request(&mut client, &mut handler, request).unwrap();
+        }
+        let texts: Vec<(&str, &str)> = handler.0.iter().map(|(k, t)| (*k, t.as_str())).collect();
+        assert_eq!(
+            texts,
+            [("preedit", "é"), ("preedit", "한국"), ("preedit", "\u{FFFD}"), ("commit", "한국"), ("reset", "aé")]
+        );
+        // a synchronous commit is still answered
+        assert!(matches!(client.sent.as_slice(), [Request::SyncReply { .. }]));
     }
 }

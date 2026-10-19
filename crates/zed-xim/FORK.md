@@ -19,9 +19,43 @@ with it, from the same commit, and needs no patch of its own for it.
 
 ## What is changed
 
-Nothing yet. Each change is listed here by file as it comes; a source
-file changed says so at its top. The crate is under the MIT licence,
-its `LICENSE` beside this file.
+Each change is listed here by file; a source file changed or added
+says so at its top. The crate is under the MIT licence, its `LICENSE`
+beside this file.
+
+- `src/ctext.rs` (added), `src/client.rs`, `src/lib.rs` and
+  `Cargo.toml`: the text an input method draws as its preedit, commits,
+  or hands back as an input context is reset is decoded from
+  COMPOUND_TEXT whatever it holds (`compound_text_to_utf8_lossy`), where
+  the client called `.expect("Encoding Error")` on xim-ctext 0.3's
+  decoder, and an application panicked as soon as a field had a
+  preedit under ibus with cangjie5 (elundqvist/kvist#455): ibus encodes
+  with libX11, which writes a letter of Latin-1 as one byte in the right
+  half, and Korean and Chinese as KS C 5601 and GB 2312, and xim-ctext
+  0.3 decodes only a whole string of UTF-8 or of JIS X 0208. The
+  decoder reads ISO 2022 as compound text has it, a side at a time:
+  ASCII and JIS X 0201 in GL, Latin-1 and the other parts of ISO 8859
+  and TIS 620 in GR, GB 2312, JIS X 0208, JIS X 0212 and KS C 5601 in
+  either, UTF-8 segments, and extended segments of Big5, GBK, GB 18030
+  and KOI8, by encoding_rs (which xim-ctext already built on, so no
+  crate is added to a lock). A byte or a charset it has no table for,
+  CNS 11643 among them, is U+FFFD, and a sequence it does not know,
+  the direction of the text among them, is passed over: nothing fails.
+  A string with no escape in it that is UTF-8 is still read as UTF-8,
+  as xim-ctext 0.3 read every one with no escape, for an input method
+  that sends UTF-8 as it is. xim-ctext 0.4.1, the newest, decodes more
+  but still gives errors (an unknown set, a UTF-8 segment that is not
+  UTF-8), overflows on GB 2312 beside a byte of GR, and xim 0.5 still
+  unwraps its result. Tests of what libX11 and ibus write, of segments
+  of several charsets, of extended segments, of what does not decode,
+  and of a preedit, a commit and a reset that reach the handler
+  decoded.
+
+  The client's `handle_reset_ic` hands back the handler's result, which
+  it dropped, and `build_ic_attributes` and `build_im_attributes` name
+  the lifetime of the builder they return: today's rustc warned of
+  both, and the crate builds as a path dependency of gpui-pre-linux,
+  whose warnings an application patching it in by path is shown.
 
 ## Tests
 

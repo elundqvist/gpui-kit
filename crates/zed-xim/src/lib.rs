@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from zed-xim 0.4.0-zed as published to crates.io: FORK.md at the
+// crate's root lists the changes.
 //! Implements the X Input Method (XIM) protocol.
 //!
 //! XIM is the input method framework used for X11 applications. To clarify, it provides
@@ -32,6 +34,8 @@ extern crate std;
 
 #[cfg(feature = "client")]
 mod client;
+#[cfg(feature = "client")]
+mod ctext;
 #[cfg(feature = "server")]
 mod server;
 

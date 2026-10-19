@@ -104,6 +104,9 @@ version = "0.8"
 features = ["compile-time-rng"]
 default-features = false
 
+[dependencies.encoding_rs]
+version = "0.8.28"
+
 [dependencies.hashbrown]
 version = "0.14.0"
 default-features = false
