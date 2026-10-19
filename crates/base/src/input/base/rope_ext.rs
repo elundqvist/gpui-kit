@@ -2,6 +2,7 @@ use std::ops::Range;
 
 use ropey::{LineType, Rope, RopeSlice};
 use sum_tree::Bias;
+use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
 
 /// Parser-independent byte/row/column position used for incremental edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -244,6 +245,45 @@ pub trait RopeExt {
     /// ```
     fn clip_offset(&self, offset: usize, bias: Bias) -> usize;
 
+    /// The byte offset of the grapheme boundary before `offset`, or 0: one
+    /// step back over what is drawn as one character, an emoji of several,
+    /// a flag, a letter and the accents after it, a `\r\n`. An offset
+    /// inside a character steps back from that character's end.
+    ///
+    /// Runs in O(log N) time, and the length of the grapheme.
+    ///
+    /// ```
+    /// use gpui_base::input::{Rope, RopeExt};
+    ///
+    /// let rope = Rope::from("a👨‍👩‍👧🇳🇴e\u{301}\r\n");
+    /// assert_eq!(rope.grapheme_before(rope.len()), rope.len() - 2);
+    /// assert_eq!(rope.grapheme_before(rope.len() - 2), rope.len() - 5);
+    /// assert_eq!(rope.grapheme_before("a👨‍👩‍👧🇳🇴".len()), "a👨‍👩‍👧".len());
+    /// assert_eq!(rope.grapheme_before("a👨‍👩‍👧".len()), 1);
+    /// assert_eq!(rope.grapheme_before(1), 0);
+    /// assert_eq!(rope.grapheme_before(0), 0);
+    /// ```
+    fn grapheme_before(&self, offset: usize) -> usize;
+
+    /// The byte offset of the grapheme boundary after `offset`, or the
+    /// length: one step on over what is drawn as one character, as
+    /// [`RopeExt::grapheme_before`] steps back. An offset inside a
+    /// character steps on from that character's start.
+    ///
+    /// Runs in O(log N) time, and the length of the grapheme.
+    ///
+    /// ```
+    /// use gpui_base::input::{Rope, RopeExt};
+    ///
+    /// let rope = Rope::from("a👨‍👩‍👧🇳🇴e\u{301}\r\n");
+    /// assert_eq!(rope.grapheme_after(0), 1);
+    /// assert_eq!(rope.grapheme_after(1), "a👨‍👩‍👧".len());
+    /// assert_eq!(rope.grapheme_after("a👨‍👩‍👧".len()), "a👨‍👩‍👧🇳🇴".len());
+    /// assert_eq!(rope.grapheme_after(rope.len() - 2), rope.len());
+    /// assert_eq!(rope.grapheme_after(rope.len()), rope.len());
+    /// ```
+    fn grapheme_after(&self, offset: usize) -> usize;
+
     /// Convert offset in characters to byte offset (0-based).
     ///
     /// Run in O(n) time.
@@ -448,6 +488,52 @@ impl RopeExt for Rope {
         }
     }
 
+    fn grapheme_before(&self, offset: usize) -> usize {
+        let offset = self.clip_offset(offset, Bias::Right);
+        if offset == 0 {
+            return 0;
+        }
+        let mut cursor = GraphemeCursor::new(offset, self.len(), true);
+        // the chunk the character before the offset is in
+        let (mut chunk, mut chunk_start) = self.chunk(offset - 1);
+        loop {
+            match cursor.prev_boundary(chunk, chunk_start) {
+                Ok(boundary) => return boundary.unwrap_or(0),
+                Err(GraphemeIncomplete::PrevChunk) => (chunk, chunk_start) = self.chunk(chunk_start - 1),
+                Err(GraphemeIncomplete::PreContext(end)) => {
+                    let (context, start) = self.chunk(end - 1);
+                    cursor.provide_context(&context[..end - start], start);
+                }
+                // the cursor asks for nothing else going back: a character back
+                Err(_) => return self.clip_offset(offset - 1, Bias::Left),
+            }
+        }
+    }
+
+    fn grapheme_after(&self, offset: usize) -> usize {
+        let len = self.len();
+        let offset = self.clip_offset(offset, Bias::Left);
+        if offset >= len {
+            return len;
+        }
+        let mut cursor = GraphemeCursor::new(offset, len, true);
+        let (mut chunk, mut chunk_start) = self.chunk(offset);
+        loop {
+            match cursor.next_boundary(chunk, chunk_start) {
+                Ok(boundary) => return boundary.unwrap_or(len),
+                Err(GraphemeIncomplete::NextChunk) => {
+                    (chunk, chunk_start) = self.chunk(chunk_start + chunk.len())
+                }
+                Err(GraphemeIncomplete::PreContext(end)) => {
+                    let (context, start) = self.chunk(end - 1);
+                    cursor.provide_context(&context[..end - start], start);
+                }
+                // the cursor asks for nothing else going on: a character on
+                Err(_) => return self.clip_offset(offset + 1, Bias::Right),
+            }
+        }
+    }
+
     fn char_index_to_offset(&self, char_offset: usize) -> usize {
         self.chars().take(char_offset).map(|c| c.len_utf8()).sum()
     }
@@ -465,6 +551,50 @@ mod tests {
     use sum_tree::Bias;
 
     use crate::input::{Position, RopeExt};
+
+    /// Every grapheme boundary of a text many chunks long, where a family,
+    /// flags, a run of flags longer than a chunk, accents, a conjunct and
+    /// `\r\n` fall across the chunks' edges, is where `grapheme_before`
+    /// and `grapheme_after` step to, as unicode-segmentation finds them in
+    /// the whole string.
+    #[test]
+    fn test_grapheme_steps_across_chunks() {
+        use unicode_segmentation::UnicodeSegmentation;
+
+        let parts = [
+            "a",
+            "👨\u{200D}👩\u{200D}👧",
+            "🇳🇴🇸🇪",
+            "e\u{301}\u{302}",
+            "\r\n",
+            "\u{915}\u{94D}\u{937}",
+            "中",
+        ];
+        let mut text: String = (0..700).map(|i| parts[i % parts.len()]).collect();
+        text.push_str(&"🇳🇴".repeat(400));
+        text.push('z');
+        let rope = Rope::from(text.as_str());
+        assert!(rope.chunks().count() > 8, "the text is many chunks");
+        let boundaries: Vec<usize> = text
+            .grapheme_indices(true)
+            .map(|(ix, _)| ix)
+            .chain([text.len()])
+            .collect();
+        for pair in boundaries.windows(2) {
+            assert_eq!(rope.grapheme_after(pair[0]), pair[1], "after {}", pair[0]);
+            assert_eq!(rope.grapheme_before(pair[1]), pair[0], "before {}", pair[1]);
+        }
+        assert_eq!(rope.grapheme_before(0), 0);
+        assert_eq!(rope.grapheme_after(text.len()), text.len());
+        assert_eq!(rope.grapheme_after(text.len() + 3), text.len());
+
+        // an offset inside a character steps from that character's edge
+        let rope = Rope::from("a中b");
+        assert_eq!(rope.grapheme_before(2), 1);
+        assert_eq!(rope.grapheme_after(2), 4);
+        assert_eq!(Rope::from("").grapheme_before(0), 0);
+        assert_eq!(Rope::from("").grapheme_after(0), 0);
+    }
 
     #[test]
     fn test_slice_line() {

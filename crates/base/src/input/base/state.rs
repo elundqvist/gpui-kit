@@ -1955,7 +1955,7 @@ impl<M: InputModeKind> InputBaseState<M> {
 
     pub(super) fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
         let intent = if self.selected_range.is_empty() {
-            self.select_to(self.previous_boundary(self.cursor()), cx);
+            self.select_to(self.backspace_boundary(self.cursor()), cx);
             EditIntent::Backspace
         } else {
             EditIntent::Atomic
@@ -3065,33 +3065,52 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.clamp_offset_to_visible_forward(self.offset_after(offset))
     }
 
-    /// The offset one character before `offset`. A `\r\n` is one character
-    /// to the caret, which never stands between its bytes: a step back over
-    /// the `\n` lands before the `\r`.
-    fn offset_before(&self, offset: usize) -> usize {
-        let offset = self.text.clip_offset(offset.saturating_sub(1), Bias::Left);
-        // both are single bytes, so a byte comparison needs no char boundary,
-        // and `offset - 1` may be inside the character stepped over
-        if offset > 0
-            && self.text.get_byte(offset) == Some(b'\n')
-            && self.text.get_byte(offset - 1) == Some(b'\r')
-        {
-            return offset - 1;
-        }
-        offset
+    /// Where Backspace at `offset` deletes back to: the whole of an emoji
+    /// drawn from several characters, a family, a flag, a thumb and its
+    /// colour, a keycap, and a `\r\n`; and of any other grapheme its last
+    /// character alone, an accent typed after its letter, a vowel sign
+    /// after its consonant, as a browser's field deletes, VS Code's boxes
+    /// among them, and as Kvist's own line edit does (elundqvist/kvist#451):
+    /// taking the whole grapheme took a Devanagari syllable for a vowel
+    /// sign mistyped.
+    pub(super) fn backspace_boundary(&self, offset: usize) -> usize {
+        let offset = self.text.clip_offset(offset, Bias::Right);
+        let from = self.offset_before(offset);
+        let grapheme = self.text.slice(from..offset);
+        let several = grapheme.chars().nth(1).is_some();
+        let from = if several && grapheme != "\r\n" && !grapheme.chars().any(is_emoji_part) {
+            self.text.clip_offset(offset - 1, Bias::Left)
+        } else {
+            from
+        };
+        self.clamp_offset_to_visible_backward(from)
     }
 
-    /// The offset one character after `offset`: past the `\n` as well when
-    /// the step crossed the `\r` of a `\r\n`.
-    fn offset_after(&self, offset: usize) -> usize {
-        let offset = self.text.clip_offset(offset + 1, Bias::Right);
-        if offset > 0
-            && self.text.get_byte(offset - 1) == Some(b'\r')
-            && self.text.get_byte(offset) == Some(b'\n')
-        {
-            return offset + 1;
+    /// The offset one grapheme before `offset`: what is drawn as one
+    /// character is one step, a family emoji, a flag, a letter and its
+    /// accent (elundqvist/kvist#456), where a step was a character and a
+    /// family seven. A `\r\n` is one grapheme, so the caret never stands
+    /// between its bytes: a step back over the `\n` lands before the `\r`.
+    ///
+    /// A masked input goes a character at a time, as it draws a bullet a
+    /// character: a step a grapheme there crossed seven bullets at once
+    /// for a family, and showed the shape of what it hides, which GTK's
+    /// password entry steps a character at a time not to.
+    fn offset_before(&self, offset: usize) -> usize {
+        if self.masked {
+            return self.text.clip_offset(offset.saturating_sub(1), Bias::Left);
         }
-        offset
+        self.text.grapheme_before(offset)
+    }
+
+    /// The offset one grapheme after `offset`: past the `\n` as well when
+    /// the step crossed the `\r` of a `\r\n`. A masked input's is one
+    /// character after it.
+    fn offset_after(&self, offset: usize) -> usize {
+        if self.masked {
+            return self.text.clip_offset(offset + 1, Bias::Right);
+        }
+        self.text.grapheme_after(offset)
     }
 
     /// Returns the true to let InputElement to render cursor, when Input is focused and current BlinkCursor is visible.
@@ -3988,6 +4007,15 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
         // `Self` is concrete enough to name its own entity type.
         M::register_actions(element, &entity, window)
     }
+}
+
+/// Whether `c` makes the grapheme it is in an emoji Backspace takes whole:
+/// the emoji's own blocks with the regional indicators of a flag and the
+/// skin tones, the variation selector that makes a symbol an emoji, the
+/// keycap's combining mark and the tags of a subdivision's flag. Kvist's
+/// `code::emoji_sequence` reads them so.
+fn is_emoji_part(c: char) -> bool {
+    matches!(c as u32, 0x1F000..=0x1FAFF | 0xFE0F | 0x20E3 | 0xE0020..=0xE007F)
 }
 
 #[cfg(test)]
@@ -7572,6 +7600,130 @@ mod tests {
                 state.set_selected_range(1..1, cx);
                 state.right(&MoveRight, window, cx);
                 assert_eq!(state.cursor(), 2);
+            });
+        });
+    }
+
+    /// The caret goes a grapheme at a time, what is drawn as one character
+    /// (elundqvist/kvist#456): a family of four is seven characters, a flag
+    /// two and a thumb with its colour two, and Left, Right, Shift+Left and
+    /// Delete each crossed one character of them, so a family took seven
+    /// Backspaces and one Backspace split a flag. Backspace takes the whole
+    /// of such an emoji and of any other grapheme its last character, an
+    /// accent typed after its letter or a vowel sign after its consonant, as
+    /// Kvist's own line edit does (elundqvist/kvist#451).
+    #[gpui::test]
+    fn the_caret_goes_by_grapheme(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        const FAMILY: &str = "👨\u{200D}👩\u{200D}👧\u{200D}👦";
+        const FLAG: &str = "🇳🇴";
+        const THUMB: &str = "👍🏽";
+        const KEYCAP: &str = "1\u{FE0F}\u{20E3}";
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                let text = format!("a{FAMILY}{FLAG}{THUMB}{KEYCAP}b");
+                let ends = [
+                    0,
+                    1,
+                    1 + FAMILY.len(),
+                    1 + FAMILY.len() + FLAG.len(),
+                    text.len() - 1 - KEYCAP.len(),
+                    text.len() - 1,
+                    text.len(),
+                ];
+                state.set_value(&text, window, cx);
+                state.set_selected_range(0..0, cx);
+                for &end in &ends[1..] {
+                    state.right(&MoveRight, window, cx);
+                    assert_eq!(state.cursor(), end, "Right crosses one grapheme");
+                }
+                for &end in ends[..ends.len() - 1].iter().rev() {
+                    state.left(&MoveLeft, window, cx);
+                    assert_eq!(state.cursor(), end, "Left crosses one grapheme");
+                }
+                state.set_selected_range(ends[3]..ends[3], cx);
+                state.select_left(&SelectLeft, window, cx);
+                assert_eq!(state.selected_range, Selection::new(ends[2], ends[3]), "Shift+Left takes the flag");
+                state.set_selected_range(ends[3]..ends[3], cx);
+                state.select_right(&SelectRight, window, cx);
+                assert_eq!(state.selected_range, Selection::new(ends[3], ends[4]), "Shift+Right the thumb");
+
+                state.set_selected_range(1..1, cx);
+                state.delete(&Delete, window, cx);
+                assert_eq!(state.value(), format!("a{FLAG}{THUMB}{KEYCAP}b").as_str(), "Delete takes the family");
+                state.set_value(&text, window, cx);
+                for (emoji, what) in [
+                    (KEYCAP, "the keycap"),
+                    (THUMB, "the thumb and its colour"),
+                    (FLAG, "the flag"),
+                    (FAMILY, "the family"),
+                ] {
+                    let at = state.value().len() - 1;
+                    state.set_selected_range(at..at, cx);
+                    state.backspace(&Backspace, window, cx);
+                    assert_eq!(state.cursor(), at - emoji.len(), "one Backspace takes {what}");
+                }
+                assert_eq!(state.value(), "ab");
+
+                // of a grapheme that is no emoji, the last character alone
+                let text = "e\u{301}x\u{915}\u{93F}";
+                state.set_value(text, window, cx);
+                state.set_selected_range(0..0, cx);
+                state.right(&MoveRight, window, cx);
+                assert_eq!(state.cursor(), "e\u{301}".len(), "Right crosses a letter and its accent");
+                state.set_selected_range(text.len()..text.len(), cx);
+                state.left(&MoveLeft, window, cx);
+                assert_eq!(state.cursor(), "e\u{301}x".len(), "Left crosses a syllable");
+                state.set_selected_range(text.len()..text.len(), cx);
+                state.backspace(&Backspace, window, cx);
+                assert_eq!(state.value(), "e\u{301}x\u{915}", "Backspace takes the vowel sign, not the syllable");
+                state.backspace(&Backspace, window, cx);
+                state.backspace(&Backspace, window, cx);
+                state.backspace(&Backspace, window, cx);
+                assert_eq!(state.value(), "e", "then the consonant, the x and the accent");
+                state.set_value(text, window, cx);
+                state.set_selected_range(0..0, cx);
+                state.delete(&Delete, window, cx);
+                assert_eq!(state.value(), "x\u{915}\u{93F}", "Delete takes the letter with its accent");
+            });
+        });
+    }
+
+    /// A masked input, a password's, goes a character at a time, as it
+    /// draws a bullet a character: a step a grapheme crossed seven bullets
+    /// at once for a family, showing the shape of what it hides, where
+    /// GTK's password entry steps a character at a time not to.
+    #[gpui::test]
+    fn a_masked_input_goes_by_character(cx: &mut TestAppContext) {
+        let input_view = InputView::build(cx, |state| state.masked(true));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        const FAMILY: &str = "👨\u{200D}👩\u{200D}👧\u{200D}👦";
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                let text = format!("a{FAMILY}🇳🇴");
+                state.set_value(&text, window, cx);
+                state.set_selected_range(text.len()..text.len(), cx);
+                state.left(&MoveLeft, window, cx);
+                assert_eq!(state.cursor(), text.len() - '🇴'.len_utf8(), "Left crosses one bullet");
+                state.set_selected_range(1..1, cx);
+                state.right(&MoveRight, window, cx);
+                assert_eq!(state.cursor(), 1 + '👨'.len_utf8(), "Right too");
+                state.set_selected_range(text.len()..text.len(), cx);
+                state.backspace(&Backspace, window, cx);
+                assert_eq!(state.value(), format!("a{FAMILY}🇳").as_str(), "Backspace takes one");
+                state.set_selected_range(1..1, cx);
+                state.delete(&Delete, window, cx);
+                assert_eq!(
+                    state.value(),
+                    format!("a{}🇳", &FAMILY['👨'.len_utf8()..]).as_str(),
+                    "Delete one"
+                );
             });
         });
     }
