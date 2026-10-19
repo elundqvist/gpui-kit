@@ -162,7 +162,10 @@ asks (section 4(b)); each says so at its top:
   under Kvist's harness on Xvfb.
 - `Cargo.toml`: an `[[example]]` entry for `examples/xdnd_source.rs`,
   which the fork adds (the published manifest names its targets and
-  has no examples).
+  has no examples). And zed-xim, the XIM client, is taken by path from
+  `crates/zed-xim`, where the fork carries it with fixes of its own
+  (its FORK.md says what they are), beside the version crates.io
+  serves it at; `Cargo.lock` names it with no source.
 
 ## Trying a drag by hand
 
