@@ -112,6 +112,67 @@ impl PasteInputHold {
     }
 }
 
+/// Read the clipboard for a paste into `view`, as an input's paste reads
+/// it, and hand `paste` what it holds.
+///
+/// With a way to hold the window's input back ([`PasteInputHold`]), the
+/// clipboard is read as the platform reads it when it can wait, which on
+/// X11 is off the drawing thread when another program owns it: a paste of
+/// 1.4 MB from another program held the frame about 35 ms while the owner
+/// handed it over (elundqvist/kvist#401). What is at hand, the app's own
+/// copy, is handed over at once; otherwise `paste` is called once the read
+/// has come, the window's input held back until then, so that what is
+/// typed and clicked meanwhile lands after the paste, in the order it
+/// came, and not at all if `view` has gone. Without a hold it is read
+/// here, as before. A view that pastes into something of its own, a
+/// terminal or a line edited in place, reads it this way as an input does
+/// (elundqvist/kvist#433).
+pub fn read_clipboard_for_paste<V: 'static>(
+    view: &mut V,
+    window: &mut Window,
+    cx: &mut Context<V>,
+    paste: impl FnOnce(&mut V, Option<ClipboardItem>, &mut Window, &mut Context<V>) + 'static,
+) {
+    let Some(hold) = cx.try_global::<PasteInputHold>().cloned() else {
+        let item = cx.read_from_clipboard();
+        paste(view, item, window, cx);
+        return;
+    };
+    let read = cx.read_from_clipboard_async();
+    paste_when_read(view, read, hold, window, cx, paste);
+}
+
+/// Hand `paste` what `read` gives: at once when it has it, as for the
+/// app's own copy, and otherwise once it has come, the window's input held
+/// back until then.
+fn paste_when_read<V: 'static>(
+    view: &mut V,
+    mut read: gpui::Task<Result<Option<ClipboardItem>, gpui::ClipboardReadError>>,
+    hold: PasteInputHold,
+    window: &mut Window,
+    cx: &mut Context<V>,
+    paste: impl FnOnce(&mut V, Option<ClipboardItem>, &mut Window, &mut Context<V>) + 'static,
+) {
+    if let Some(read) = futures::FutureExt::now_or_never(&mut read) {
+        paste(view, read.ok().flatten(), window, cx);
+        return;
+    }
+    let held = (hold.hold)(window, cx);
+    cx.spawn_in(window, async move |view, cx| {
+        let item = read.await.ok().flatten();
+        cx.update(|window, cx| {
+            if let Some(landing) = &hold.landing {
+                landing(window, cx);
+            }
+            view.update(cx, |view, cx| paste(view, item, window, cx))
+                .ok();
+            (hold.release)(held, window, cx);
+        })
+        .ok();
+    })
+    .detach();
+}
+
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
 #[action(namespace = input, no_json)]
 pub struct Enter {
@@ -2262,53 +2323,10 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.reveal_typed_caret(cx);
     }
 
-    /// Paste what the clipboard holds. With a way to hold the window's
-    /// input back ([`PasteInputHold`]), the clipboard is read as the
-    /// platform reads it when it can wait, which on X11 is off the drawing
-    /// thread when another program owns it: a paste of 1.4 MB from another
-    /// program held the frame about 35 ms while the owner handed it over
-    /// (elundqvist/kvist#401). Without one it is read here, as before, so
-    /// that the keys typed after the paste come after it.
+    /// Paste what the clipboard holds, read as [`read_clipboard_for_paste`]
+    /// reads it.
     pub(super) fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(hold) = cx.try_global::<PasteInputHold>().cloned() else {
-            let item = cx.read_from_clipboard();
-            self.paste_item(item, window, cx);
-            return;
-        };
-        let read = cx.read_from_clipboard_async();
-        self.paste_when_read(read, hold, window, cx);
-    }
-
-    /// Paste what `read` gives: at once when it has it, as for the app's
-    /// own copy, and otherwise once it has come, the window's input held
-    /// back until then, so that what was typed meanwhile lands after the
-    /// paste, in the order it was typed.
-    fn paste_when_read(
-        &mut self,
-        mut read: gpui::Task<Result<Option<ClipboardItem>, gpui::ClipboardReadError>>,
-        hold: PasteInputHold,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(read) = futures::FutureExt::now_or_never(&mut read) {
-            self.paste_item(read.ok().flatten(), window, cx);
-            return;
-        }
-        let held = (hold.hold)(window, cx);
-        cx.spawn_in(window, async move |state, cx| {
-            let item = read.await.ok().flatten();
-            cx.update(|window, cx| {
-                if let Some(landing) = &hold.landing {
-                    landing(window, cx);
-                }
-                state
-                    .update(cx, |state, cx| state.paste_item(item, window, cx))
-                    .ok();
-                (hold.release)(held, window, cx);
-            })
-            .ok();
-        })
-        .detach();
+        read_clipboard_for_paste(self, window, cx, Self::paste_item);
     }
 
     /// Paste the text `item` holds. A clipboard with no text, an image
@@ -4122,7 +4140,14 @@ mod tests {
             input.update(cx, |state, cx| {
                 state.set_value("one two", window, cx);
                 state.move_to(4, None, cx);
-                state.paste_when_read(read, recording_hold(&log), window, cx);
+                paste_when_read(
+                    state,
+                    read,
+                    recording_hold(&log),
+                    window,
+                    cx,
+                    InputBaseState::paste_item,
+                );
             });
         });
         cx.run_until_parked();
@@ -4165,12 +4190,91 @@ mod tests {
         });
         cx.update(|window, cx| {
             input.update(cx, |state, cx| {
-                state.paste_when_read(read, recording_hold(&log), window, cx)
+                paste_when_read(
+                    state,
+                    read,
+                    recording_hold(&log),
+                    window,
+                    cx,
+                    InputBaseState::paste_item,
+                )
             });
         });
         drop(send);
         cx.run_until_parked();
         cx.update(|_, cx| assert_eq!(input.read(cx).value(), "one "));
+        assert_eq!(*log.borrow(), ["hold", "landing", "release"]);
+    }
+
+    /// A view that pastes into something of its own, not an input, as a
+    /// terminal pastes into its shell, reads the clipboard as an input
+    /// does: what is at hand at once, nothing held, and what waits once it
+    /// has come, the window's input held until then; a view gone by then
+    /// is handed nothing, and the input is let go (elundqvist/kvist#433).
+    #[gpui::test]
+    fn test_a_view_that_is_no_input_pastes_as_an_input_does(cx: &mut TestAppContext) {
+        struct Pasted(Vec<String>);
+        impl Render for Pasted {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        fn take(
+            view: &mut Pasted,
+            item: Option<ClipboardItem>,
+            _: &mut Window,
+            _: &mut Context<Pasted>,
+        ) {
+            view.0.extend(item.and_then(|item| item.text()));
+        }
+        let waiting = |cx: &mut VisualTestContext| {
+            let (send, received) = futures::channel::oneshot::channel::<Option<ClipboardItem>>();
+            let read = cx
+                .executor()
+                .spawn(async move { Ok(received.await.ok().flatten()) });
+            (send, read)
+        };
+        let (view, cx) = cx.add_window_view(|_, _| Pasted(Vec::new()));
+        let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update(|window, cx| {
+            recording_hold(&log).set(cx);
+            cx.write_to_clipboard(ClipboardItem::new_string("at hand".into()));
+            view.update(cx, |view, cx| {
+                read_clipboard_for_paste(view, window, cx, take)
+            });
+            assert_eq!(view.read(cx).0, ["at hand"]);
+        });
+        assert!(log.borrow().is_empty(), "nothing waits: {:?}", log.borrow());
+
+        let (send, read) = waiting(cx);
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                paste_when_read(view, read, recording_hold(&log), window, cx, take)
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(view.read(cx).0, ["at hand"]));
+        assert_eq!(*log.borrow(), ["hold"], "the input waits for the paste");
+        send.send(Some(ClipboardItem::new_string("another program's".into())))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|_, cx| assert_eq!(view.read(cx).0, ["at hand", "another program's"]));
+        assert_eq!(*log.borrow(), ["hold", "landing", "release"]);
+
+        log.borrow_mut().clear();
+        let (send, read) = waiting(cx);
+        let gone = cx.update(|window, cx| {
+            let gone = cx.new(|_| Pasted(Vec::new()));
+            gone.update(cx, |view, cx| {
+                paste_when_read(view, read, recording_hold(&log), window, cx, take)
+            });
+            gone.downgrade()
+        });
+        cx.run_until_parked();
+        assert!(gone.upgrade().is_none(), "the view has gone");
+        send.send(Some(ClipboardItem::new_string("too late".into())))
+            .unwrap();
+        cx.run_until_parked();
         assert_eq!(*log.borrow(), ["hold", "landing", "release"]);
     }
 
