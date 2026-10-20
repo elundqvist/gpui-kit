@@ -18,6 +18,11 @@ pub enum TruncateFrom {
     Middle,
 }
 
+/// How far a closing mark looks back, or an opening mark ahead, for the
+/// character it is shaped with (`LineWrapper::width_beside`), past other
+/// marks and spaces.
+const SHAPED_WITH_REACH: usize = 16;
+
 /// The GPUI line wrapper, used to wrap lines of text to a given width.
 pub struct LineWrapper {
     text_system: Arc<TextSystem>,
@@ -25,6 +30,8 @@ pub struct LineWrapper {
     pub(crate) font_size: Pixels,
     cached_ascii_char_widths: [Option<Pixels>; 128],
     cached_other_char_widths: HashMap<char, Pixels>,
+    // Added in elundqvist/gpui-kit (elundqvist/kvist#497): see `width_beside`.
+    cached_pair_widths: HashMap<[char; 2], Pixels>,
 }
 
 impl LineWrapper {
@@ -38,6 +45,7 @@ impl LineWrapper {
             font_size,
             cached_ascii_char_widths: [None; 128],
             cached_other_char_widths: HashMap::default(),
+            cached_pair_widths: HashMap::default(),
         }
     }
 
@@ -54,30 +62,46 @@ impl LineWrapper {
         let mut last_candidate_width = px(0.);
         let mut last_wrap_ix = 0;
         let mut prev_c = '\0';
+        // the character before, by which `may_break_between` says whether a
+        // row may begin here: `prev_c` is left as it was when a row is wrapped
+        let mut rule_prev = '\0';
+        // the character a closing mark is shaped with: see `width_beside`
+        let mut shaped_with = None;
         let mut index = 0;
         let mut candidates = fragments
             .iter()
-            .flat_map(move |fragment| fragment.wrap_boundary_candidates())
-            .peekable();
+            .flat_map(move |fragment| fragment.wrap_boundary_candidates());
         iter::from_fn(move || {
-            for candidate in candidates.by_ref() {
+            while let Some(candidate) = candidates.next() {
                 let ix = index;
                 index += candidate.len_utf8();
                 let mut new_prev_c = prev_c;
                 let item_width = match candidate {
                     WrapBoundaryCandidate::Char { character: c } => {
                         if c == '\n' {
+                            shaped_with = None;
+                            rule_prev = '\0';
                             continue;
                         }
 
                         if Self::is_word_char(c) {
-                            if prev_c == ' ' && c != ' ' && first_non_whitespace_ix.is_some() {
+                            // Changed in elundqvist/gpui-kit (elundqvist/kvist#497): a
+                            // word may begin a row after a `，` as after a space.
+                            if (prev_c == ' ' || Self::is_closing_mark(rule_prev))
+                                && c != ' '
+                                && first_non_whitespace_ix.is_some()
+                            {
                                 last_candidate_ix = ix;
                                 last_candidate_width = width;
                             }
                         } else {
                             // CJK may not be space separated, e.g.: `Hello world你好世界`
-                            if c != ' ' && first_non_whitespace_ix.is_some() {
+                            // Changed in elundqvist/gpui-kit (elundqvist/kvist#497):
+                            // but no row starts with a `，` or ends with a `「`.
+                            if c != ' '
+                                && first_non_whitespace_ix.is_some()
+                                && Self::may_break_between(rule_prev, c)
+                            {
                                 last_candidate_ix = ix;
                                 last_candidate_width = width;
                             }
@@ -88,8 +112,17 @@ impl LineWrapper {
                         }
 
                         new_prev_c = c;
+                        rule_prev = c;
 
-                        self.width_for_char(c)
+                        let before = shaped_with;
+                        if !c.is_whitespace() && !Self::is_line_start_prohibited(c) {
+                            shaped_with = Some(c);
+                        }
+                        self.width_beside(
+                            c,
+                            || before,
+                            || Self::shaped_with_after(candidates.clone()),
+                        )
                     }
                     WrapBoundaryCandidate::Element {
                         width: element_width,
@@ -104,6 +137,8 @@ impl LineWrapper {
                             first_non_whitespace_ix = Some(ix);
                         }
 
+                        shaped_with = None;
+                        rule_prev = '\0';
                         element_width
                     }
                 };
@@ -143,6 +178,10 @@ impl LineWrapper {
     /// Determines if a line should be truncated based on its width.
     ///
     /// Returns the truncation index in `line`.
+    ///
+    /// Changed in elundqvist/gpui-kit (elundqvist/kvist#497): a `、` is
+    /// measured beside the character it is drawn with (`width_at`), here and
+    /// in the middle cut, as `wrap_line` measures it.
     pub fn should_truncate_line(
         &mut self,
         line: &str,
@@ -164,7 +203,7 @@ impl LineWrapper {
                         truncate_ix = ix;
                     }
 
-                    let char_width = self.width_for_char(c);
+                    let char_width = self.width_at(line, ix, c);
                     width += char_width;
 
                     if width.floor() > truncate_width {
@@ -178,7 +217,7 @@ impl LineWrapper {
                         truncate_ix = ix;
                     }
 
-                    let char_width = self.width_for_char(c);
+                    let char_width = self.width_at(line, ix, c);
                     width += char_width;
 
                     if width.floor() > truncate_width {
@@ -204,8 +243,8 @@ impl LineWrapper {
             .fold(px(0.0), |a, x| a + x);
 
         let total_width: Pixels = line
-            .chars()
-            .map(|c| self.width_for_char(c))
+            .char_indices()
+            .map(|(ix, c)| self.width_at(line, ix, c))
             .fold(px(0.0), |a, x| a + x);
 
         if total_width <= truncate_width {
@@ -223,7 +262,7 @@ impl LineWrapper {
         let mut front_width = px(0.);
         let mut front_end_ix = 0usize;
         for (ix, c) in line.char_indices() {
-            let char_width = self.width_for_char(c);
+            let char_width = self.width_at(line, ix, c);
             if front_width + char_width > front_budget {
                 break;
             }
@@ -234,7 +273,7 @@ impl LineWrapper {
         let mut back_width = px(0.);
         let mut back_start_ix = line.len();
         for (ix, c) in line.char_indices().rev() {
-            let char_width = self.width_for_char(c);
+            let char_width = self.width_at(line, ix, c);
             if back_width + char_width > back_budget {
                 break;
             }
@@ -597,6 +636,219 @@ impl LineWrapper {
         matches!(c, '\u{202F}' | '\u{00A0}' | '\u{2011}')
     }
 
+    /// Whether a row may begin with `next` where `prev` ends the row before.
+    ///
+    /// Added in elundqvist/gpui-kit (elundqvist/kvist#497): text that is
+    /// not spaced, as Chinese and Japanese are not, could break before any
+    /// of its characters, so a row of wrapped Chinese started with `，` or
+    /// `。`, and one ended with `「`. No row starts with a character
+    /// `is_line_start_prohibited` names and none ends with one
+    /// `is_line_end_prohibited` names, as UAX #14 and JIS X 4051 have it:
+    /// the character before goes to the next row with it.
+    pub(crate) fn may_break_between(prev: char, next: char) -> bool {
+        !Self::is_line_start_prohibited(next) && !Self::is_line_end_prohibited(prev)
+    }
+
+    /// A character no row starts with: closing brackets and quotes, full
+    /// stops, commas, colons, question and exclamation marks
+    /// (`is_closing_mark`), middle dots,
+    /// iteration marks, the prolonged sound mark, small kana and the units
+    /// written after a number. The set is VS Code's
+    /// (`editor.wordWrapBreakAfterCharacters`) with JIS X 4051's other
+    /// closing brackets, hyphens and dividing marks; the ASCII ones are
+    /// left to `is_word_char`, which keeps `)`, `!` and the like with the
+    /// word before them already.
+    pub(crate) fn is_line_start_prohibited(c: char) -> bool {
+        // `”`, which `is_word_char` keeps with the word before it already
+        c == '”'
+            || Self::is_closing_mark(c)
+            || matches!(
+                c,
+                // middle dots, the wave dash and the double hyphen
+                '・' | '･' | '〜' | '゠'
+                // iteration marks and the prolonged sound mark
+                | 'ゝ' | 'ゞ' | 'ヽ' | 'ヾ' | '々' | '〻' | 'ー' | 'ｰ'
+                // small kana
+                | 'ぁ' | 'ぃ' | 'ぅ' | 'ぇ' | 'ぉ' | 'っ' | 'ゃ' | 'ゅ' | 'ょ' | 'ゎ' | 'ゕ'
+                | 'ゖ' | 'ァ' | 'ィ' | 'ゥ' | 'ェ' | 'ォ' | 'ッ' | 'ャ' | 'ュ' | 'ョ' | 'ヮ'
+                | 'ヵ' | 'ヶ' | 'ㇰ'..='ㇿ' | 'ｧ'..='ｯ'
+                // units after a number
+                | '％' | '‰' | '°' | '′' | '″' | '℃' | '¢' | '￠'
+            )
+    }
+
+    /// A closing bracket or quote, a full stop, a comma, a colon, or a
+    /// question or exclamation mark of Chinese or Japanese, which no row
+    /// starts with (`is_line_start_prohibited`) and after which a row may
+    /// begin with a word, as after a space: `修复bug，` / `update`. A word
+    /// has no other place to break, so `bug，update` was a word of its own
+    /// once no row could start with the `，` (UAX #14 breaks after it too).
+    ///
+    /// Added in elundqvist/gpui-kit (elundqvist/kvist#497).
+    pub(crate) fn is_closing_mark(c: char) -> bool {
+        matches!(
+            c,
+            // closing brackets and quotes
+            '）' | '］' | '｝' | '〕' | '〉' | '》' | '」' | '』' | '】' | '〙' | '〗' | '〟' | '｠'
+                | '｣'
+                // full stops, commas, colons, question and exclamation marks
+                | '。' | '．' | '｡' | '、' | '，' | '､' | '：' | '；' | '？' | '！' | '‼'
+                | '⁇' | '⁈' | '⁉'
+        )
+    }
+
+    /// A character no row ends with: opening brackets and quotes, the
+    /// ASCII ones among them, and the signs written before a number, VS
+    /// Code's (`editor.wordWrapBreakBeforeCharacters`) with JIS X 4051's
+    /// other opening brackets. `+`, which VS Code has too, is a word
+    /// character here.
+    pub(crate) fn is_line_end_prohibited(c: char) -> bool {
+        matches!(
+            c,
+            '(' | '[' | '{' | '‘' | '“' | '（' | '［' | '｛' | '〔' | '〈' | '《' | '「' | '『'
+                | '【' | '〘' | '〖' | '〝' | '｟' | '｢' | '£' | '¥' | '＄' | '￡' | '￥' | '＋'
+        )
+    }
+
+    /// The width of `c`, at `ix` in `text`, as `text` is drawn: see
+    /// `width_beside`.
+    ///
+    /// Added in elundqvist/gpui-kit (elundqvist/kvist#497).
+    fn width_at(&mut self, text: &str, ix: usize, c: char) -> Pixels {
+        self.width_beside(
+            c,
+            || {
+                text[..ix]
+                    .chars()
+                    .rev()
+                    .take(SHAPED_WITH_REACH)
+                    .find(|&b| !b.is_whitespace() && !Self::is_line_start_prohibited(b))
+            },
+            || {
+                Self::shaped_with_after(
+                    text[ix + c.len_utf8()..]
+                        .chars()
+                        .map(|character| WrapBoundaryCandidate::Char { character }),
+                )
+            },
+        )
+    }
+
+    /// The character an opening mark is shaped with, the first in `after`
+    /// that is neither one nor a space, on its row and close by.
+    fn shaped_with_after(after: impl Iterator<Item = WrapBoundaryCandidate>) -> Option<char> {
+        for candidate in after.take(SHAPED_WITH_REACH) {
+            match candidate {
+                WrapBoundaryCandidate::Char { character: '\n' }
+                | WrapBoundaryCandidate::Element { .. } => return None,
+                WrapBoundaryCandidate::Char { character } => {
+                    if !character.is_whitespace() && !Self::is_line_end_prohibited(character) {
+                        return Some(character);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The width `c` is drawn at, `before` the character before it past
+    /// any closing marks and spaces, and `after` the one after it past
+    /// any opening marks and spaces.
+    ///
+    /// Added in elundqvist/gpui-kit (elundqvist/kvist#497): each character
+    /// was measured shaped on its own, and a character the font lacks falls
+    /// back to a font by the script of the characters it is shaped with,
+    /// those up to the next place a line could break: a lone `、` or `。`,
+    /// of no script, came out half the width it is drawn at among Chinese,
+    /// so the rows `wrap_line` made of Chinese were wider than the width
+    /// drawn, and `truncate_line` kept more than fits and drew its ellipsis
+    /// past the edge. (`，`, a full-width form, is as wide alone.) As no
+    /// line breaks before a closing mark or after an opening one, a closing
+    /// mark is shaped with the character before it and an opening mark with
+    /// the one after it, and either is measured as the two shaped together
+    /// less the other alone. The other is one of its script in its place
+    /// (`of_its_script`), so a mark is shaped once a script and a wrapper,
+    /// not once a character it is drawn beside; and a mark beside ASCII,
+    /// which brings no script a font is found by, is measured on its own.
+    fn width_beside(
+        &mut self,
+        c: char,
+        before: impl FnOnce() -> Option<char>,
+        after: impl FnOnce() -> Option<char>,
+    ) -> Pixels {
+        if c.is_ascii() {
+            return self.width_for_char(c);
+        }
+        let (pair, other) = if Self::is_line_start_prohibited(c) {
+            match before() {
+                Some(before) if !before.is_ascii() => {
+                    let before = Self::of_its_script(before);
+                    ([before, c], before)
+                }
+                _ => return self.width_for_char(c),
+            }
+        } else if Self::is_line_end_prohibited(c) {
+            match after() {
+                Some(after) if !after.is_ascii() => {
+                    let after = Self::of_its_script(after);
+                    ([c, after], after)
+                }
+                _ => return self.width_for_char(c),
+            }
+        } else {
+            return self.width_for_char(c);
+        };
+        let pair_width = match self.cached_pair_widths.get(&pair) {
+            Some(width) => *width,
+            None => {
+                let mut buffer = [0; 8];
+                let len = pair[0].encode_utf8(&mut buffer).len();
+                let len = len + pair[1].encode_utf8(&mut buffer[len..]).len();
+                let text = std::str::from_utf8(&buffer[..len]).unwrap_or_default();
+                let width = self
+                    .text_system
+                    .platform_text_system
+                    .layout_line(
+                        text,
+                        self.font_size,
+                        &[FontRun {
+                            len,
+                            font_id: self.font_id,
+                        }],
+                    )
+                    .width;
+                self.cached_pair_widths.insert(pair, width);
+                width
+            }
+        };
+        (pair_width - self.width_for_char(other)).max(px(0.))
+    }
+
+    /// The character a mark is shaped beside in place of `c`
+    /// (`width_beside`): one character of `c`'s script where that is Han,
+    /// Hiragana, Katakana or Hangul, as the font a mark falls back to is
+    /// found by the script, not the character; else `c`. So the marks of a
+    /// long Chinese text are shaped a few times, not once a character.
+    ///
+    /// Added in elundqvist/gpui-kit (elundqvist/kvist#497).
+    fn of_its_script(c: char) -> char {
+        match c {
+            '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{20000}'..='\u{3FFFF}' => '一',
+            '\u{3041}'..='\u{3096}' | '\u{309D}'..='\u{309F}' => 'あ',
+            // not `・` and `ー`, which are of both kana, nor their half-width forms
+            '\u{30A1}'..='\u{30FA}'
+            | '\u{30FD}'..='\u{30FF}'
+            | '\u{31F0}'..='\u{31FF}'
+            | '\u{FF66}'..='\u{FF6F}'
+            | '\u{FF71}'..='\u{FF9D}' => 'ア',
+            '\u{1100}'..='\u{11FF}' | '\u{3131}'..='\u{318E}' | '\u{AC00}'..='\u{D7A3}' => '가',
+            _ => c,
+        }
+    }
+
     #[inline(always)]
     fn width_for_char(&mut self, c: char) -> Pixels {
         if (c as u32) < 128 {
@@ -745,7 +997,7 @@ impl<'a> LineFragment<'a> {
         LineFragment::Element { width, len_utf8 }
     }
 
-    fn wrap_boundary_candidates(&self) -> impl Iterator<Item = WrapBoundaryCandidate> {
+    fn wrap_boundary_candidates(&self) -> impl Iterator<Item = WrapBoundaryCandidate> + Clone {
         let text = match self {
             LineFragment::Text { text } => text,
             LineFragment::Element { .. } => "\0",
@@ -763,6 +1015,7 @@ impl<'a> LineFragment<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
 enum WrapBoundaryCandidate {
     Char { character: char },
     Element { width: Pixels, len_utf8: usize },
@@ -1449,8 +1702,10 @@ mod tests {
     /// A text system that draws a `。` among Chinese twice as wide as on its own,
     /// as cosmic-text draws it in Kvist: a character the font lacks falls back to
     /// a font by the script of the characters around it, and a lone `。`, of no
-    /// script, to one that has it half-width. Each character else is 10 px wide.
-    /// It counts the bytes it shapes.
+    /// script, to one that has it half-width. So do `、`, `「`, `」`, `《` and
+    /// `》`, as under Kvist's harness, where `，`, a full-width form, is as
+    /// wide alone. Each character else is 10 px wide. It counts the bytes it
+    /// shapes.
     #[derive(Default)]
     struct FallbackTextSystem {
         shaped: std::sync::atomic::AtomicUsize,
@@ -1513,7 +1768,9 @@ mod tests {
                         index,
                         is_emoji: false,
                     };
-                    x += if c == '。' && !among_chinese {
+                    x += if matches!(c, '。' | '、' | '「' | '」' | '《' | '》')
+                        && !among_chinese
+                    {
                         px(5.)
                     } else {
                         px(10.)
@@ -1565,8 +1822,10 @@ mod tests {
             TruncateFrom::End,
         );
 
-        // the second row whole but its last character, given way to the ellipsis
-        assert_eq!(truncated.as_ref(), "是的。是的。是的。是的。是的。\u{2026}");
+        // the first row gives its last character to the second, which starts
+        // with no `。` (elundqvist/kvist#497), and the second row its last to
+        // the ellipsis
+        assert_eq!(truncated.as_ref(), "是的。是的。是的。是的。是的\u{2026}");
         assert_eq!(truncated_runs[0].len, truncated.len());
         // and drawn in two rows
         let drawn = text_system.platform_text_system.layout_line(
@@ -1630,7 +1889,7 @@ mod tests {
         let long = "是的。".repeat(12_000);
         let before = shaped();
         let long_cut = cut(&mut wrapper, &long);
-        assert_eq!(long_cut, "是的。是的。是的。是的。是的。\u{2026}");
+        assert_eq!(long_cut, "是的。是的。是的。是的。是的\u{2026}");
         assert!(
             shaped() - before < 1_000,
             "{} bytes shaped for a cut of two rows",
@@ -1647,6 +1906,212 @@ mod tests {
             "是的。\n是的。是的。是\u{2026}"
         );
         assert!(shaped() - before < 1_000);
+    }
+
+    /// No row of wrapped Chinese or Japanese starts with a closing bracket, a
+    /// full stop, a comma or the like, and none ends with an opening bracket
+    /// (elundqvist/kvist#497): the character before goes to the next row with
+    /// it, as browsers and VS Code wrap them. A row with nowhere else to break
+    /// still breaks.
+    #[test]
+    fn test_wrap_line_keeps_line_start_and_end_rules() {
+        let mut wrapper = build_wrapper();
+        let wrap_to = |wrapper: &mut LineWrapper, text: &str, width: Pixels| {
+            wrapper
+                .wrap_line(&[LineFragment::text(text)], width)
+                .map(|boundary| boundary.ix)
+                .collect::<Vec<_>>()
+        };
+        // four characters a row
+        let wrap = |wrapper: &mut LineWrapper, text: &str| wrap_to(wrapper, text, px(40.));
+
+        // `是的是` / `的。是的`, where `是的是的` / `。是的` was wrapped
+        assert_eq!(wrap(&mut wrapper, "是的是的。是的"), [9]);
+        assert_eq!(wrap(&mut wrapper, "是的是的，是的"), [9]);
+        assert_eq!(wrap(&mut wrapper, "是的是的、是的"), [9]);
+        assert_eq!(wrap(&mut wrapper, "是的是的）是的"), [9]);
+        // two in a row go with the character before them
+        assert_eq!(wrap(&mut wrapper, "是的是的」。是"), [9]);
+        // `是的是` / `「是的`, where `是的是「` / `是的` was wrapped
+        assert_eq!(wrap(&mut wrapper, "是的是「是的"), [9]);
+        assert_eq!(wrap(&mut wrapper, "是的是（是的"), [9]);
+        // Japanese: a small kana and the prolonged sound mark start no row
+        assert_eq!(wrap(&mut wrapper, "ではちょっと"), [6]);
+        assert_eq!(wrap(&mut wrapper, "コンピューター"), [6, 15]);
+        // a row of commas has nowhere else to break
+        assert_eq!(wrap(&mut wrapper, "，，，，，，"), [12]);
+        // the character before a row's first says where it may break, not
+        // the one before the row before: `是是是是` / `「是AB` / `CDEF` / `G`,
+        // where `「`, which overflowed the first row, was a row of its own
+        assert_eq!(wrap(&mut wrapper, "是是是是「是ABCDEFG"), [12, 20, 24]);
+        // a word may begin a row after a `，` as after a space: `修复bug，` /
+        // `update`, six characters a row, where no row could start with the
+        // `，` and `bug，update` was one word
+        assert_eq!(wrap_to(&mut wrapper, "修复bug，update", px(60.)), [12]);
+        // and after a `」`: `是是是` / `「是」` / `abc`, where `a` was cut off
+        assert_eq!(wrap(&mut wrapper, "是是是「是」abc"), [9, 18]);
+        // Latin text wraps as before
+        assert_eq!(wrap(&mut wrapper, "aa (bb) cc"), [3, 7]);
+        // but for no row ending with an opening bracket, as in VS Code:
+        // `ab` / `([cd`, where it was `ab(` / `[cd`
+        assert_eq!(wrap(&mut wrapper, "ab([cd"), [2]);
+    }
+
+    /// The window wraps text it draws by the same rules (elundqvist/kvist#497).
+    #[test]
+    fn test_drawn_wrap_keeps_line_start_and_end_rules() {
+        use crate::PlatformTextSystem as _;
+        let wrap_to = |text: &str, width: Pixels| {
+            let layout = crate::NoopTextSystem.layout_line(
+                text,
+                px(16.),
+                &[FontRun {
+                    len: text.len(),
+                    font_id: FontId(0),
+                }],
+            );
+            // the first character of each row after the first
+            layout
+                .compute_wrap_boundaries(text, width, None)
+                .iter()
+                .map(|boundary| layout.runs[0].glyphs[boundary.glyph_ix].index)
+                .collect::<Vec<_>>()
+        };
+        let wrap = |text: &str| wrap_to(text, px(40.));
+        assert_eq!(wrap("是的是的。是的"), [9]);
+        assert_eq!(wrap("是的是的」。是"), [9]);
+        assert_eq!(wrap("是的是「是的"), [9]);
+        assert_eq!(wrap("ではちょっと"), [6]);
+        assert_eq!(wrap("，，，，，，"), [12]);
+        assert_eq!(wrap("是是是是「是ABCDEFG"), [12, 20, 24]);
+        assert_eq!(wrap_to("修复bug，update", px(60.)), [12]);
+        assert_eq!(wrap("是是是「是」abc"), [9, 18]);
+        assert_eq!(wrap("aa (bb) cc"), [3, 7]);
+        assert_eq!(wrap("ab([cd"), [2]);
+    }
+
+    /// A wrapper whose characters are measured as `FallbackTextSystem` draws
+    /// them, and a function that measures a text as it draws it.
+    fn fallback_wrapper() -> (LineWrapper, impl Fn(&str) -> Pixels) {
+        use crate::PlatformTextSystem as _;
+        let platform = Arc::new(FallbackTextSystem::default());
+        let text_system = Arc::new(TextSystem::new(platform.clone()));
+        let font_id = text_system.resolve_font(&font("Dummy"));
+        let drawn = move |text: &str| {
+            platform
+                .layout_line(
+                    text,
+                    px(16.),
+                    &[FontRun {
+                        len: text.len(),
+                        font_id,
+                    }],
+                )
+                .width
+        };
+        (LineWrapper::new(font_id, px(16.), text_system), drawn)
+    }
+
+    /// Chinese cut to a width with an ellipsis, at its end, its start or its
+    /// middle, is no wider than the width as drawn: each character's width
+    /// shaped on its own had a `、` half its drawn width among Chinese, so the
+    /// cut kept more than fits and the ellipsis was drawn past the edge
+    /// (elundqvist/kvist#497).
+    #[test]
+    fn test_truncate_line_measures_chinese_punctuation_as_drawn() {
+        let (mut wrapper, drawn) = fallback_wrapper();
+        let width = px(80.);
+        let mut wrong = Vec::new();
+        for (text, from) in [
+            ("是、是、是、是、是、是、", TruncateFrom::End),
+            ("、是、是、是、是、是、是", TruncateFrom::Start),
+            ("是、是、是、是、是、是、是、是、", TruncateFrom::Middle),
+            ("「是」「是」「是」「是」", TruncateFrom::End),
+            ("《是》《是》《是》《是》", TruncateFrom::Start),
+            // and a `，`, as wide alone, as before
+            ("是，是，是，是，是，是，", TruncateFrom::End),
+        ] {
+            let runs = generate_test_runs(&[text.len()]);
+            let (cut, cut_runs) = wrapper.truncate_line(text.into(), width, "…", &runs, from);
+            if !cut.contains('…') {
+                wrong.push(format!("{from:?}: '{cut}' has no ellipsis"));
+            } else if drawn(&cut) > width {
+                wrong.push(format!("{from:?}: '{cut}' is drawn {} wide", drawn(&cut)));
+            }
+            assert_eq!(cut_runs.iter().map(|run| run.len).sum::<usize>(), cut.len());
+        }
+        assert!(wrong.is_empty(), "cut to {width}: {wrong:#?}");
+        // and as much of it is kept as fits
+        let text = "是、是、是、是、是、是、";
+        let runs = generate_test_runs(&[text.len()]);
+        let (cut, _) = wrapper.truncate_line(text.into(), width, "…", &runs, TruncateFrom::End);
+        assert_eq!(cut.as_ref(), "是、是、是、…");
+    }
+
+    /// The rows `wrap_line` makes of Chinese, which gpui-base's editor and
+    /// its text with images draw, are no wider than the width as drawn
+    /// (elundqvist/kvist#497).
+    #[test]
+    fn test_wrap_line_measures_chinese_punctuation_as_drawn() {
+        let (mut wrapper, drawn) = fallback_wrapper();
+        let width = px(80.);
+        // eight characters a row as drawn, or six where the eighth is a
+        // closing bracket and the sixth an opening one
+        for (text, first_row) in [
+            ("是、是、是、是、是、是、是、是、是、", 8),
+            ("「是」「是」「是」「是」「是」「是」", 6),
+        ] {
+            let mut start = 0;
+            let mut rows = Vec::new();
+            for boundary in wrapper.wrap_line(&[LineFragment::text(text)], width) {
+                rows.push(&text[start..boundary.ix]);
+                start = boundary.ix;
+            }
+            rows.push(&text[start..]);
+            for row in &rows {
+                assert!(
+                    drawn(row) <= width,
+                    "'{row}' of {rows:?} is drawn {} wide, past {width}",
+                    drawn(row)
+                );
+            }
+            assert_eq!(rows[0].chars().count(), first_row, "{rows:?}");
+        }
+    }
+
+    /// A mark is shaped beside a character of each script once, not beside
+    /// each character it follows or comes before: Chinese of 2,000
+    /// characters, each in brackets and before a `、`, is shaped a character
+    /// at a time and each mark once more, where it was each mark again for
+    /// each character, three times as much (elundqvist/kvist#497).
+    #[test]
+    fn test_chinese_punctuation_is_shaped_once_a_script() {
+        let platform = Arc::new(FallbackTextSystem::default());
+        let text_system = Arc::new(TextSystem::new(platform.clone()));
+        let font_id = text_system.resolve_font(&font("Dummy"));
+        let mut wrapper = LineWrapper::new(font_id, px(16.), text_system);
+        let shaped = || platform.shaped.load(std::sync::atomic::Ordering::Relaxed);
+        let characters = ('\u{4E00}'..).take(2_000);
+        let text: String = characters.map(|c| format!("「{c}」{c}、")).collect();
+        // each character alone, three bytes each
+        let alone = 2_000 * 3;
+
+        let before = shaped();
+        let rows = wrapper
+            .wrap_line(&[LineFragment::text(&text)], px(80.))
+            .count();
+        assert!(rows > 1_000);
+        assert!(
+            shaped() - before < alone + 100,
+            "{} bytes shaped to wrap, {alone} of them the characters alone",
+            shaped() - before
+        );
+
+        // and a cut at the middle, which measures it all, shapes nothing more
+        let before = shaped();
+        let runs = generate_test_runs(&[text.len()]);
+        wrapper.truncate_line(text.into(), px(80.), "…", &runs, TruncateFrom::Middle);
+        assert!(shaped() - before < 100, "{} bytes shaped to cut", shaped() - before);
     }
 
     #[test]

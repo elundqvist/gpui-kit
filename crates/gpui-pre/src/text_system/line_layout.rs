@@ -242,12 +242,22 @@ impl LineLayout {
             // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
             // but there are some differences, so we have to duplicate the code here.
             if LineWrapper::is_word_char(ch) {
-                if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
+                // Changed in elundqvist/gpui-kit (elundqvist/kvist#497): a word may
+                // begin a row after a `，` as after a space, as in `LineWrapper::wrap_line`
+                if (prev_ch == ' ' || LineWrapper::is_closing_mark(prev_ch))
+                    && ch != ' '
+                    && first_non_whitespace_ix.is_some()
+                {
                     last_candidate_ix = Some(boundary);
                     last_candidate_x = x;
                 }
             } else {
-                if ch != ' ' && first_non_whitespace_ix.is_some() {
+                // Changed in elundqvist/gpui-kit (elundqvist/kvist#497): no row
+                // starts with a `，` or ends with a `「`, as in `LineWrapper::wrap_line`
+                if ch != ' '
+                    && first_non_whitespace_ix.is_some()
+                    && LineWrapper::may_break_between(prev_ch, ch)
+                {
                     last_candidate_ix = Some(boundary);
                     last_candidate_x = x;
                 }

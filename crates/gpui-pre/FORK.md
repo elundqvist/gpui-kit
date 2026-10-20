@@ -97,6 +97,39 @@ asks (section 4(b)); each says so at its top:
   text anew each time.
 - `src/text_system/line_layout.rs`: `LineLayout::compute_wrap_boundaries`
   is crate-visible, for the cut above.
+- `src/text_system/line_wrapper.rs` and `src/text_system/line_layout.rs`:
+  no row of wrapped text starts with a closing bracket or quote, a full
+  stop, a comma, a colon, a question or exclamation mark, a middle dot,
+  an iteration mark, the prolonged sound mark, a small kana or a unit
+  after a number, and none ends with an opening bracket or quote or a
+  sign before a number (`LineWrapper::may_break_between`,
+  elundqvist/kvist#497): Chinese and Japanese, which are not spaced,
+  could break before any character, so a row started with `，` or `。`
+  and one ended with `「`. The character before goes to the next row
+  with the mark, as UAX #14 and JIS X 4051 have it and browsers and VS
+  Code wrap; the sets are VS Code's, with JIS X 4051's other brackets
+  and marks, and ASCII is left as `is_word_char` has it, but for `(`,
+  `[` and `{`, which end no row either, as in VS Code. A word of Latin
+  letters may begin a row after a Chinese comma or closing bracket, as
+  after a space (`is_closing_mark`), so `bug，update` is not one word.
+  `wrap_line` and the window's own wrap (`compute_wrap_boundaries`) keep
+  the rules alike, `wrap_line` by the character before even where it
+  wraps a row, where its `prev_c` stays as it was. A row with nowhere
+  else to break still breaks. Tests of both.
+- `src/text_system/line_wrapper.rs`: `wrap_line`, which gpui-base's
+  editor and its text with images wrap by, and `truncate_line`, at the
+  end, the start or the middle, measure a closing mark with the
+  character before it and an opening mark with the one after it
+  (`width_beside`, elundqvist/kvist#497), as they are shaped together
+  where they are drawn: a lone `、` or `。`, which a font is found for by
+  the characters it is shaped with, came out half the width it is drawn
+  at among Chinese, so the rows `wrap_line` made were wider than the
+  width drawn, and `truncate_line` kept more than fits and drew its
+  ellipsis past the edge, or none at all (`，`, a full-width form, is as
+  wide alone). The mark is shaped beside one character of its
+  neighbour's script, Han, kana or Hangul (`of_its_script`), so once a
+  script and a wrapper, not once a neighbour. Tests with the text system
+  above, which draws `、`, `。` and the brackets so, and of what is shaped.
 
 ## Tests
 
