@@ -1200,17 +1200,23 @@ impl PopupMenu {
         self.max_width.unwrap_or(px(500.))
     }
 
-    /// Calculate the anchor corner and left offset for child submenu
+    /// Calculate the anchor corner and left offset for child submenu.
+    ///
+    /// Against the viewport, not the window's bounds: a window zoomed
+    /// (`Window::set_zoom`, elundqvist/kvist#563) is laid out in its size over
+    /// the zoom, which the viewport is, while its bounds stay the display's.
+    /// The same holds for the context menu's backdrop, the menu's height, the
+    /// hover popover and the code action menu.
     fn update_submenu_menu_anchor(&mut self, window: &Window) {
         let bounds = self.bounds;
         let max_width = self.max_width();
-        let (anchor, left) = if max_width + bounds.origin.x > window.bounds().size.width {
+        let (anchor, left) = if max_width + bounds.origin.x > window.viewport_size().width {
             (Anchor::TopRight, -px(16.))
         } else {
             (Anchor::TopLeft, bounds.size.width - px(8.))
         };
 
-        let is_bottom_pos = bounds.origin.y + bounds.size.height > window.bounds().size.height;
+        let is_bottom_pos = bounds.origin.y + bounds.size.height > window.viewport_size().height;
         self.submenu_anchor = if is_bottom_pos {
             (anchor.other_side_along(gpui::Axis::Vertical), left)
         } else {
@@ -1459,7 +1465,7 @@ impl Render for PopupMenu {
         let items_count = self.menu_items.len();
 
         let max_height = self.max_height.unwrap_or_else(|| {
-            let window_half_height = window.window_bounds().get_bounds().size.height * 0.5;
+            let window_half_height = window.viewport_size().height * 0.5;
             window_half_height.min(px(450.))
         });
 

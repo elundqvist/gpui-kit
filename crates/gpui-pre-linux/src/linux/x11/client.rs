@@ -493,7 +493,14 @@ pub struct X11ClientState {
     pub(crate) gpu_context: GpuContext,
     pub(crate) compositor_gpu: Option<CompositorGpuHint>,
 
+    /// The display's factor, from Xft.dpi: what the displays, the windows' bounds
+    /// and the window manager's coordinates go by.
     pub(crate) scale_factor: f32,
+    /// The app's zoom over it, the last a window was given
+    /// (`PlatformWindow::set_zoom`, elundqvist/kvist#563): what a window opened
+    /// now starts at. A window's positions go by its own
+    /// (`X11WindowStatePtr::scale_factor`).
+    pub(crate) zoom: f32,
 
     xkb_context: xkbc::Context,
     pub(crate) xcb_connection: Rc<XCBConnection>,
@@ -573,7 +580,9 @@ impl X11ClientStatePtr {
         state.xdnd_drags.forget(x_window);
     }
 
-    pub fn update_ime_position(&self, bounds: Bounds<Pixels>) {
+    /// `bounds` in the window's content pixels, `scale_factor` what they are
+    /// drawn at, the display's times the window's zoom (elundqvist/kvist#563).
+    pub fn update_ime_position(&self, bounds: Bounds<Pixels>, scale_factor: f32) {
         let Some(client) = self.get_client() else {
             return;
         };
@@ -591,7 +600,7 @@ impl X11ClientStatePtr {
             state.ximc = Some(ximc);
             return;
         };
-        let scaled_bounds = bounds.scale(state.scale_factor);
+        let scaled_bounds = bounds.scale(scale_factor);
         let ic_attributes = ximc
             .build_ic_attributes()
             .push(
@@ -844,6 +853,7 @@ impl X11Client {
             gpu_context: Rc::new(RefCell::new(None)),
             compositor_gpu,
             scale_factor,
+            zoom: 1.0,
 
             xkb_context,
             xcb_connection,
@@ -1640,8 +1650,8 @@ impl X11Client {
                 state.modifiers = modifiers;
 
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(event.event_x as f32 / u16::MAX as f32 / window.scale_factor()),
+                    px(event.event_y as f32 / u16::MAX as f32 / window.scale_factor()),
                 );
 
                 if state.composing && state.ximc.is_some() {
@@ -1744,8 +1754,8 @@ impl X11Client {
                 state.modifiers = modifiers;
 
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(event.event_x as f32 / u16::MAX as f32 / window.scale_factor()),
+                    px(event.event_y as f32 / u16::MAX as f32 / window.scale_factor()),
                 );
                 match button_or_scroll_from_event_detail(event.detail) {
                     Some(ButtonOrScroll::Button(button)) => {
@@ -1795,8 +1805,8 @@ impl X11Client {
                 }
                 let pressed_button = pressed_button_from_mask(event.button_mask[0]);
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(event.event_x as f32 / u16::MAX as f32 / window.scale_factor()),
+                    px(event.event_y as f32 / u16::MAX as f32 / window.scale_factor()),
                 );
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
@@ -1831,6 +1841,7 @@ impl X11Client {
                 state.restore_cursor_after_hide();
             }
             Event::XinputLeave(event) if event.mode == xinput::NotifyMode::NORMAL => {
+                let window = self.get_window(event.event)?;
                 let mut state = self.0.borrow_mut();
 
                 // Set last scroll values to `None` so that a large delta isn't created if scrolling is done outside the window (the valuator is global)
@@ -1838,14 +1849,13 @@ impl X11Client {
                 state.mouse_focused_window = None;
                 let pressed_button = pressed_button_from_mask(event.buttons[0]);
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(event.event_x as f32 / u16::MAX as f32 / window.scale_factor()),
+                    px(event.event_y as f32 / u16::MAX as f32 / window.scale_factor()),
                 );
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
                 drop(state);
 
-                let window = self.get_window(event.event)?;
                 window.handle_input(PlatformInput::MouseExited(gpui::MouseExitEvent {
                     pressed_button,
                     position,
@@ -1882,8 +1892,8 @@ impl X11Client {
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(event.event_x as f32 / u16::MAX as f32 / window.scale_factor()),
+                    px(event.event_y as f32 / u16::MAX as f32 / window.scale_factor()),
                 );
                 drop(state);
                 window.handle_input(PlatformInput::Pinch(gpui::PinchEvent {
@@ -1899,8 +1909,8 @@ impl X11Client {
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(event.event_x as f32 / u16::MAX as f32 / window.scale_factor()),
+                    px(event.event_y as f32 / u16::MAX as f32 / window.scale_factor()),
                 );
                 // scale is in FP16.16 format: divide by 65536 to get the float value
                 let new_absolute_scale = event.scale as f32 / 65536.0;
@@ -1922,8 +1932,8 @@ impl X11Client {
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(event.event_x as f32 / u16::MAX as f32 / window.scale_factor()),
+                    px(event.event_y as f32 / u16::MAX as f32 / window.scale_factor()),
                 );
                 drop(state);
                 window.handle_input(PlatformInput::Pinch(gpui::PinchEvent {
@@ -2141,6 +2151,7 @@ impl LinuxClient for X11Client {
         let x_root_index = state.x_root_index;
         let atoms = state.atoms;
         let scale_factor = state.scale_factor;
+        let zoom = state.zoom;
         let appearance = state.common.appearance;
         let compositor_gpu = state.compositor_gpu.take();
         let supports_xinput_gestures = state.supports_xinput_gestures;
@@ -2161,6 +2172,7 @@ impl LinuxClient for X11Client {
             x_window,
             &atoms,
             scale_factor,
+            zoom,
             appearance,
             parent_window,
             supports_xinput_gestures,

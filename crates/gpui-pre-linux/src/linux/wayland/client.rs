@@ -2104,12 +2104,16 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 surface_y,
                 ..
             } => {
-                let position = point(px(surface_x as f32), px(surface_y as f32));
+                // in the pixels the window's content is laid out in: the
+                // surface's over the window's zoom (elundqvist/kvist#563)
+                let window = get_window(&mut state, &surface.id());
+                let zoom = window.as_ref().map_or(1.0, |window| window.zoom());
+                let position = point(px(surface_x as f32 / zoom), px(surface_y as f32 / zoom));
                 state.serial_tracker.update(SerialKind::MouseEnter, serial);
                 state.mouse_location = Some(position);
                 state.button_pressed = None;
 
-                if let Some(window) = get_window(&mut state, &surface.id()) {
+                if let Some(window) = window {
                     state.mouse_focused_window = Some(window.clone());
 
                     if state.enter_token.is_some() {
@@ -2163,10 +2167,11 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 surface_y,
                 ..
             } => {
-                if state.mouse_focused_window.is_none() {
+                let Some(zoom) = state.mouse_focused_window.as_ref().map(|window| window.zoom()) else {
                     return;
-                }
-                state.mouse_location = Some(point(px(surface_x as f32), px(surface_y as f32)));
+                };
+                // in the window's content pixels (elundqvist/kvist#563)
+                state.mouse_location = Some(point(px(surface_x as f32 / zoom), px(surface_y as f32 / zoom)));
                 state.restore_cursor_after_hide();
 
                 if let Some(window) = state.mouse_focused_window.clone() {
@@ -2655,7 +2660,9 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                                     }
                                 })
                                 .collect();
-                            let position = Point::new(x.into(), y.into());
+                            // in the window's content pixels (elundqvist/kvist#563)
+                            let zoom = drag_window.zoom();
+                            let position = Point::new(px(x as f32 / zoom), px(y as f32 / zoom));
 
                             // Prevent dropping text from other programs.
                             if paths.is_empty() {
@@ -2684,7 +2691,8 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                 let Some(drag_window) = state.drag.window.clone() else {
                     return;
                 };
-                let position = Point::new(x.into(), y.into());
+                let zoom = drag_window.zoom();
+                let position = Point::new(px(x as f32 / zoom), px(y as f32 / zoom));
                 state.drag.position = position;
 
                 let input = PlatformInput::FileDrop(FileDropEvent::Pending { position });

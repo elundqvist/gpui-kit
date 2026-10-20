@@ -269,8 +269,21 @@ pub struct X11WindowState {
     visual_id: u32,
     pub(crate) counter_id: sync::Counter,
     pub(crate) last_sync_counter: Option<sync::Int64>,
+    /// The window's bounds in the display's logical pixels, device pixels over
+    /// `display_scale_factor`: where the window is, for placing windows, whatever
+    /// the zoom; its content is `content_size`.
     bounds: Bounds<Pixels>,
+    /// What the window's content is laid out and drawn at: the display's factor
+    /// times the app's zoom (elundqvist/kvist#563).
     scale_factor: f32,
+    /// The display's own factor, from Xft.dpi, which the window's bounds, the
+    /// displays and the window manager's coordinates go by.
+    display_scale_factor: f32,
+    /// The app's zoom over it, 1.0 for none (`PlatformWindow::set_zoom`).
+    zoom: f32,
+    /// The least size the window opened with, in content pixels, which the
+    /// window manager is told again in its own pixels at each zoom.
+    min_size: Option<Size<Pixels>>,
     renderer: WgpuRenderer,
     display: Rc<dyn PlatformDisplay>,
     input_handler: Option<PlatformInputHandler>,
@@ -459,6 +472,7 @@ impl X11WindowState {
         x_window: xproto::Window,
         atoms: &XcbAtoms,
         scale_factor: f32,
+        zoom: f32,
         appearance: WindowAppearance,
         parent_window: Option<X11WindowStatePtr>,
         supports_xinput_gestures: bool,
@@ -469,6 +483,7 @@ impl X11WindowState {
         if let WindowKind::AnchoredPopup(_) = params.kind {
             return Err(PopupNotSupportedError.into());
         }
+        let min_size = params.window_min_size;
 
         let x_screen_index = params
             .display_id
@@ -773,21 +788,13 @@ impl X11WindowState {
 
             // Set max window size hints based on the GPU's maximum texture dimension.
             // This prevents the window from being resized larger than what the GPU can render.
-            let max_texture_size = renderer.max_texture_size();
-            let mut size_hints = WmSizeHints::new();
-            if let Some(size) = params.window_min_size {
-                size_hints.min_size =
-                    Some((f32::from(size.width) as i32, f32::from(size.height) as i32));
-            }
-            size_hints.max_size = Some((max_texture_size as i32, max_texture_size as i32));
-            check_reply(
-                || {
-                    format!(
-                        "X11 change of WM_SIZE_HINTS failed. max_size: {:?}",
-                        max_texture_size
-                    )
-                },
-                size_hints.set_normal_hints(xcb, x_window),
+            set_size_hints(
+                xcb,
+                x_window,
+                x_screen_index,
+                min_size,
+                scale_factor * zoom,
+                renderer.max_texture_size(),
             )?;
 
             if let Some(image) = params.icon {
@@ -825,7 +832,10 @@ impl X11WindowState {
                 x_screen_index,
                 visual_id: visual.id,
                 bounds: bounds.to_pixels(scale_factor),
-                scale_factor,
+                scale_factor: scale_factor * zoom,
+                display_scale_factor: scale_factor,
+                zoom,
+                min_size,
                 renderer,
                 atoms: *atoms,
                 input_handler: None,
@@ -861,9 +871,49 @@ impl X11WindowState {
         setup_result
     }
 
+    /// The window's size in the pixels its content is laid out in: the
+    /// display's logical pixels over the zoom (elundqvist/kvist#563).
     fn content_size(&self) -> Size<Pixels> {
-        self.bounds.size
+        self.bounds.size.map(|v| v / self.zoom)
     }
+}
+
+/// Tell the window manager the least and the most the window may be, in its
+/// own pixels, the device's: the least is `min_size`, in content pixels, at
+/// `scale_factor`, the display's times the zoom (elundqvist/kvist#563), and
+/// no more than the screen `x_screen_index` names either way, so that a zoom
+/// never asks for a window taller than the screen, which a window manager
+/// would grow past its bottom; and the most the GPU's largest texture.
+fn set_size_hints(
+    xcb: &XCBConnection,
+    x_window: xproto::Window,
+    x_screen_index: usize,
+    min_size: Option<Size<Pixels>>,
+    scale_factor: f32,
+    max_texture_size: u32,
+) -> anyhow::Result<()> {
+    let mut size_hints = WmSizeHints::new();
+    if let Some(size) = min_size {
+        let screen = xcb.setup().roots.get(x_screen_index);
+        let cap = |v: Pixels, screen_px: Option<u16>| {
+            let want = (f32::from(v) * scale_factor).round() as i32;
+            screen_px.map_or(want, |px| want.min(i32::from(px)))
+        };
+        size_hints.min_size = Some((
+            cap(size.width, screen.map(|s| s.width_in_pixels)),
+            cap(size.height, screen.map(|s| s.height_in_pixels)),
+        ));
+    }
+    size_hints.max_size = Some((max_texture_size as i32, max_texture_size as i32));
+    check_reply(
+        || {
+            format!(
+                "X11 change of WM_SIZE_HINTS failed. max_size: {:?}",
+                max_texture_size
+            )
+        },
+        size_hints.set_normal_hints(xcb, x_window),
+    )
 }
 
 pub(crate) struct X11Window(pub X11WindowStatePtr);
@@ -927,6 +977,7 @@ impl X11Window {
         x_window: xproto::Window,
         atoms: &XcbAtoms,
         scale_factor: f32,
+        zoom: f32,
         appearance: WindowAppearance,
         parent_window: Option<X11WindowStatePtr>,
         supports_xinput_gestures: bool,
@@ -946,6 +997,7 @@ impl X11Window {
                 x_window,
                 atoms,
                 scale_factor,
+                zoom,
                 appearance,
                 parent_window,
                 supports_xinput_gestures,
@@ -1045,6 +1097,13 @@ impl X11Window {
 }
 
 impl X11WindowStatePtr {
+    /// What the window's content is laid out at, the display's factor times
+    /// the zoom: what a position in the window is divided by to be in the
+    /// pixels gpui lays out (elundqvist/kvist#563).
+    pub fn scale_factor(&self) -> f32 {
+        self.state.borrow().scale_factor
+    }
+
     pub fn should_close(&self) -> bool {
         let mut cb = self.callbacks.borrow_mut();
         if let Some(mut should_close) = cb.should_close.take() {
@@ -1314,7 +1373,7 @@ impl X11WindowStatePtr {
     pub fn set_bounds(&self, bounds: Bounds<i32>) -> anyhow::Result<()> {
         let (is_resize, content_size, scale_factor) = {
             let mut state = self.state.borrow_mut();
-            let bounds = bounds.map(|f| px(f as f32 / state.scale_factor));
+            let bounds = bounds.map(|f| px(f as f32 / state.display_scale_factor));
 
             let is_resize = bounds.size.width != state.bounds.size.width
                 || bounds.size.height != state.bounds.size.height;
@@ -1423,10 +1482,10 @@ impl PlatformWindow for X11Window {
             let [left, right, top, bottom] = state.last_insets;
 
             let [left, right, top, bottom] = [
-                px((left as f32) / state.scale_factor),
-                px((right as f32) / state.scale_factor),
-                px((top as f32) / state.scale_factor),
-                px((bottom as f32) / state.scale_factor),
+                px((left as f32) / state.display_scale_factor),
+                px((right as f32) / state.display_scale_factor),
+                px((top as f32) / state.display_scale_factor),
+                px((bottom as f32) / state.display_scale_factor),
             ];
 
             bounds.origin.x += left;
@@ -1471,6 +1530,41 @@ impl PlatformWindow for X11Window {
 
     fn scale_factor(&self) -> f32 {
         self.0.state.borrow().scale_factor
+    }
+
+    /// Changed in elundqvist/gpui-kit (elundqvist/kvist#563): the app's zoom
+    /// over the display's factor. The window's content is laid out at the
+    /// product from the next frame on, gpui reading it back through
+    /// `scale_factor` and `content_size`, and its positions are divided by it
+    /// as they come (`X11WindowStatePtr::scale_factor`); its bounds stay the
+    /// display's. The window manager is told the least size again in its
+    /// pixels, and the client the zoom, which the windows opened after this
+    /// start at.
+    fn set_zoom(&self, zoom: f32) {
+        let mut state = self.0.state.borrow_mut();
+        if zoom == state.zoom {
+            return;
+        }
+        state.zoom = zoom;
+        state.scale_factor = state.display_scale_factor * zoom;
+        set_size_hints(
+            &self.0.xcb,
+            self.0.x_window,
+            state.x_screen_index,
+            state.min_size,
+            state.scale_factor,
+            state.renderer.max_texture_size(),
+        )
+        .log_err();
+        xcb_flush(&self.0.xcb);
+        if let Some(client) = state.client.get_client() {
+            match client.0.try_borrow_mut() {
+                Ok(mut client) => client.zoom = zoom,
+                Err(_) => log::warn!(
+                    "X11 client busy: a window opened later starts at the zoom before this"
+                ),
+            }
+        }
     }
 
     fn appearance(&self) -> WindowAppearance {
@@ -1962,8 +2056,9 @@ impl PlatformWindow for X11Window {
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
         let state = self.0.state.borrow();
         let client = state.client.clone();
+        let scale_factor = state.scale_factor;
         drop(state);
-        client.update_ime_position(bounds);
+        client.update_ime_position(bounds, scale_factor);
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
@@ -1999,7 +2094,7 @@ impl PlatformWindow for X11Window {
 
     fn a11y_update_window_bounds(&self) {
         let mut state = self.0.state.borrow_mut();
-        let scale = state.scale_factor;
+        let scale = state.display_scale_factor;
         let bounds = state.bounds;
         let [left, right, top, bottom] = state.last_insets;
 

@@ -49,6 +49,9 @@ pub(crate) struct TestWindowState {
     appearance: WindowAppearance,
     external_drag_files: Vec<(PathBuf, bool)>,
     start_external_drag_result: bool,
+    /// Changed in elundqvist/gpui-kit (elundqvist/kvist#563): the app's zoom over the
+    /// test display's factor of 2.0, which `scale_factor` includes.
+    zoom: f32,
 }
 
 #[derive(Clone)]
@@ -113,6 +116,7 @@ impl TestWindow {
             appearance: WindowAppearance::Light,
             external_drag_files: Vec::new(),
             start_external_drag_result: false,
+            zoom: 1.0,
         })))
     }
     pub fn simulate_scheduled_frame(&self) -> bool {
@@ -231,17 +235,25 @@ impl PlatformWindow for TestWindow {
         false
     }
 
+    /// The window's size over the zoom, the pixels its content is laid out in, as the X11
+    /// window has it (elundqvist/kvist#563).
     fn content_size(&self) -> Size<Pixels> {
-        self.bounds().size
+        let zoom = self.0.lock().zoom;
+        self.bounds().size.map(|v| v / zoom)
     }
 
     fn resize(&mut self, size: Size<Pixels>) {
         let mut lock = self.0.lock();
-        lock.bounds.size = size;
+        let zoom = lock.zoom;
+        lock.bounds.size = size.map(|v| v * zoom);
     }
 
     fn scale_factor(&self) -> f32 {
-        2.0
+        2.0 * self.0.lock().zoom
+    }
+
+    fn set_zoom(&self, zoom: f32) {
+        self.0.lock().zoom = zoom;
     }
 
     fn appearance(&self) -> WindowAppearance {

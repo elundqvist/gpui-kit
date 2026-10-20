@@ -111,8 +111,18 @@ pub struct WaylandWindowState {
     display: Option<(ObjectId, Output)>,
     globals: Globals,
     renderer: WgpuRenderer,
+    /// The window's bounds in the compositor's logical pixels, whatever the zoom;
+    /// its content is `content_size`.
     bounds: Bounds<Pixels>,
+    /// The output's scale, what the buffer is sized by.
     scale: f32,
+    /// The app's zoom over it, 1.0 for none (`PlatformWindow::set_zoom`,
+    /// elundqvist/kvist#563): the content is laid out at `scale` times it, in
+    /// `bounds` over it, and the pointer's positions come divided by it.
+    zoom: f32,
+    /// The least size the window opened with, in content pixels, told to the
+    /// compositor again in its own at each zoom.
+    min_size: Option<Size<Pixels>>,
     input_handler: Option<PlatformInputHandler>,
     decorations: WindowDecorations,
     background_appearance: WindowBackgroundAppearance,
@@ -610,6 +620,8 @@ impl WaylandWindowState {
             renderer,
             bounds: options.bounds,
             scale: 1.0,
+            zoom: 1.0,
+            min_size: options.window_min_size,
             input_handler: None,
             decorations: WindowDecorations::Client,
             background_appearance: WindowBackgroundAppearance::Opaque,
@@ -881,6 +893,13 @@ impl WaylandWindowStatePtr {
 
     pub fn toplevel(&self) -> Option<xdg_toplevel::XdgToplevel> {
         self.state.borrow().surface_state.toplevel().cloned()
+    }
+
+    /// The app's zoom over the output's scale (elundqvist/kvist#563): what a
+    /// position in the window's logical pixels is divided by to be in the
+    /// pixels gpui lays out.
+    pub fn zoom(&self) -> f32 {
+        self.state.borrow().zoom
     }
 
     /// The `xdg_surface` backing this window, if it has one. Used to anchor child popups.
@@ -1455,13 +1474,18 @@ impl WaylandWindowStatePtr {
         marked
     }
 
+    /// Where the input method's candidates go, in the window's own pixels: the
+    /// handler's content pixels times the zoom (elundqvist/kvist#563).
     pub fn get_ime_area(&self) -> Option<Bounds<Pixels>> {
         let mut state = self.state.borrow_mut();
         let mut bounds: Option<Bounds<Pixels>> = None;
         if let Some(mut input_handler) = state.input_handler.take() {
             drop(state);
             bounds = input_handler.ime_candidate_bounds();
-            self.state.borrow_mut().input_handler = Some(input_handler);
+            let mut state = self.state.borrow_mut();
+            state.input_handler = Some(input_handler);
+            let zoom = state.zoom;
+            bounds = bounds.map(|b| b.map(|v| v * zoom));
         }
         bounds
     }
@@ -1669,13 +1693,19 @@ impl PlatformWindow for WaylandWindow {
         }
     }
 
+    /// The window's size in the pixels its content is laid out in: the
+    /// compositor's logical pixels over the zoom (elundqvist/kvist#563).
     fn content_size(&self) -> Size<Pixels> {
-        self.borrow().bounds.size
+        let state = self.borrow();
+        state.bounds.size.map(|v| v / state.zoom)
     }
 
+    /// `size` in content pixels, the window's in the compositor's being that
+    /// times the zoom (elundqvist/kvist#563).
     fn resize(&mut self, size: Size<Pixels>) {
         let state = self.borrow();
         let state_ptr = self.0.clone();
+        let size = size.map(|v| v * state.zoom);
 
         // A popup's placement is the compositor's, so a resize re-runs the positioner and the
         // configure reply drives the buffer resize. Before the first configure the popup is
@@ -1722,8 +1752,48 @@ impl PlatformWindow for WaylandWindow {
             .detach();
     }
 
+    /// The output's scale times the app's zoom: what the content is laid out
+    /// and drawn at (elundqvist/kvist#563).
     fn scale_factor(&self) -> f32 {
-        self.borrow().scale
+        let state = self.borrow();
+        state.scale * state.zoom
+    }
+
+    /// Changed in elundqvist/gpui-kit (elundqvist/kvist#563): the app's zoom
+    /// over the output's scale, as the X11 window has it. The content is laid
+    /// out at the product from the next frame on, gpui reading it back through
+    /// `scale_factor` and `content_size`; the window's bounds, its buffer and
+    /// what the compositor is told stay in its logical pixels, and the
+    /// pointer's and a drag's positions come divided by the zoom
+    /// (`WaylandWindowStatePtr::zoom`). The least size the window opened with
+    /// is told to the compositor again in its pixels, and no more than the
+    /// output the window is on, so a zoom never asks for a window taller than
+    /// the screen.
+    fn set_zoom(&self, zoom: f32) {
+        let (toplevel, min_size) = {
+            let mut state = self.borrow_mut();
+            if zoom == state.zoom {
+                return;
+            }
+            state.zoom = zoom;
+            let min_size = state.min_size.map(|size| {
+                let want = size.map(|v| v * zoom);
+                match state.display.as_ref() {
+                    Some((_, output)) => {
+                        let room = output.bounds.to_pixels(output.scale as f32).size;
+                        Size {
+                            width: want.width.min(room.width),
+                            height: want.height.min(room.height),
+                        }
+                    }
+                    None => want,
+                }
+            });
+            (state.surface_state.toplevel().cloned(), min_size)
+        };
+        if let (Some(toplevel), Some(size)) = (toplevel, min_size) {
+            toplevel.set_min_size(f32::from(size.width) as i32, f32::from(size.height) as i32);
+        }
     }
 
     fn appearance(&self) -> WindowAppearance {
@@ -2107,12 +2177,15 @@ impl PlatformWindow for WaylandWindow {
         }
     }
 
+    /// `bounds` in content pixels, which the compositor takes in the window's
+    /// own, the zoom times them (elundqvist/kvist#563).
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
         let state = self.borrow();
         if !state.active {
             return;
         }
-        state.client.update_ime_position(bounds);
+        let zoom = state.zoom;
+        state.client.update_ime_position(bounds.map(|v| v * zoom));
     }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {

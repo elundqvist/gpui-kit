@@ -130,6 +130,28 @@ asks (section 4(b)); each says so at its top:
   neighbour's script, Han, kana or Hangul (`of_its_script`), so once a
   script and a wrapper, not once a neighbour. Tests with the text system
   above, which draws `、`, `。` and the brackets so, and of what is shaped.
+- `src/platform.rs` and `src/window.rs`: `PlatformWindow::set_zoom`, a
+  no-op unless the platform has one, and `Window::set_zoom`, the app's
+  zoom over the display's scale factor (elundqvist/kvist#563), as a
+  browser zooms a page. gpui lays a window out in logical pixels and
+  draws them through the window's scale factor, the display's, read
+  once; the zoom is that factor changed while the app runs. The window
+  hands it to the platform window and takes the factor and the content
+  size back (`bounds_changed`), so from the next frame on it is laid out
+  at the display's factor times the zoom, the glyphs and the SVGs
+  rasterised anew at it, which the atlas keys by the factor already, and
+  nothing scaled as a bitmap; the mouse and the input method's positions
+  come divided by it. The window's bounds and the displays' stay the
+  display's, so windows are placed as before. Each window has its own,
+  and an app zooms all of its alike. A zoom the window has already, or
+  one the platform has no zoom for, asks for no frame: the window is laid
+  out again only where its factor moved, so a key held at the end of an
+  app's range does not have every window redrawn.
+- `src/platform/test/window.rs`: the test window takes a zoom over its
+  factor of 2.0, its content size its bounds over the zoom, as the X11
+  window's is. A test of a frame's layout at 1.5, 1.5 times the one at
+  1.0, and back, with a root that fills the window drawn as wide as the
+  window at either, and no frame asked for a zoom the window has.
 
 ## Tests
 

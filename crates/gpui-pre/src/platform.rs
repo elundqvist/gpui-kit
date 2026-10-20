@@ -823,6 +823,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn content_size(&self) -> Size<Pixels>;
     fn resize(&mut self, size: Size<Pixels>);
     fn scale_factor(&self) -> f32;
+    /// Changed in elundqvist/gpui-kit (elundqvist/kvist#563): the app's zoom over the
+    /// display's factor, 1.0 for none. Set, `scale_factor` is the display's times it,
+    /// `content_size` the window's size in the pixels that factor lays out, and the mouse
+    /// and the input method's positions are in them too; the window's bounds and the
+    /// displays' stay the display's. The window is to take it at once, for the next frame,
+    /// and `Window::set_zoom` reads it back from it then. A platform that has no zoom
+    /// ignores it.
+    fn set_zoom(&self, _zoom: f32) {}
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;
     fn mouse_position(&self) -> Point<Pixels>;

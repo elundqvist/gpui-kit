@@ -224,12 +224,52 @@ asks (section 4(b)); each says so at its top:
   Portuguese's ç in Latin-1. Tests of the order, of the UTF-8 form, and
   of the pt_BR tables, where the system's are as the test takes them
   and no compose file of the user's is read in their place.
+- `src/linux/x11/window.rs` and `src/linux/x11/client.rs`: an X11
+  window takes the app's zoom over the display's factor
+  (`PlatformWindow::set_zoom`, the fork's gpui-pre,
+  elundqvist/kvist#563). Its content is laid out and drawn at the
+  display's factor times the zoom from the next frame on
+  (`scale_factor`, `content_size`), while its bounds, the displays and
+  what the window manager is told stay in the display's logical pixels
+  (`display_scale_factor`), as before: a window is placed as it was,
+  and a resize comes in the display's pixels. Each position of the
+  pointer in a window goes by that window's factor
+  (`X11WindowStatePtr::scale_factor`), where every window's went by the
+  client's one, and the input method's spot too (`update_ime_position`
+  takes the factor). The least size the window opened with is told to
+  the window manager again at each zoom, in its pixels, the display's
+  times the zoom (`set_size_hints`): it was told once in logical pixels
+  unscaled, so at a display factor other than 1.0 the window could be
+  made smaller than the least it asked for. It is no more than the
+  screen either way: a least size past the screen, 640 by 480 at 200 %
+  on a screen 900 high, would have the window manager grow the window
+  past the screen's bottom. The client keeps the last zoom a window was
+  given, which a window opened after it starts at. The windows and the
+  server it takes cannot be had in a test; checked under Kvist's harness
+  on Xvfb.
+- `src/linux/wayland/window.rs` and `src/linux/wayland/client.rs`: a
+  Wayland window takes the zoom the same way (elundqvist/kvist#563):
+  its content is laid out at the output's scale times the zoom
+  (`scale_factor`, `content_size`), its bounds, its buffer and what the
+  compositor is told stay in the compositor's logical pixels, a resize
+  gpui asks for is in content pixels, the pointer's and a drag's
+  positions come divided by the window's zoom
+  (`WaylandWindowStatePtr::zoom`) and the input method's rectangle
+  multiplied by it, and the least size is told to the compositor again
+  in its pixels at each zoom, no more than the output the window is on.
+  Written to the X11 window's pattern and built with the `wayland`
+  feature, as Kvist builds it; not run on a compositor, there being
+  none at hand.
 - `Cargo.toml`: an `[[example]]` entry for `examples/xdnd_source.rs`,
   which the fork adds (the published manifest names its targets and
   has no examples). And zed-xim, the XIM client, is taken by path from
   `crates/zed-xim`, where the fork carries it with fixes of its own
   (its FORK.md says what they are), beside the version crates.io
-  serves it at; `Cargo.lock` names it with no source.
+  serves it at; `Cargo.lock` names it with no source. And gpui-pre is
+  patched to `crates/gpui-pre`, the fork's, whose `PlatformWindow` has
+  `set_zoom` (elundqvist/kvist#563), which the X11 window implements:
+  on the published gpui-pre the crate no longer builds. `Cargo.lock`
+  names it with no source too.
 
 ## Trying a drag by hand
 
@@ -260,12 +300,13 @@ should print `finished: accepted`, the window having taken the file.
 ## Tests
 
 The crate is not a member of the fork's workspace (the root
-`Cargo.toml` excludes it) and builds with the lock it was published
-with. From this directory:
+`Cargo.toml` excludes it) and builds with its own lock. From this
+directory:
 
     cargo test --locked --lib
 
-It builds on gpui-pre and the other gpui-pre-* crates from crates.io,
-at the versions in its own `Cargo.lock`, not on `crates/gpui-pre`, so
-its tests never run on that crate's fixes. An application gets both
-through `[patch.crates-io]`, as Kvist does.
+It builds on `crates/gpui-pre`, the fork's, through the
+`[patch.crates-io]` in its `Cargo.toml` (the X11 window implements that
+crate's `PlatformWindow::set_zoom`), and on the other gpui-pre-* crates
+from crates.io, at the versions in its `Cargo.lock`. An application
+gets all of them through its own `[patch.crates-io]`, as Kvist does.

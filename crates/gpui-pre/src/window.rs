@@ -2952,6 +2952,25 @@ impl Window {
         self.refresh();
     }
 
+    /// Changed in elundqvist/gpui-kit (elundqvist/kvist#563): set the app's zoom over the
+    /// display's scale factor, 1.0 for none. From the next frame on the window is laid out
+    /// and drawn at the display's factor times it, as it is for a display of that factor:
+    /// one number scales the text, the icons, the rows and the gutters together, the glyphs
+    /// and the SVGs rasterised anew at it (the atlas keys them by the factor), nothing laid
+    /// out twice, and the design's pixels what they are. The viewport is the window's size
+    /// in those pixels, and the mouse and the input method's positions come in them. The
+    /// window's bounds and the displays' stay the display's, so windows are placed as
+    /// before. Each window has its own; an app zooms all of its windows alike. On a platform
+    /// that has no zoom nothing changes, and a zoom the window has already changes nothing
+    /// either: the window is laid out again only where the factor moved.
+    pub fn set_zoom(&mut self, zoom: f32, cx: &mut App) {
+        let before = self.platform_window.scale_factor();
+        self.platform_window.set_zoom(zoom);
+        if self.platform_window.scale_factor() != before {
+            self.bounds_changed(cx);
+        }
+    }
+
     /// The size of an em for the base font of the application. Adjusting this value allows the
     /// UI to scale, just like zooming a web page.
     pub fn rem_size(&self) -> Pixels {
@@ -9152,5 +9171,81 @@ mod held_input_tests {
         cx.run_until_parked();
         cx.update(|window, _| assert!(!window.input_held()));
         assert_eq!(logged(&log), ["<hold>", "a", "<up a>", "<mark>"]);
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use crate::{
+        self as gpui, Context, IntoElement, ParentElement as _, Render, Styled as _,
+        TestAppContext, VisualTestContext, Window, div, px,
+    };
+
+    /// A box of 100 by 50 design pixels in a root that fills the window.
+    struct Box100;
+
+    impl Render for Box100 {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .bg(gpui::blue())
+                .child(div().w(px(100.)).h(px(50.)).bg(gpui::red()))
+        }
+    }
+
+    /// The quads of the last frame, by their size in the pixels drawn.
+    fn drawn(cx: &mut VisualTestContext) -> Vec<(f32, f32)> {
+        cx.update(|window, _| {
+            window
+                .painted_quads()
+                .iter()
+                .map(|q| (q.bounds.size.width.0, q.bounds.size.height.0))
+                .collect()
+        })
+    }
+
+    /// The window's size in the pixels drawn: the viewport at the factor.
+    fn device(cx: &mut VisualTestContext) -> (f32, f32) {
+        cx.update(|window, _| {
+            let (size, factor) = (window.viewport_size(), window.scale_factor());
+            (size.width.0 * factor, size.height.0 * factor)
+        })
+    }
+
+    /// A zoom set on the window is in the next frame's layout: at 1.5 the
+    /// frame is laid out at the display's factor times 1.5, so every box is
+    /// 1.5 times what it was, and at 1.0 again what it was
+    /// (elundqvist/kvist#563). The window itself is no larger: its viewport
+    /// is its size over the zoom, so a root that fills it is drawn as wide
+    /// as the window at either zoom, and a zoom the window has already
+    /// asks for no frame.
+    #[gpui::test]
+    fn a_zoom_scales_the_next_frames_layout(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| Box100);
+        cx.run_until_parked();
+        assert_eq!(cx.update(|window, _| window.scale_factor()), 2.0);
+        assert!(drawn(cx).contains(&(200., 100.)), "{:?}", drawn(cx));
+        let viewport = cx.update(|window, _| window.viewport_size());
+        let window_px = device(cx);
+        assert!(drawn(cx).contains(&window_px), "{:?} has no {window_px:?}", drawn(cx));
+
+        cx.update(|window, cx| window.set_zoom(1.5, cx));
+        cx.run_until_parked();
+        assert_eq!(cx.update(|window, _| window.scale_factor()), 3.0);
+        assert!(drawn(cx).contains(&(300., 150.)), "{:?}", drawn(cx));
+        assert!(!drawn(cx).contains(&(200., 100.)), "{:?}", drawn(cx));
+        assert_eq!(cx.update(|window, _| window.viewport_size()), viewport.map(|v| v / 1.5));
+        assert_eq!(device(cx), window_px);
+        assert!(drawn(cx).contains(&window_px), "{:?} has no {window_px:?}", drawn(cx));
+
+        cx.update(|window, cx| window.set_zoom(1.5, cx));
+        assert!(!cx.update(|window, _| window.invalidator.is_dirty()), "a zoom the window has asks for no frame");
+
+        cx.update(|window, cx| window.set_zoom(1.0, cx));
+        cx.run_until_parked();
+        assert_eq!(cx.update(|window, _| window.scale_factor()), 2.0);
+        assert!(drawn(cx).contains(&(200., 100.)), "{:?}", drawn(cx));
+        assert_eq!(cx.update(|window, _| window.viewport_size()), viewport);
+        assert!(drawn(cx).contains(&window_px), "{:?} has no {window_px:?}", drawn(cx));
     }
 }

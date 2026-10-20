@@ -310,3 +310,8 @@ priority = -1
 [lints.rust.unexpected_cfgs]
 level = "allow"
 priority = 0
+
+# Changed in elundqvist/gpui-kit: the crate builds on the fork's gpui-pre, whose
+# `PlatformWindow` has `set_zoom` (elundqvist/kvist#563), not on the published one.
+[patch.crates-io]
+gpui-pre = { path = "../gpui-pre" }
