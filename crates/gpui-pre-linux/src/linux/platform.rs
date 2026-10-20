@@ -869,13 +869,22 @@ fn validate_xkb_context(context: xkb::Context) -> anyhow::Result<xkb::Context> {
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
 pub(super) fn get_xkb_compose_state(cx: &xkb::Context) -> Option<xkb::compose::State> {
-    let mut locales = Vec::default();
-    if let Some(locale) = env::var_os("LC_CTYPE") {
-        locales.push(locale);
-    }
-    locales.push(OsString::from("C"));
+    compose_state(cx, |name| env::var_os(name))
+}
+
+/// The compose table of the locale `var`, the environment, names, in its
+/// UTF-8 form first, or the C locale's where there is none for it
+/// (`compose_locales`).
+///
+/// Changed in elundqvist/gpui-kit (elundqvist/kvist#498): the locale was
+/// `LC_CTYPE`'s alone.
+#[cfg(any(feature = "wayland", feature = "x11"))]
+fn compose_state(
+    cx: &xkb::Context,
+    var: impl Fn(&str) -> Option<OsString>,
+) -> Option<xkb::compose::State> {
     let mut state: Option<xkb::compose::State> = None;
-    for locale in locales {
+    for locale in compose_locales(var) {
         if let Ok(table) =
             xkb::compose::Table::new_from_locale(cx, &locale, xkb::compose::COMPILE_NO_FLAGS)
         {
@@ -887,6 +896,76 @@ pub(super) fn get_xkb_compose_state(cx: &xkb::Context) -> Option<xkb::compose::S
         }
     }
     state
+}
+
+/// The locales whose compose tables are tried in turn: the one `setlocale`
+/// takes for the character type (`compose_locale`), in its UTF-8 form first
+/// where it names another codeset or none (`utf8_form`), then as it is
+/// named, then the C locale, which xkbcommon takes for en_US.UTF-8.
+///
+/// Added in elundqvist/gpui-kit (elundqvist/kvist#498).
+#[cfg(any(feature = "wayland", feature = "x11"))]
+fn compose_locales(var: impl Fn(&str) -> Option<OsString>) -> Vec<OsString> {
+    let locale = compose_locale(var);
+    let mut locales: Vec<OsString> = utf8_form(&locale).into_iter().collect();
+    locales.push(locale);
+    if !locales.iter().any(|locale| locale == "C") {
+        locales.push(OsString::from("C"));
+    }
+    locales
+}
+
+/// `locale` in the codeset UTF-8: `en_US.UTF-8` for `en_US` or
+/// `en_US.ISO-8859-1`, `sr_RS.UTF-8@latin` for `sr_RS@latin`; none where it
+/// is UTF-8 already, or C or POSIX.
+///
+/// Added in elundqvist/gpui-kit (elundqvist/kvist#498): xkbcommon reads a
+/// compose table in UTF-8 alone, and the table of a locale in another
+/// codeset, as `LANG=en_US` names Latin-1, is in that codeset: xkbcommon
+/// logged a dozen errors on it at every start and took the C locale's
+/// table, and Brazilian Portuguese in Latin-1 lost its ç as it did before
+/// `LANG` was read. Text in gpui is UTF-8 whatever the locale, as Qt
+/// takes a UTF-8 locale in place of one of another codeset.
+#[cfg(any(feature = "wayland", feature = "x11"))]
+fn utf8_form(locale: &std::ffi::OsStr) -> Option<OsString> {
+    let locale = locale.to_str()?;
+    let (name, modifier) = match locale.split_once('@') {
+        Some((name, modifier)) => (name, Some(modifier)),
+        None => (locale, None),
+    };
+    let (language, codeset) = match name.split_once('.') {
+        Some((language, codeset)) => (language, Some(codeset)),
+        None => (name, None),
+    };
+    let utf8 = codeset.is_some_and(|codeset| {
+        codeset.eq_ignore_ascii_case("UTF-8") || codeset.eq_ignore_ascii_case("utf8")
+    });
+    if utf8 || matches!(language, "" | "C" | "POSIX") {
+        return None;
+    }
+    Some(OsString::from(match modifier {
+        Some(modifier) => format!("{language}.UTF-8@{modifier}"),
+        None => format!("{language}.UTF-8"),
+    }))
+}
+
+/// The locale whose compose table a dead key's and the Compose key's
+/// sequences follow: the first of `LC_ALL`, `LC_CTYPE` and `LANG` that `var`
+/// has set and not empty, as `setlocale` takes the locale of the character
+/// type and as xkbcommon asks its callers to take it, or `C`.
+///
+/// Added in elundqvist/gpui-kit (elundqvist/kvist#498): `LC_CTYPE` was read
+/// alone, so with `LANG` set and no `LC_CTYPE`, as a desktop session often
+/// leaves it, the sequences followed the C locale's table, which xkbcommon
+/// takes for en_US.UTF-8's, whatever `LANG` named, and a locale `LC_ALL`
+/// set was passed over: in Brazilian Portuguese a dead ´ and a c gave ć,
+/// where the locale's table, and the rest of the desktop, give ç.
+#[cfg(any(feature = "wayland", feature = "x11"))]
+fn compose_locale(var: impl Fn(&str) -> Option<OsString>) -> OsString {
+    ["LC_ALL", "LC_CTYPE", "LANG"]
+        .into_iter()
+        .find_map(|name| var(name).filter(|locale| !locale.is_empty()))
+        .unwrap_or_else(|| OsString::from("C"))
 }
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
@@ -1443,6 +1522,124 @@ mod tests {
             error.to_string(),
             "libxkbcommon failed to create an XKB context"
         );
+    }
+
+    /// An environment of `vars` alone.
+    #[cfg(any(feature = "wayland", feature = "x11"))]
+    fn environment(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        move |name| {
+            vars.iter()
+                .find(|(set, _)| set == name)
+                .map(|(_, value)| OsString::from(value))
+        }
+    }
+
+    /// The compose table is the locale's that `setlocale` takes for the
+    /// character type: `LC_ALL`'s, else `LC_CTYPE`'s, else `LANG`'s, one set
+    /// empty counting as none, else C's (elundqvist/kvist#498). `LC_CTYPE`'s
+    /// alone was read, and with `LANG` alone set the table was C's.
+    #[cfg(any(feature = "wayland", feature = "x11"))]
+    #[test]
+    fn the_compose_locale_is_the_one_setlocale_takes() {
+        let locale = |vars: &[(&str, &str)]| compose_locale(environment(vars));
+        assert_eq!(locale(&[("LANG", "en_US.UTF-8")]), "en_US.UTF-8");
+        assert_eq!(
+            locale(&[("LANG", "en_US.UTF-8"), ("LC_CTYPE", "pl_PL.UTF-8")]),
+            "pl_PL.UTF-8"
+        );
+        assert_eq!(
+            locale(&[
+                ("LANG", "en_US.UTF-8"),
+                ("LC_CTYPE", "pl_PL.UTF-8"),
+                ("LC_ALL", "hu_HU.UTF-8"),
+            ]),
+            "hu_HU.UTF-8"
+        );
+        assert_eq!(
+            locale(&[("LANG", "en_US.UTF-8"), ("LC_CTYPE", ""), ("LC_ALL", "")]),
+            "en_US.UTF-8"
+        );
+        assert_eq!(locale(&[("LC_MESSAGES", "pl_PL.UTF-8")]), "C");
+        assert_eq!(locale(&[]), "C");
+    }
+
+    /// A locale of another codeset than UTF-8, or of none, is tried in its
+    /// UTF-8 form first, as xkbcommon reads tables in UTF-8 alone, then as
+    /// named, then the C locale (elundqvist/kvist#498).
+    #[cfg(any(feature = "wayland", feature = "x11"))]
+    #[test]
+    fn a_locale_of_another_codeset_is_tried_in_utf8_first() {
+        let locales = |vars: &[(&str, &str)]| compose_locales(environment(vars));
+        assert_eq!(locales(&[("LANG", "en_US")]), ["en_US.UTF-8", "en_US", "C"]);
+        assert_eq!(
+            locales(&[("LANG", "pt_BR.ISO-8859-1")]),
+            ["pt_BR.UTF-8", "pt_BR.ISO-8859-1", "C"]
+        );
+        assert_eq!(
+            locales(&[("LC_ALL", "sr_RS@latin")]),
+            ["sr_RS.UTF-8@latin", "sr_RS@latin", "C"]
+        );
+        assert_eq!(locales(&[("LANG", "en_US.UTF-8")]), ["en_US.UTF-8", "C"]);
+        assert_eq!(locales(&[("LANG", "de_DE.utf8")]), ["de_DE.utf8", "C"]);
+        assert_eq!(locales(&[("LANG", "C.UTF-8")]), ["C.UTF-8", "C"]);
+        assert_eq!(locales(&[("LANG", "POSIX")]), ["POSIX", "C"]);
+        assert_eq!(locales(&[]), ["C"]);
+    }
+
+    /// With `LANG` alone set to Brazilian Portuguese, a dead ´ and a c compose
+    /// ç, as pt_BR.UTF-8's table has it, where the C locale's, which
+    /// xkbcommon takes for en_US.UTF-8's, has ć, and so does Brazilian
+    /// Portuguese in Latin-1 (elundqvist/kvist#498). Passes where the
+    /// system's tables are not so, as on a machine with no X11 locale files,
+    /// or where a compose file of the user's (`XCOMPOSEFILE`,
+    /// `~/.XCompose`), which xkbcommon reads in place of the locale's,
+    /// composes ´ and c otherwise.
+    #[cfg(any(feature = "wayland", feature = "x11"))]
+    #[test]
+    fn a_dead_key_composes_by_the_table_of_lang() {
+        let cx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let compose = |mut state: xkb::compose::State| {
+            state.feed(Keysym::dead_acute);
+            state.feed(Keysym::c);
+            (state.status() == xkb::compose::Status::Composed)
+                .then(|| state.utf8())
+                .flatten()
+        };
+        let by_table = |locale: &str| {
+            xkb::compose::Table::new_from_locale(
+                &cx,
+                std::ffi::OsStr::new(locale),
+                xkb::compose::COMPILE_NO_FLAGS,
+            )
+            .ok()
+            .and_then(|table| {
+                compose(xkb::compose::State::new(
+                    &table,
+                    xkb::compose::STATE_NO_FLAGS,
+                ))
+            })
+        };
+        if by_table("pt_BR.UTF-8").as_deref() != Some("ç")
+            || by_table("C").as_deref() != Some("ć")
+        {
+            return;
+        }
+        let composed = |vars: &[(&str, &str)]| {
+            compose(compose_state(&cx, environment(vars)).expect("a table"))
+        };
+        assert_eq!(composed(&[("LANG", "pt_BR.UTF-8")]).as_deref(), Some("ç"));
+        assert_eq!(composed(&[("LC_ALL", "pt_BR.UTF-8")]).as_deref(), Some("ç"));
+        assert_eq!(
+            composed(&[("LANG", "pt_BR.UTF-8"), ("LC_CTYPE", "en_US.UTF-8")]).as_deref(),
+            Some("ć")
+        );
+        // in Latin-1, by the locale's table in UTF-8
+        assert_eq!(composed(&[("LANG", "pt_BR")]).as_deref(), Some("ç"));
+        assert_eq!(composed(&[("LANG", "en_US")]).as_deref(), Some("ć"));
     }
 
     /// A dead key's and the Compose key's sequences as the clients follow them

@@ -206,6 +206,24 @@ asks (section 4(b)); each says so at its top:
   let go of it, the palette's field a shortcut had opened over it, or,
   on X11, of the window clicked. Tests of each on a compose table of
   their own, with an input that lets go of its mark.
+- `src/linux/platform.rs`: the compose table both clients follow is the
+  locale's that `setlocale` takes for the character type, `LC_ALL`'s,
+  else `LC_CTYPE`'s, else `LANG`'s, one set empty counting as none
+  (`compose_locale`, elundqvist/kvist#498), as xkbcommon asks its
+  callers to take it. `LC_CTYPE`'s was read alone, so with `LANG` set
+  and no `LC_CTYPE`, as a desktop session often leaves it, the table
+  was the C locale's, which xkbcommon takes for en_US.UTF-8's, whatever
+  `LANG` named, and a locale `LC_ALL` set was passed over: in Brazilian
+  Portuguese a dead ´ and a c gave ć, where the locale's own table has
+  ç, as Portugal's has, and Greek, Czech, Finnish, Russian, Serbian,
+  Chinese, Japanese, Korean, Khmer and Amharic have tables of their
+  own. A locale of another codeset, or of none, as `LANG=en_US` names
+  Latin-1, is tried in its UTF-8 form first (`utf8_form`): xkbcommon
+  reads tables in UTF-8 alone, logged a dozen errors on the Latin-1
+  table at every start, and took the C locale's, which lost Brazilian
+  Portuguese's ç in Latin-1. Tests of the order, of the UTF-8 form, and
+  of the pt_BR tables, where the system's are as the test takes them
+  and no compose file of the user's is read in their place.
 - `Cargo.toml`: an `[[example]]` entry for `examples/xdnd_source.rs`,
   which the fork adds (the published manifest names its targets and
   has no examples). And zed-xim, the XIM client, is taken by path from
