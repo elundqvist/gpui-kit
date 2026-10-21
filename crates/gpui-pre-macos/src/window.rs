@@ -348,7 +348,24 @@ fn zoom_input(event: &mut PlatformInput, zoom: f32) {
                 scale(delta);
             }
         }
-        PlatformInput::KeyDown(_)
+        PlatformInput::Touch(e) => {
+            scale(&mut e.position);
+            if let Some(p) = &mut e.predicted_position {
+                scale(p);
+            }
+        }
+        PlatformInput::TouchDrag(e) => {
+            scale(&mut e.start_position);
+            scale(&mut e.position);
+        }
+        PlatformInput::LongPress(e) => {
+            scale(&mut e.start_position);
+            scale(&mut e.position);
+        }
+        // a drop's positions are made from the drag's location, divided
+        // already (`drag_event_position`)
+        PlatformInput::FileDrop(_)
+        | PlatformInput::KeyDown(_)
         | PlatformInput::KeyUp(_)
         | PlatformInput::ModifiersChanged(_) => {}
     }
