@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre-macos 0.3.3 as published to crates.io: FORK.md at
+// the crate's root says what and why (elundqvist/kvist#563).
 use crate::{
     BoolExt, MacDisplay, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
     TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
@@ -324,6 +326,34 @@ pub(crate) fn convert_mouse_position(position: NSPoint, window_height: Pixels) -
     )
 }
 
+/// Changed in elundqvist/gpui-kit (elundqvist/kvist#563): an event read in
+/// the view's points brought into gpui's zoomed pixels, its position and a
+/// wheel's pixel delta divided by the window's zoom. Keys carry no position;
+/// a wheel's lines and a pinch's factor are not lengths.
+fn zoom_input(event: &mut PlatformInput, zoom: f32) {
+    if zoom == 1.0 {
+        return;
+    }
+    let scale = |p: &mut Point<Pixels>| *p = p.map(|v| v / zoom);
+    match event {
+        PlatformInput::MouseDown(e) => scale(&mut e.position),
+        PlatformInput::MouseUp(e) => scale(&mut e.position),
+        PlatformInput::MouseMove(e) => scale(&mut e.position),
+        PlatformInput::MouseExited(e) => scale(&mut e.position),
+        PlatformInput::MousePressure(e) => scale(&mut e.position),
+        PlatformInput::Pinch(e) => scale(&mut e.position),
+        PlatformInput::ScrollWheel(e) => {
+            scale(&mut e.position);
+            if let gpui::ScrollDelta::Pixels(delta) = &mut e.delta {
+                scale(delta);
+            }
+        }
+        PlatformInput::KeyDown(_)
+        | PlatformInput::KeyUp(_)
+        | PlatformInput::ModifiersChanged(_) => {}
+    }
+}
+
 /// Stores the cursor style on the active GPUI window and invalidates its cursor rects.
 ///
 /// # Safety
@@ -636,6 +666,15 @@ struct MacWindowState {
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
+    /// Changed in elundqvist/gpui-kit (elundqvist/kvist#563): the app's zoom
+    /// over the display's backing scale factor, 1.0 for none
+    /// (`PlatformWindow::set_zoom`). The view's points are gpui's pixels on
+    /// macOS; zoomed, gpui lays the window out in points over the zoom and
+    /// draws at the backing factor times the zoom, the same device pixels.
+    zoom: f32,
+    /// The least content size the window was opened with, in gpui's pixels,
+    /// told to AppKit again in points at each zoom.
+    min_size: Option<Size<Pixels>>,
 }
 
 impl MacWindowState {
@@ -856,14 +895,30 @@ impl MacWindowState {
         )
     }
 
-    fn content_size(&self) -> Size<Pixels> {
+    /// The content view's size in points, what AppKit measures and places
+    /// in: gpui's pixels at zoom 1.0 (elundqvist/kvist#563).
+    fn view_size(&self) -> Size<Pixels> {
         let NSSize { width, height, .. } =
             unsafe { NSView::frame(self.native_window.contentView()) }.size;
         size(px(width as f32), px(height as f32))
     }
 
-    fn scale_factor(&self) -> f32 {
+    /// The content size gpui lays out in: the view's points over the zoom
+    /// (elundqvist/kvist#563).
+    fn content_size(&self) -> Size<Pixels> {
+        self.view_size().map(|v| v / self.zoom)
+    }
+
+    /// The display's backing scale factor, what a point is in device pixels.
+    fn display_scale_factor(&self) -> f32 {
         get_scale_factor(self.native_window)
+    }
+
+    /// What gpui draws at: the display's factor times the zoom
+    /// (elundqvist/kvist#563), so the zoomed layout fills the same device
+    /// pixels.
+    fn scale_factor(&self) -> f32 {
+        self.display_scale_factor() * self.zoom
     }
 
     fn window_bounds(&self) -> WindowBounds {
@@ -1067,6 +1122,8 @@ impl MacWindow {
                 closed: Arc::new(AtomicBool::new(false)),
                 accesskit_adapter: None,
                 sheet_parent: None,
+                zoom: 1.0,
+                min_size: window_min_size,
             }));
             let mut window = Self(state, marker);
 
@@ -1357,6 +1414,8 @@ impl PlatformWindow for MacWindow {
         let this = self.0.lock();
         let window = this.native_window;
         let closed = this.closed.clone();
+        // in points: gpui's pixels times the zoom (elundqvist/kvist#563)
+        let size = size.map(|v| v * this.zoom);
         this.foreground_executor
             .spawn(async move {
                 if_window_not_closed(closed, || unsafe {
@@ -1436,6 +1495,35 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().scale_factor()
     }
 
+    /// Changed in elundqvist/gpui-kit (elundqvist/kvist#563): the app's zoom
+    /// over the display's backing factor. From the next frame on the content
+    /// is laid out in points over the zoom and drawn at the backing factor
+    /// times the zoom (`scale_factor`, `content_size`), the pointer's and the
+    /// input method's positions are divided by it as they come, and the
+    /// window's least content size is told to AppKit again in points, so a
+    /// 640 by 480 window at 150 % is 960 by 720 on screen. The window's
+    /// bounds and the drawable stay as they are: the same device pixels,
+    /// laid out anew.
+    fn set_zoom(&self, zoom: f32) {
+        let mut state = self.0.as_ref().lock();
+        if zoom == state.zoom {
+            return;
+        }
+        state.zoom = zoom;
+        let (native_window, min_size) = (state.native_window, state.min_size);
+        // AppKit may grow the window to the new least size and tell the
+        // delegate at once, which takes this lock: not held meanwhile
+        drop(state);
+        if let Some(min_size) = min_size {
+            unsafe {
+                native_window.setContentMinSize_(NSSize {
+                    width: (min_size.width * zoom).to_f64(),
+                    height: (min_size.height * zoom).to_f64(),
+                });
+            }
+        }
+    }
+
     fn appearance(&self) -> WindowAppearance {
         unsafe {
             let appearance: id = msg_send![self.0.lock().native_window, effectiveAppearance];
@@ -1466,7 +1554,8 @@ impl PlatformWindow for MacWindow {
                 .native_window
                 .mouseLocationOutsideOfEventStream()
         };
-        convert_mouse_position(position, self.content_size().height)
+        let lock = self.0.lock();
+        convert_mouse_position(position, lock.view_size().height).map(|v| v / lock.zoom)
     }
 
     fn modifiers(&self) -> Modifiers {
@@ -2411,7 +2500,7 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
 
-    let window_height = lock.content_size().height;
+    let window_height = lock.view_size().height;
     let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
 
     let Some(event) = event else {
@@ -2552,7 +2641,8 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
     let window_state = unsafe { get_window_state(this) };
     let weak_window_state = Arc::downgrade(&window_state);
     let mut lock = window_state.as_ref().lock();
-    let window_height = lock.content_size().height;
+    let window_height = lock.view_size().height;
+    let zoom = lock.zoom;
     let native_event_type = unsafe { native_event.eventType() };
     match native_event_type {
         NSEventType::NSLeftMouseDown => {
@@ -2569,6 +2659,7 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
     let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
 
     if let Some(mut event) = event {
+        zoom_input(&mut event, zoom);
         // AppKit unhides the cursor on the next mouse movement; mirror that here.
         if matches!(
             event,
@@ -2780,8 +2871,10 @@ extern "C" fn window_did_move(this: &Object, _: Sel, _: id) {
 // Update the window scale factor and drawable size, and call the resize callback if any.
 fn update_window_scale_factor(window_state: &Arc<Mutex<MacWindowState>>) {
     let mut lock = window_state.as_ref().lock();
-    let scale_factor = lock.scale_factor();
-    let size = lock.content_size();
+    // the layer and the drawable are the view's points at the backing factor,
+    // the same whatever the zoom (elundqvist/kvist#563)
+    let scale_factor = lock.display_scale_factor();
+    let size = lock.view_size();
     let drawable_size = size.to_device_pixels(scale_factor);
     if let Some(layer) = lock.renderer.layer() {
         unsafe {
@@ -2966,8 +3059,9 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
         let _: () = msg_send![super(this, class!(NSView)), setFrameSize: size];
     }
 
-    let scale_factor = lock.scale_factor();
-    let drawable_size = new_size.to_device_pixels(scale_factor);
+    // `new_size` is in points: the drawable is at the backing factor, the
+    // zoom being gpui's layout only (elundqvist/kvist#563)
+    let drawable_size = new_size.to_device_pixels(lock.display_scale_factor());
     lock.renderer.update_drawable_size(drawable_size);
 
     if let Some(mut callback) = lock.resize_callback.take() {
@@ -3041,10 +3135,13 @@ extern "C" fn first_rect_for_character_range(
     _: id,
 ) -> NSRect {
     let frame = get_frame(this);
+    // gpui's pixels into the view's points (elundqvist/kvist#563)
+    let zoom = unsafe { get_window_state(this) }.lock().zoom;
     with_input_handler(this, |input_handler| {
         input_handler.bounds_for_range(range.to_range()?)
     })
     .flatten()
+    .map(|bounds| bounds.map(|v| v * zoom))
     .map_or(
         NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.)),
         |bounds| {
@@ -3395,7 +3492,8 @@ fn send_file_drop_event(
 
 fn drag_event_position(window_state: &Mutex<MacWindowState>, dragging_info: id) -> Point<Pixels> {
     let drag_location: NSPoint = unsafe { msg_send![dragging_info, draggingLocation] };
-    convert_mouse_position(drag_location, window_state.lock().content_size().height)
+    let lock = window_state.lock();
+    convert_mouse_position(drag_location, lock.view_size().height).map(|v| v / lock.zoom)
 }
 
 fn with_input_handler<F, R>(window: &Object, f: F) -> Option<R>
