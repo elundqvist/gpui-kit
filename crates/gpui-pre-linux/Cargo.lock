@@ -2053,6 +2053,7 @@ dependencies = [
  "gpui-pre-http-client",
  "gpui-pre-util",
  "gpui-pre-wgpu",
+ "image",
  "libc",
  "log",
  "notify-rust",
@@ -2176,8 +2177,6 @@ dependencies = [
 [[package]]
 name = "gpui-pre-wgpu"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "695c613099863bbf434ff896d196e3f55d4d5f59769dac99596e79dbb18a8aff"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2186,6 +2185,7 @@ dependencies = [
  "gpui-pre",
  "gpui-pre-collections",
  "gpui-pre-util",
+ "image",
  "itertools 0.14.0",
  "log",
  "parking_lot",
@@ -2194,6 +2194,7 @@ dependencies = [
  "smallvec",
  "swash",
  "unicode-bidi",
+ "unicode-properties",
  "unicode-segmentation",
  "web-sys",
  "wgpu",

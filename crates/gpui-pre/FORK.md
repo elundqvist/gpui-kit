@@ -152,6 +152,12 @@ asks (section 4(b)); each says so at its top:
   window's is. A test of a frame's layout at 1.5, 1.5 times the one at
   1.0, and back, with a root that fills the window drawn as wide as the
   window at either, and no frame asked for a zoom the window has.
+- `src/platform.rs` and `src/window.rs`: `PlatformWindow::render_to_image`
+  and `Window::render_to_image` are there in every build, not in a
+  `test-support` one alone, so an app can take a screenshot of its own
+  window (elundqvist/kvist#577): the frame last presented, drawn again
+  into a texture and read back, with nothing of a window above it. A
+  platform with no read back still says so, as before.
 
 ## Tests
 

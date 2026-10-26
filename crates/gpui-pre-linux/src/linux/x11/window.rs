@@ -2065,6 +2065,15 @@ impl PlatformWindow for X11Window {
         self.0.state.borrow().renderer.gpu_specs().into()
     }
 
+    fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
+        let mut state = self.0.state.borrow_mut();
+        anyhow::ensure!(
+            !state.renderer.device_lost(),
+            "the window's GPU device was lost"
+        );
+        state.renderer.render_to_image(scene)
+    }
+
     fn play_system_bell(&self) {
         // Volume 0% means don't increase or decrease from system volume
         let _ = self.0.xcb.bell(0);

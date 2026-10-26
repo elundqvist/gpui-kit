@@ -269,7 +269,14 @@ asks (section 4(b)); each says so at its top:
   patched to `crates/gpui-pre`, the fork's, whose `PlatformWindow` has
   `set_zoom` (elundqvist/kvist#563), which the X11 window implements:
   on the published gpui-pre the crate no longer builds. `Cargo.lock`
-  names it with no source too.
+  names it with no source too. And gpui-pre-wgpu is patched to
+  `crates/gpui-pre-wgpu`, the fork's, whose renderer reads a frame back
+  (elundqvist/kvist#577), with `image` for the image it returns.
+- `src/linux/x11/window.rs`: the X11 window implements
+  `PlatformWindow::render_to_image` with its renderer's read back, so an
+  app can take a screenshot of its own window, whatever is stacked over
+  it (elundqvist/kvist#577); a window whose GPU device was lost says so.
+  The Wayland window does not yet, and says it is not implemented.
 
 ## Trying a drag by hand
 
@@ -305,8 +312,10 @@ directory:
 
     cargo test --locked --lib
 
-It builds on `crates/gpui-pre`, the fork's, through the
-`[patch.crates-io]` in its `Cargo.toml` (the X11 window implements that
-crate's `PlatformWindow::set_zoom`), and on the other gpui-pre-* crates
-from crates.io, at the versions in its `Cargo.lock`. An application
+It builds on `crates/gpui-pre` and `crates/gpui-pre-wgpu`, the fork's,
+through the `[patch.crates-io]` in its `Cargo.toml` (the X11 window
+implements that crate's `PlatformWindow::set_zoom` and
+`render_to_image`, the latter with the fork's renderer), and on the
+other gpui-pre-* crates from crates.io, at the versions in its
+`Cargo.lock`. An application
 gets all of them through its own `[patch.crates-io]`, as Kvist does.

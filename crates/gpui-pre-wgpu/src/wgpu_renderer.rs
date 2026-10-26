@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre-wgpu 0.3.3 as published to crates.io: FORK.md at
+// the crate's root lists the changes.
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
@@ -5,6 +7,7 @@ use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
     ScaledPixels, Scene, Size, get_gamma_correction_ratios,
 };
+use image::RgbaImage;
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -1345,6 +1348,114 @@ impl WgpuRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        self.write_globals();
+
+        if let Err(error) = self.record_frame(scene, &frame_view) {
+            log::error!("{error:#}");
+            self.resources().queue.submit(std::iter::empty());
+            return false;
+        }
+
+        frame.present();
+        true
+    }
+
+    /// The scene drawn as `draw` draws it, into a texture of the surface's
+    /// size and format that is never presented, and read back: what the
+    /// window shows, and nothing of a window above it. Where the surface is
+    /// opaque, so is the image; where it takes premultiplied alpha, the
+    /// image's alpha is straight.
+    pub fn render_to_image(&mut self, scene: &Scene) -> Result<RgbaImage> {
+        anyhow::ensure!(
+            self.surface_configured && self.resources.is_some(),
+            "the window has no surface to draw into"
+        );
+        let format = self.surface_config.format;
+        let swap = match format {
+            wgpu::TextureFormat::Bgra8Unorm => true,
+            wgpu::TextureFormat::Rgba8Unorm => false,
+            other => anyhow::bail!("a surface of {other:?} is not read back"),
+        };
+        let alpha = match self.surface_config.alpha_mode {
+            wgpu::CompositeAlphaMode::Opaque => ReadAlpha::Opaque,
+            wgpu::CompositeAlphaMode::PreMultiplied => ReadAlpha::Premultiplied,
+            _ => ReadAlpha::Straight,
+        };
+        let (width, height) = (self.surface_config.width, self.surface_config.height);
+
+        self.atlas.before_frame();
+        self.ensure_intermediate_textures();
+        self.write_globals();
+
+        let device = self.resources().device.clone();
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("readback_target"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        self.record_frame(scene, &view)?;
+
+        let row = readback_row(width);
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback_buffer"),
+            size: u64::from(row) * u64::from(height),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("readback_encoder"),
+        });
+        encoder.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(height),
+                },
+            },
+            size,
+        );
+        let submitted = self
+            .resources()
+            .queue
+            .submit(std::iter::once(encoder.finish()));
+
+        let slice = buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |mapped| {
+            let _ = tx.send(mapped);
+        });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submitted),
+                timeout: Some(std::time::Duration::from_secs(5)),
+            })
+            .context("the frame read back did not finish")?;
+        rx.try_recv()
+            .context("the frame read back was not mapped")?
+            .context("the frame read back could not be mapped")?;
+        let pixels = {
+            let data = slice.get_mapped_range();
+            readback_pixels(&data, width, height, row, swap, alpha)
+        };
+        buffer.unmap();
+        RgbaImage::from_raw(width, height, pixels).context("the frame read back has the wrong size")
+    }
+
+    fn write_globals(&self) {
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
             grayscale_enhanced_contrast: self.rendering_params.grayscale_enhanced_contrast,
@@ -1373,33 +1484,20 @@ impl WgpuRenderer {
             ..globals
         };
 
-        {
-            let resources = self.resources();
-            resources.queue.write_buffer(
-                &resources.globals_buffer,
-                0,
-                bytemuck::bytes_of(&globals),
-            );
-            resources.queue.write_buffer(
-                &resources.globals_buffer,
-                self.path_globals_offset,
-                bytemuck::bytes_of(&path_globals),
-            );
-            resources.queue.write_buffer(
-                &resources.globals_buffer,
-                self.gamma_offset,
-                bytemuck::bytes_of(&gamma_params),
-            );
-        }
-
-        if let Err(error) = self.record_frame(scene, &frame_view) {
-            log::error!("{error:#}");
-            self.resources().queue.submit(std::iter::empty());
-            return false;
-        }
-
-        frame.present();
-        true
+        let resources = self.resources();
+        resources
+            .queue
+            .write_buffer(&resources.globals_buffer, 0, bytemuck::bytes_of(&globals));
+        resources.queue.write_buffer(
+            &resources.globals_buffer,
+            self.path_globals_offset,
+            bytemuck::bytes_of(&path_globals),
+        );
+        resources.queue.write_buffer(
+            &resources.globals_buffer,
+            self.gamma_offset,
+            bytemuck::bytes_of(&gamma_params),
+        );
     }
 
     fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
@@ -2133,6 +2231,59 @@ impl WgpuRenderer {
     }
 }
 
+/// What a surface's alpha means, for the pixels read back from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadAlpha {
+    /// The compositor ignores it: the image is opaque, as the window is.
+    Opaque,
+    /// The colours were multiplied by it, and are divided by it again.
+    Premultiplied,
+    Straight,
+}
+
+/// The bytes a row of `width` four-byte pixels takes in a buffer a texture
+/// is copied into, which wgpu has a multiple of 256.
+fn readback_row(width: u32) -> u32 {
+    (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+}
+
+/// The RGBA pixels of a texture copied into `data`, `row` bytes to a row,
+/// the padding at each row's end left out; `swap` where they are BGRA.
+fn readback_pixels(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    row: u32,
+    swap: bool,
+    alpha: ReadAlpha,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(width as usize * height as usize * 4);
+    for line in data.chunks(row as usize).take(height as usize) {
+        for px in line[..width as usize * 4].chunks_exact(4) {
+            let (r, g, b, a) = if swap {
+                (px[2], px[1], px[0], px[3])
+            } else {
+                (px[0], px[1], px[2], px[3])
+            };
+            match alpha {
+                ReadAlpha::Opaque => out.extend_from_slice(&[r, g, b, 255]),
+                ReadAlpha::Straight => out.extend_from_slice(&[r, g, b, a]),
+                ReadAlpha::Premultiplied => {
+                    let straight = |c: u8| {
+                        if a == 0 {
+                            0
+                        } else {
+                            ((u32::from(c) * 255 + u32::from(a) / 2) / u32::from(a)).min(255) as u8
+                        }
+                    };
+                    out.extend_from_slice(&[straight(r), straight(g), straight(b), a]);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn instance_range(range: Range<usize>) -> Range<u32> {
     range.start as u32..range.end as u32
 }
@@ -2202,6 +2353,43 @@ impl RenderingParameters {
 mod tests {
     use super::*;
     use gpui::{MonochromeSprite, PolychromeSprite, Quad, Shadow, SubpixelSprite, Underline};
+
+    #[test]
+    fn a_frame_read_back_loses_its_row_padding_and_is_rgba() {
+        let width = 2;
+        let row = readback_row(width);
+        assert_eq!(row, 256, "a row padded to wgpu's copy alignment");
+        let mut data = vec![0xEE; row as usize * 2];
+        data[..8].copy_from_slice(&[10, 20, 30, 255, 1, 2, 3, 0]);
+        data[row as usize..row as usize + 8].copy_from_slice(&[40, 50, 60, 128, 0, 0, 0, 0]);
+
+        let bgra = readback_pixels(&data, width, 2, row, true, ReadAlpha::Straight);
+        assert_eq!(
+            bgra,
+            [30, 20, 10, 255, 3, 2, 1, 0, 60, 50, 40, 128, 0, 0, 0, 0]
+        );
+        let rgba = readback_pixels(&data, width, 2, row, false, ReadAlpha::Straight);
+        assert_eq!(&rgba[..8], &[10, 20, 30, 255, 1, 2, 3, 0]);
+
+        let opaque = readback_pixels(&data, width, 2, row, false, ReadAlpha::Opaque);
+        assert!(
+            opaque.chunks(4).all(|p| p[3] == 255),
+            "an opaque surface's image is opaque"
+        );
+        assert_eq!(&opaque[4..8], &[1, 2, 3, 255]);
+
+        let straight = readback_pixels(&data, width, 2, row, false, ReadAlpha::Premultiplied);
+        assert_eq!(
+            &straight[8..12],
+            &[80, 100, 120, 128],
+            "premultiplied colours divided by their alpha"
+        );
+        assert_eq!(
+            &straight[12..16],
+            &[0, 0, 0, 0],
+            "and none where there is no alpha"
+        );
+    }
 
     #[test]
     fn webgl_shader_is_valid_wgsl_without_storage_buffers() {

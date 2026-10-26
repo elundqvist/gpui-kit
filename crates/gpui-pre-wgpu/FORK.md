@@ -74,6 +74,18 @@ asks (section 4(b)); a source file says so at its top:
   brings, as a dev-dependency with `wgsl-in`. The renderer's tests
   validate its shaders with it, and the published manifest, which
   leaves out zed's dev-dependencies, did not let them build.
+- `src/wgpu_renderer.rs`: `WgpuRenderer::render_to_image`, the scene
+  drawn as `draw` draws it into a texture of the surface's size and
+  format that is never presented, copied to a buffer and read back as
+  an RGBA image: what the window shows and nothing of a window above it
+  (elundqvist/kvist#577). The surface's own texture is not read, since a
+  surface need not offer `COPY_SRC`. A BGRA surface's pixels are
+  swapped, an opaque surface's image is opaque, and a premultiplied
+  one's colours are divided by their alpha; `draw` writes its globals
+  through the same `write_globals`. A test of the pixels read back, a
+  row's padding left out.
+- `Cargo.toml` and `Cargo.lock`: `image`, at the version gpui-pre
+  already brings, for the `RgbaImage` gpui's `render_to_image` returns.
 
 ## Tests
 
