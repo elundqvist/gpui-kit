@@ -83,7 +83,9 @@ asks (section 4(b)); a source file says so at its top:
   swapped, an opaque surface's image is opaque, and a premultiplied
   one's colours are divided by their alpha; `draw` writes its globals
   through the same `write_globals`. A test of the pixels read back, a
-  row's padding left out.
+  row's padding left out. A validation or out-of-memory error in what it
+  draws or copies is an error scope's, so the call returns it and the next
+  `draw` does not count it as a failed frame.
 - `Cargo.toml` and `Cargo.lock`: `image`, at the version gpui-pre
   already brings, for the `RgbaImage` gpui's `render_to_image` returns.
 

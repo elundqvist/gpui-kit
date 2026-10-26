@@ -1388,6 +1388,10 @@ impl WgpuRenderer {
         self.write_globals();
 
         let device = self.resources().device.clone();
+        // a validation or out-of-memory error in what is drawn here is this
+        // call's to return, not the next frame's to count as a failed one
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let size = wgpu::Extent3d {
             width,
             height,
@@ -1432,6 +1436,12 @@ impl WgpuRenderer {
             .resources()
             .queue
             .submit(std::iter::once(encoder.finish()));
+        if let Some(error) = gpui::block_on(memory.pop()) {
+            anyhow::bail!("the frame could not be read back: {error}");
+        }
+        if let Some(error) = gpui::block_on(validation.pop()) {
+            anyhow::bail!("the frame could not be read back: {error}");
+        }
 
         let slice = buffer.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
