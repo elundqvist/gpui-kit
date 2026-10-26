@@ -1518,6 +1518,8 @@ impl PlatformInputHandler {
     }
 
     pub fn replace_text_in_range(&mut self, replacement_range: Option<Range<usize>>, text: &str) {
+        let _input = crate::window::perf_spans()
+            .then(|| tracing::trace_span!(target: "gpui::perf", "input", kind = "text").entered());
         self.cx
             .update(|window, cx| {
                 let input = HeldInput::Text {
@@ -1537,6 +1539,9 @@ impl PlatformInputHandler {
         new_text: &str,
         new_selected_range: Option<Range<usize>>,
     ) {
+        let _input = crate::window::perf_spans().then(|| {
+            tracing::trace_span!(target: "gpui::perf", "input", kind = "compose").entered()
+        });
         self.cx
             .update(|window, cx| {
                 let input = HeldInput::MarkedText {

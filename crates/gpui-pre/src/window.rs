@@ -355,6 +355,16 @@ fn draw_in_progress() -> bool {
     CURRENT_ELEMENT_ARENA.with(|current| current.get().is_some())
 }
 
+/// Whether a tracing subscriber takes trace-level spans. A frame (one
+/// draw) with its layout and paint, a present, each input and each action
+/// handler is a span of target `gpui::perf` (elundqvist/kvist#578), made only
+/// then: with no subscriber, or one that takes less, each costs this one
+/// relaxed load and allocates nothing.
+#[inline]
+pub(crate) fn perf_spans() -> bool {
+    tracing::level_filters::LevelFilter::current() == tracing::level_filters::LevelFilter::TRACE
+}
+
 /// Allocates an element in the current arena. Uses the app-specific arena if one
 /// is active (during draw), otherwise falls back to the thread-local ELEMENT_ARENA.
 pub(crate) fn with_element_arena<R>(f: impl FnOnce(&mut Arena) -> R) -> R {
@@ -1951,6 +1961,11 @@ impl Window {
         platform_window.on_input({
             let mut cx = cx.to_async();
             Box::new(move |event| {
+                // the dispatch and the effects it flushes as it ends
+                let _input = perf_spans().then(|| {
+                    let kind = event.kind_name();
+                    tracing::trace_span!(target: "gpui::perf", "input", kind).entered()
+                });
                 handle
                     .update(&mut cx, |_, window, cx| window.dispatch_event(event, cx))
                     .log_err()
@@ -3202,6 +3217,13 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        // a frame is one draw, wherever it is made: in the frame request,
+        // or ahead of an input that finds the window dirty, inside that
+        // input's span. Its present is a span of its own.
+        let _frame = perf_spans().then(|| {
+            let window = self.handle.window_id().as_u64();
+            tracing::trace_span!(target: "gpui::perf", "frame", window).entered()
+        });
         // Drain every draw in profiler builds so a previous frame's
         // first-invalidation timestamp can't be attributed to this one.
         #[cfg(feature = "profiler")]
@@ -3378,6 +3400,8 @@ impl Window {
 
     #[profiling::function]
     fn present(&mut self) {
+        let _present =
+            perf_spans().then(|| tracing::trace_span!(target: "gpui::perf", "present").entered());
         #[cfg(feature = "profiler")]
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
@@ -3477,6 +3501,10 @@ impl Window {
         // stretches to fill the viewport unless explicitly sized, window roots
         // fill the window when their size is `auto`.
         let scale_factor = self.scale_factor();
+        // the views' render, their layout and prepaint, the deferred
+        // draws', the prompt's, the drag's and the tooltip's
+        let layout =
+            perf_spans().then(|| tracing::trace_span!(target: "gpui::perf", "layout").entered());
         let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
         let root_layout_id = root_element.request_layout(self, cx);
         self.layout_engine
@@ -3514,8 +3542,11 @@ impl Window {
         }
 
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
+        drop(layout);
 
         // Now actually paint the elements.
+        let _paint =
+            perf_spans().then(|| tracing::trace_span!(target: "gpui::perf", "paint").entered());
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
 
@@ -6454,6 +6485,9 @@ impl Window {
         action: &dyn Action,
         cx: &mut App,
     ) {
+        let _action = perf_spans().then(|| {
+            tracing::trace_span!(target: "gpui::perf", "action", name = action.name()).entered()
+        });
         self.dispatch_action_on_node_inner(node_id, action, cx);
 
         if !cx.propagate_event
@@ -9248,5 +9282,167 @@ mod zoom_tests {
         assert!(drawn(cx).contains(&(200., 100.)), "{:?}", drawn(cx));
         assert_eq!(cx.update(|window, _| window.viewport_size()), viewport);
         assert!(drawn(cx).contains(&window_px), "{:?} has no {window_px:?}", drawn(cx));
+    }
+}
+
+#[cfg(test)]
+mod perf_span_tests {
+    //! The spans a frame, an input and an action are for a tracing
+    //! subscriber that takes trace-level spans (elundqvist/kvist#578).
+    use crate::{
+        self as gpui, Context, FocusHandle, InteractiveElement as _, IntoElement, KeyDownEvent,
+        Keystroke, PlatformInput, Render, RequestFrameOptions, TestAppContext, Window, div,
+    };
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    actions!(perf_span_test, [Ping]);
+
+    /// The spans closed, in the order they closed, as `name` or
+    /// `name(field)` where the span has a `kind` or `name` field.
+    type Closed = Arc<Mutex<Vec<String>>>;
+
+    struct Collect {
+        next: AtomicU64,
+        open: Mutex<HashMap<u64, String>>,
+        closed: Closed,
+    }
+
+    struct Said(Option<String>);
+
+    impl Visit for Said {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "kind" || field.name() == "name" {
+                self.0 = Some(value.to_string());
+            }
+        }
+
+        fn record_debug(&mut self, _: &Field, _: &dyn std::fmt::Debug) {}
+    }
+
+    impl Subscriber for Collect {
+        fn enabled(&self, m: &Metadata<'_>) -> bool {
+            m.target() == "gpui::perf"
+        }
+
+        fn new_span(&self, a: &Attributes<'_>) -> Id {
+            let mut said = Said(None);
+            a.record(&mut said);
+            let name = a.metadata().name();
+            let label = said.0.map_or(name.to_string(), |s| format!("{name}({s})"));
+            let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+            self.open.lock().unwrap().insert(id, label);
+            Id::from_u64(id)
+        }
+
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn event(&self, _: &Event<'_>) {}
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+
+        fn try_close(&self, id: Id) -> bool {
+            if let Some(label) = self.open.lock().unwrap().remove(&id.into_u64()) {
+                self.closed.lock().unwrap().push(label);
+            }
+            true
+        }
+    }
+
+    struct Pinged {
+        focus: FocusHandle,
+    }
+
+    impl Render for Pinged {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .track_focus(&self.focus)
+                .on_action(|_: &Ping, _, _| {})
+        }
+    }
+
+    fn collect() -> (Collect, Closed) {
+        let closed = Closed::default();
+        (
+            Collect {
+                next: AtomicU64::new(0),
+                open: Mutex::default(),
+                closed: closed.clone(),
+            },
+            closed,
+        )
+    }
+
+    /// A frame is a draw, wherever it is made, with its layout and its
+    /// paint inside it, and its present a span of its own, after it or
+    /// alone; an action dispatched and a key pressed are spans named by
+    /// what they were, and a draw that comes ahead of a key is inside the
+    /// key's span.
+    #[gpui::test]
+    fn a_frame_an_input_and_an_action_are_spans_inside_what_they_belong_to(
+        cx: &mut TestAppContext,
+    ) {
+        let (sub, closed) = collect();
+        // a second dispatcher, so that a callsite the other tests' threads
+        // meet first is asked of every dispatcher: with a scoped one alone,
+        // tracing asks the default of the thread that meets it, theirs
+        // none, and keeps its never for this one too
+        let _other = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let _default = tracing::subscriber::set_default(sub);
+        let window = cx.add_window(|_, cx| Pinged {
+            focus: cx.focus_handle(),
+        });
+        let mut test_window = cx.test_window(window.into());
+        window
+            .update(cx, |v, window, cx| window.focus(&v.focus, cx))
+            .unwrap();
+        closed.lock().unwrap().clear();
+        test_window.simulate_frame_request(RequestFrameOptions {
+            require_presentation: false,
+            force_render: true,
+        });
+        assert_eq!(
+            *closed.lock().unwrap(),
+            ["layout", "paint", "frame", "present"]
+        );
+        closed.lock().unwrap().clear();
+        // nothing is dirty, and the frame is presented: a present alone
+        test_window.simulate_frame_request(RequestFrameOptions {
+            require_presentation: true,
+            force_render: false,
+        });
+        assert_eq!(*closed.lock().unwrap(), ["present"]);
+        closed.lock().unwrap().clear();
+        window
+            .update(cx, |_, window, cx| {
+                window.dispatch_action(Box::new(Ping), cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(*closed.lock().unwrap(), ["action(perf_span_test::Ping)"]);
+        closed.lock().unwrap().clear();
+        let key = KeyDownEvent {
+            keystroke: Keystroke::parse("x").unwrap(),
+            is_held: false,
+            prefer_character_input: false,
+        };
+        test_window.simulate_input(PlatformInput::KeyDown(key.clone()));
+        assert_eq!(
+            closed.lock().unwrap().last().map(String::as_str),
+            Some("input(key_down)")
+        );
+        // a window dirty when a key comes is drawn ahead of it, a frame
+        // inside the key's span that closes before it, with no present
+        closed.lock().unwrap().clear();
+        window.update(cx, |_, window, _| window.refresh()).unwrap();
+        test_window.simulate_input(PlatformInput::KeyDown(key));
+        assert_eq!(
+            *closed.lock().unwrap(),
+            ["layout", "paint", "frame", "input(key_down)"]
+        );
     }
 }

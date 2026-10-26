@@ -158,6 +158,23 @@ asks (section 4(b)); each says so at its top:
   window (elundqvist/kvist#577): the frame last presented, drawn again
   into a texture and read back, with nothing of a window above it. A
   platform with no read back still says so, as before.
+- `src/window.rs` and `src/platform.rs`: a frame, its layout and its
+  paint, its present, each input and each action handler are `tracing`
+  spans of target `gpui::perf` at trace level (elundqvist/kvist#578),
+  for an app that times what its drawing thread does: `frame` (its
+  `window`) around a draw (`Window::draw`), wherever it is made: in the
+  frame request, or ahead of an input that finds the window dirty, which
+  puts it inside that input's span; `layout` from the views' render
+  through their prepaint and the tooltip's, `paint` from there to the
+  scene's end, both inside the frame; `present`, a span of its own after
+  the frame or alone, where the renderer's submit and the swap chain's
+  wait are; `input` (its `kind`, as `PlatformInput::kind_name` names it,
+  `text` for text the input handler is handed and `compose` for a
+  composition) around an input's dispatch and the effects it flushes,
+  and `action` (its `name`) around an action's handlers. Each is made
+  only where tracing's max level is trace (`perf_spans`), so with no
+  subscriber, or one that takes less, a span's site costs one relaxed
+  load and allocates nothing. A test of the spans and their order.
 
 ## Tests
 
