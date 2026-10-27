@@ -1,6 +1,8 @@
 #[cfg(test)]
 use crate::highlighter::HighlightTheme;
+use crate::highlighter::LanguageConfig;
 use crate::highlighter::LanguageRegistry;
+use crate::highlighter::queries;
 
 use anyhow::{Context, Result, anyhow};
 use gpui::{HighlightStyle, SharedString};
@@ -86,7 +88,7 @@ thread_local! {
 #[allow(unused)]
 pub struct SyntaxHighlighter {
     language: SharedString,
-    query: Option<Query>,
+    query: Option<Arc<Query>>,
     /// The full injections query. This is used to build injection layers during parsing.
     injections_query: Option<Arc<Query>>,
     /// The kind of node each pattern of the injections query starts at
@@ -96,7 +98,7 @@ pub struct SyntaxHighlighter {
     locals_pattern_index: usize,
     highlights_pattern_index: usize,
     // highlight_indices: Vec<Option<Highlight>>,
-    non_local_variable_patterns: Vec<bool>,
+    non_local_variable_patterns: Arc<[bool]>,
     injection_content_capture_index: Option<u32>,
     injection_language_capture_index: Option<u32>,
     local_scope_capture_index: Option<u32>,
@@ -122,11 +124,27 @@ pub struct SyntaxHighlighter {
     layers_whole: bool,
     /// How long one injected span may parse in update().
     injection_parse_timeout: Duration,
+    /// An update with a time limit leaves a span whose language's highlight
+    /// query no one has compiled yet to the parse after the pause, and has
+    /// a thread compile it (`queries`): compiled there, a Rust fence took
+    /// 12 ms of the drawing thread and a Kotlin one 22, the open of a
+    /// Markdown file with fences 18 to 43 and the first key into a new
+    /// Rust fence 12 to 15 (elundqvist/kvist#593). Set by the editor's
+    /// adapter; a caller that has no parse after the pause compiles there.
+    defer_cold_queries: bool,
     /// `tree` was edited to the text but not parsed again, as it is while
     /// a large file waits for the background parse or a parse ran out of
     /// time: what the edits touched in it says nothing true about what is
     /// there now, and is left plain until a parse finishes.
     stale: bool,
+    /// `tree` is a tree a parse made from nothing that the next parse would
+    /// not reuse whole (`parsed_again_from_itself`), left to the parse after
+    /// the pause, which parses it again from itself, edited at its start
+    /// (`edited_at_its_start`), as the one that finds none does, and does
+    /// not do it on the drawing thread: it rebuilds every node of the text
+    /// (elundqvist/kvist#593). Cleared by any parse of a tree made from an
+    /// edit, which is one the next parse does reuse.
+    again_pending: bool,
     /// Where the edits since the last finished parse lie in the text. A
     /// node an edit lands in has changes, but so has the first node after
     /// an edit in the space before it, which the edit did not touch: only
@@ -246,6 +264,10 @@ pub(crate) struct InjectionParseData {
     /// have `parse_timeout` between them, not each: they are made on the UI
     /// thread, by an update with a time limit.
     pub(crate) paragraphs_share_timeout: bool,
+    /// A span whose language's highlight query is not compiled yet is not
+    /// parsed: the parse is not finished, and a thread compiles the query,
+    /// for the parse after the pause (`SyntaxHighlighter::defer_cold_queries`).
+    pub(crate) defer_cold_queries: bool,
 }
 
 pub(crate) struct ReusableInjectionLayer {
@@ -320,6 +342,7 @@ impl InjectionParseSource {
             roots: self.roots,
             reach: None,
             paragraphs_share_timeout: false,
+            defer_cold_queries: false,
         }
     }
 }
@@ -483,7 +506,7 @@ fn normalize_combined_injection_ranges(
 /// `is_pattern_rooted`): `((comment) @injection.content . (function))`
 /// is two nodes side by side, and the match hangs on the second, outside
 /// the first, which holds every capture.
-fn pattern_root_kinds(query: &Query, source: &str) -> Vec<Option<SharedString>> {
+pub(super) fn pattern_root_kinds(query: &Query, source: &str) -> Vec<Option<SharedString>> {
     (0..query.pattern_count())
         .map(|i| {
             if !query.is_pattern_rooted(i) {
@@ -547,11 +570,14 @@ fn match_range(
 /// (elundqvist/kvist#593). The parse again builds those nodes as a
 /// parse after an edit builds them, and the tree is one the next key's
 /// parse reuses; it takes a quarter to three quarters of what the first
-/// parse took. Other grammars reuse a tree made from nothing as they
-/// reuse any: Rust's first key costs what its second does, and so do
-/// those of HTML, JavaScript, Python, YAML and the rest but Java and PHP,
-/// whose first key in 30 KB takes 73 and 112 steps where it takes 20 and
-/// 71 after the parse again, too little to parse them again for.
+/// parse took, and a call with a time limit leaves it to the parse after
+/// the pause, off the drawing thread
+/// (`SyntaxHighlighter::again_pending`). Other grammars reuse a tree made
+/// from nothing as they reuse any: Rust's first key costs what its
+/// second does, and so do those of HTML, JavaScript, Python, YAML and the
+/// rest but Java and PHP, whose first key in 30 KB takes 73 and 112 steps
+/// where it takes 20 and 71 after the parse again, too little to parse
+/// them again for.
 pub(crate) fn parsed_again_from_itself(grammar: &tree_sitter::Language) -> bool {
     is_markdown_blocks(grammar)
 }
@@ -762,7 +788,7 @@ impl SyntaxHighlighter {
             injection_roots: Arc::from([]),
             locals_pattern_index: 0,
             highlights_pattern_index: 0,
-            non_local_variable_patterns: Vec::new(),
+            non_local_variable_patterns: Arc::from([]),
             injection_content_capture_index: None,
             injection_language_capture_index: None,
             local_scope_capture_index: None,
@@ -775,16 +801,17 @@ impl SyntaxHighlighter {
             injection_layers: Arc::default(),
             layers_whole: false,
             injection_parse_timeout: INJECTION_PARSE_TIMEOUT,
+            defer_cold_queries: false,
             stale: false,
+            again_pending: false,
             edited: Vec::new(),
             anew: false,
             coloured_to: None,
         }
     }
 
-    /// Build the highlighter for the given language.
-    ///
-    /// https://github.com/tree-sitter/tree-sitter/blob/v0.26.8/crates/highlight/src/highlight.rs#L339
+    /// Build the highlighter for the given language, from the queries the
+    /// process keeps for it (`queries`), compiled where it is the first.
     fn build_for_language(lang: &str) -> Result<Self> {
         let Some(config) = LanguageRegistry::singleton().language(&lang) else {
             return Err(anyhow!(
@@ -802,111 +829,31 @@ impl SyntaxHighlighter {
         let mut parser = Parser::new();
         parser.set_language(grammar).context("parse set_language")?;
 
-        // Concatenate the query strings, keeping track of the start offset of each section.
-        let mut query_source = String::new();
-        query_source.push_str(&config.injections);
-        let locals_query_offset = query_source.len();
-        query_source.push_str(&config.locals);
-        let highlights_query_offset = query_source.len();
-        query_source.push_str(&config.highlights);
-
-        // Construct a single query by concatenating the three query strings, but record the
-        // range of pattern indices that belong to each individual string.
-        let mut query = Query::new(grammar, &query_source).context("new query")?;
-
-        let mut locals_pattern_index = 0;
-        let mut highlights_pattern_index = 0;
-        for i in 0..(query.pattern_count()) {
-            let pattern_offset = query.start_byte_for_pattern(i);
-            if pattern_offset < highlights_query_offset {
-                if pattern_offset < highlights_query_offset {
-                    highlights_pattern_index += 1;
-                }
-                if pattern_offset < locals_query_offset {
-                    locals_pattern_index += 1;
-                }
-            }
-        }
-
-        let injections_query = if !config.injections.is_empty() {
-            Query::new(grammar, &config.injections).ok().map(Arc::new)
-        } else {
-            None
-        };
-        let injection_roots = injections_query
-            .as_ref()
-            .map_or_else(Vec::new, |q| pattern_root_kinds(q, &config.injections))
-            .into();
-
-        // Injection layers are computed separately during parsing, so do not
-        // emit injection captures from the main highlight query.
-        for pattern_index in 0..locals_pattern_index {
-            query.disable_pattern(pattern_index);
-        }
-
-        // Find all of the highlighting patterns that are disabled for nodes that
-        // have been identified as local variables.
-        let non_local_variable_patterns = (0..query.pattern_count())
-            .map(|i| {
-                query
-                    .property_predicates(i)
-                    .iter()
-                    .any(|(prop, positive)| !*positive && prop.key.as_ref() == "local")
-            })
-            .collect();
-
-        // Store the numeric ids for all of the special captures.
-        let injection_content_capture_index = injections_query.as_ref().and_then(|q| {
-            q.capture_names()
-                .iter()
-                .position(|name| *name == "injection.content")
-                .map(|i| i as u32)
-        });
-        let injection_language_capture_index = injections_query.as_ref().and_then(|q| {
-            q.capture_names()
-                .iter()
-                .position(|name| *name == "injection.language")
-                .map(|i| i as u32)
-        });
-        let mut local_def_capture_index = None;
-        let mut local_def_value_capture_index = None;
-        let mut local_ref_capture_index = None;
-        let mut local_scope_capture_index = None;
-        for (i, name) in query.capture_names().iter().enumerate() {
-            let i = Some(i as u32);
-            match *name {
-                "local.definition" => local_def_capture_index = i,
-                "local.definition-value" => local_def_value_capture_index = i,
-                "local.reference" => local_ref_capture_index = i,
-                "local.scope" => local_scope_capture_index = i,
-                _ => {}
-            }
-        }
-
-        // let highlight_indices = vec![None; query.capture_names().len()];
-
+        let queries = queries::host(&config)?;
         Ok(Self {
             language: config.name.clone(),
-            query: Some(query),
-            injections_query,
-            injection_roots,
+            query: Some(queries.query.clone()),
+            injections_query: queries.injections_query.clone(),
+            injection_roots: queries.injection_roots.clone(),
 
-            locals_pattern_index,
-            highlights_pattern_index,
-            non_local_variable_patterns,
-            injection_content_capture_index,
-            injection_language_capture_index,
-            local_scope_capture_index,
-            local_def_capture_index,
-            local_def_value_capture_index,
-            local_ref_capture_index,
+            locals_pattern_index: queries.locals_pattern_index,
+            highlights_pattern_index: queries.highlights_pattern_index,
+            non_local_variable_patterns: queries.non_local_variable_patterns.clone(),
+            injection_content_capture_index: queries.injection_content_capture_index,
+            injection_language_capture_index: queries.injection_language_capture_index,
+            local_scope_capture_index: queries.local_scope_capture_index,
+            local_def_capture_index: queries.local_def_capture_index,
+            local_def_value_capture_index: queries.local_def_value_capture_index,
+            local_ref_capture_index: queries.local_ref_capture_index,
             text: Rope::new(),
             parser,
             tree: None,
             injection_layers: Arc::default(),
             layers_whole: false,
             injection_parse_timeout: INJECTION_PARSE_TIMEOUT,
+            defer_cold_queries: false,
             stale: false,
+            again_pending: false,
             edited: Vec::new(),
             anew: false,
             coloured_to: None,
@@ -929,6 +876,21 @@ impl SyntaxHighlighter {
     /// from.
     pub(crate) fn tree_of_text(&self) -> Option<&Tree> {
         self.tree.as_ref().filter(|_| !self.anew)
+    }
+
+    /// Whether `tree_of_text` is a tree a parse made from nothing that the
+    /// next parse would not reuse whole, which the parse after the pause
+    /// is to parse again from itself, edited at its start
+    /// (`edited_at_its_start`) rather than from as it is.
+    pub(crate) fn again_pending(&self) -> bool {
+        self.again_pending && !self.anew
+    }
+
+    /// Leave a span whose language's highlight query no one has compiled
+    /// to the parse after the pause, by an update with a time limit
+    /// (`defer_cold_queries`).
+    pub(crate) fn defer_cold_queries(&mut self) {
+        self.defer_cold_queries = true;
     }
 
     /// Take `text`, made anew, a paste over all of the old, and keep the
@@ -1008,6 +970,7 @@ impl SyntaxHighlighter {
                 self.layers_whole = false;
                 self.edited.clear();
                 self.anew = false;
+                self.again_pending = false;
                 self.coloured_to = None;
             }
         }
@@ -1333,6 +1296,7 @@ impl SyntaxHighlighter {
     /// editor's text or language was replaced.
     pub(crate) fn take_parse(&mut self) -> (Parse, usize) {
         self.anew = false;
+        self.again_pending = false;
         self.coloured_to = None;
         let parse = Parse {
             tree: self.tree.take(),
@@ -1354,7 +1318,11 @@ impl SyntaxHighlighter {
     /// finishes it.
     /// With a `timeout`, a key typed in a line of a Markdown fence moves the
     /// host's tree and parses the fence's layer alone, and returns `false`
-    /// for the host's parse after the pause (`in_a_fence_line`).
+    /// for the host's parse after the pause (`in_a_fence_line`). It returns
+    /// `false` too for a Markdown tree made from nothing, which the parse
+    /// after the pause parses again from itself (`again_pending`), and for a
+    /// span whose language's highlight query no one has compiled, where the
+    /// highlighter defers those (`defer_cold_queries`).
     /// When `timeout` is `None`, parsing runs to completion and always returns `true`.
     pub fn update(
         &mut self,
@@ -1376,9 +1344,11 @@ impl SyntaxHighlighter {
         timeout: Option<Duration>,
     ) -> bool {
         // the trees kept through a text made anew are not of it, however
-        // alike the texts
+        // alike the texts; and a text whose parse is the pause's still
+        // (a tree edited and not parsed, one halted, one it is to parse
+        // again) is the pause's, which this call does not cancel
         if self.text.eq(text) && !self.anew {
-            return true;
+            return timeout.is_none() || !(self.stale || self.again_pending);
         }
 
         // If there's no grammar for the language, just update the text.
@@ -1514,7 +1484,7 @@ impl SyntaxHighlighter {
                 // nothing, and the parse that finishes this one is to
                 // start from nothing, so that a tree it would not reuse
                 // is parsed again from itself
-                None if from_nothing => {}
+                None if from_nothing => self.again_pending = false,
                 None => self.tree = Some(old_tree),
             }
             self.text = text.clone();
@@ -1523,38 +1493,38 @@ impl SyntaxHighlighter {
         }
 
         let mut new_tree = new_tree.unwrap();
-        // a tree made from nothing that the next parse would not reuse is
-        // parsed again from itself, edited at its start, in what is left
-        // of the time limit; one that runs out of it is left as it is
+        // A tree made from nothing that the next parse would not reuse
+        // is parsed again from itself, edited at its start
+        // (`parsed_again_from_itself`), and that rebuilds every node of
+        // the text, a quarter to three quarters of the whole parse: not on
+        // the drawing thread, where it ran out of its time and left the
+        // tree as it was, for every key after it to build again, and took
+        // the open's frame longer where it did not. A call with a time
+        // limit has the parse after the pause do it (`again_pending`); one
+        // without has no other.
+        let mut again_pending = false;
         if from_nothing && parsed_again_from_itself(&new_tree.language()) {
-            let mut out_of_time = false;
-            let mut progress = |_: &tree_sitter::ParseState| -> ControlFlow<()> {
-                match timeout {
-                    Some(budget) if start.elapsed() > budget => {
-                        out_of_time = true;
-                        ControlFlow::Break(())
-                    }
-                    _ => ControlFlow::Continue(()),
+            if timeout.is_some() {
+                again_pending = true;
+            } else {
+                let again = self.parser.parse_with_options(
+                    &mut move |offset, _| {
+                        if offset >= text.len() {
+                            ""
+                        } else {
+                            let (chunk, chunk_byte_ix) = text.chunk(offset);
+                            &chunk[offset - chunk_byte_ix..]
+                        }
+                    },
+                    Some(&edited_at_its_start(&new_tree)),
+                    None,
+                );
+                if let Some(again) = again {
+                    new_tree = again;
                 }
-            };
-            let options = ParseOptions::new().progress_callback(&mut progress);
-            let again = self.parser.parse_with_options(
-                &mut move |offset, _| {
-                    if offset >= text.len() {
-                        ""
-                    } else {
-                        let (chunk, chunk_byte_ix) = text.chunk(offset);
-                        &chunk[offset - chunk_byte_ix..]
-                    }
-                },
-                Some(&edited_at_its_start(&new_tree)),
-                Some(options),
-            );
-            match again {
-                Some(again) if !out_of_time => new_tree = again,
-                _ => self.parser.reset(),
             }
         }
+        self.again_pending = again_pending;
         self.tree = Some(new_tree.clone());
         self.anew = false;
         self.coloured_to = None;
@@ -1567,7 +1537,7 @@ impl SyntaxHighlighter {
             self.edited.clear();
         }
         // Only a caller with a time limit parses again in the background.
-        injections_finished || timeout.is_none()
+        (injections_finished && !again_pending) || timeout.is_none()
     }
 
     /// What the edits since the last finished parse reach in `new_tree`,
@@ -1782,28 +1752,51 @@ impl SyntaxHighlighter {
             key
         }
 
+        /// What a language name a span asks for comes to.
+        #[derive(Clone)]
+        enum Resolved {
+            /// The language, by its own name, and its highlight query.
+            Ready(SharedString, Arc<Query>),
+            /// A language whose query no one has compiled, which this
+            /// update leaves to the parse after the pause
+            /// (`InjectionParseData::defer_cold_queries`).
+            Cold,
+            Unknown,
+        }
+
         fn resolve_language(
             language_name: &str,
             query_cache: &mut HashMap<SharedString, Arc<Query>>,
-        ) -> Option<(SharedString, Arc<Query>)> {
-            let config = LanguageRegistry::singleton().language(language_name)?;
+            defer_cold: bool,
+            cold: &mut Vec<LanguageConfig>,
+        ) -> Resolved {
+            let Some(config) = LanguageRegistry::singleton().language(language_name) else {
+                return Resolved::Unknown;
+            };
             if let Some(query) = query_cache.get(&config.name) {
-                return Some((config.name, query.clone()));
+                return Resolved::Ready(config.name, query.clone());
             }
-
-            let query = match Query::new(config.language.as_ref()?, &config.highlights) {
-                Ok(query) => Arc::new(query),
-                Err(error) => {
-                    tracing::error!(
-                        "failed to build injection query for {:?}: {:?}",
-                        config.name,
-                        error
-                    );
-                    return None;
+            if config.language.is_none() {
+                return Resolved::Unknown;
+            }
+            // a paragraph's language is every document's, and takes some
+            // 0.5 ms
+            let compiled = if defer_cold && !injection_spans_are_paragraphs(&config.name) {
+                match queries::injected_if_compiled(&config) {
+                    Some(compiled) => compiled,
+                    None => {
+                        cold.push(config);
+                        return Resolved::Cold;
+                    }
                 }
+            } else {
+                queries::injected(&config)
+            };
+            let Some(query) = compiled else {
+                return Resolved::Unknown;
             };
             query_cache.insert(config.name.clone(), query.clone());
-            Some((config.name, query))
+            Resolved::Ready(config.name, query)
         }
 
         let root_node = tree.root_node();
@@ -1889,8 +1882,8 @@ impl SyntaxHighlighter {
         }
         // Cache raw names as well as canonical queries. Otherwise every fence with the
         // same info string would lock the registry and clone its language configuration.
-        let mut resolved_languages: HashMap<SharedString, Option<(SharedString, Arc<Query>)>> =
-            HashMap::new();
+        let mut resolved_languages: HashMap<SharedString, Resolved> = HashMap::new();
+        let mut cold_languages = Vec::new();
         let mut new_layers = Vec::new();
         let mut non_combined_parses = 0usize;
         while let Some(query_match) = matches.next() {
@@ -1937,12 +1930,22 @@ impl SyntaxHighlighter {
                 if let Some(resolved) = resolved_languages.get(&raw_language_name) {
                     resolved.clone()
                 } else {
-                    let resolved = resolve_language(&raw_language_name, &mut highlight_queries);
+                    let resolved = resolve_language(
+                        &raw_language_name,
+                        &mut highlight_queries,
+                        data.defer_cold_queries,
+                        &mut cold_languages,
+                    );
                     resolved_languages.insert(raw_language_name, resolved.clone());
                     resolved
                 };
-            let Some((language_name, highlight_query)) = resolved_language else {
-                continue;
+            let (language_name, highlight_query) = match resolved_language {
+                Resolved::Ready(name, query) => (name, query),
+                Resolved::Cold => {
+                    finished = false;
+                    continue;
+                }
+                Resolved::Unknown => continue,
             };
 
             let mut ranges = query_match
@@ -2068,6 +2071,9 @@ impl SyntaxHighlighter {
                 new_layers.push(layer);
             }
         }
+        if !cold_languages.is_empty() {
+            queries::compile_in_background(cold_languages);
+        }
         new_layers.sort_by_key(|layer| layer.byte_range.start);
         (new_layers, finished, non_combined_parses)
     }
@@ -2185,6 +2191,7 @@ impl SyntaxHighlighter {
             ),
         };
         self.stale = false;
+        self.again_pending = false;
         self.layers_whole = true;
         self.edited.clear();
         // the trees are of the text now: a key's parse starts from them,
@@ -2231,6 +2238,7 @@ impl SyntaxHighlighter {
             roots: self.injection_roots.clone(),
             reach,
             paragraphs_share_timeout: timed,
+            defer_cold_queries: self.defer_cold_queries && timed,
         };
         let (layers, finished) = Self::compute_injection_layers(data, tree, &self.text.clone());
         self.injection_layers = Arc::new(layers);
@@ -3320,6 +3328,220 @@ console.log(answer);
             .split_once("---\n\n")
             .map_or(readme, |(_, rest)| rest)
             .to_string()
+    }
+
+    /// A language of a name of its own, `name`, that is Rust's grammar and
+    /// highlights, and that no other test has met: nothing has compiled its
+    /// queries.
+    #[cfg(feature = "tree-sitter-languages")]
+    pub(crate) fn register_rust_as(name: &str) {
+        let rust = LanguageRegistry::singleton().language("rust").unwrap();
+        let config = LanguageConfig::new(
+            name,
+            rust.language.clone().unwrap(),
+            vec![],
+            &rust.highlights,
+            "",
+            "",
+        );
+        LanguageRegistry::singleton().register(name, &config);
+    }
+
+    /// Wait for the thread that compiles `name`'s highlight query as an
+    /// injected language (`queries::compile_in_background`).
+    #[cfg(feature = "tree-sitter-languages")]
+    pub(crate) fn wait_until_compiled(name: &str) {
+        let config = LanguageRegistry::singleton().language(name).unwrap();
+        let began = Instant::now();
+        while queries::injected_if_compiled(&config).is_none() {
+            assert!(began.elapsed() < Duration::from_secs(60), "{name} was not compiled");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn layer_languages(highlighter: &SyntaxHighlighter) -> Vec<String> {
+        highlighter
+            .injection_layers
+            .iter()
+            .map(|layer| layer.language_name.to_string())
+            .collect()
+    }
+
+    /// A fence of a language no one has compiled the highlight query of is
+    /// left to the parse after the pause by an update with a time limit,
+    /// whose thread compiles the query: compiled in the update, a Rust
+    /// fence took 12 ms of the drawing thread and a Kotlin one 22, the
+    /// open of a Markdown file with three fences 18 and the first key into
+    /// a new Rust fence 12 to 15 (elundqvist/kvist#593). The paragraphs'
+    /// language, every document's, is not left; and once compiled, the
+    /// query is every highlighter's, the fence parsed in the first update
+    /// of one that is made after.
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_a_fence_of_a_language_no_one_has_compiled_is_left_to_the_parse_after_the_pause() {
+        let name = "kvist-test-cold-fence";
+        register_rust_as(name);
+        let text = format!(
+            "# Title\n\nA paragraph with *emphasis*.\n\n```{name}\nfn f() {{}}\n```\n"
+        );
+        let rope = Rope::from_str(&text);
+        let limit = Some(Duration::from_secs(60));
+        let mut highlighter = SyntaxHighlighter::new("markdown");
+        highlighter.defer_cold_queries();
+        assert!(!highlighter.update(None, &rope, limit));
+        assert!(!highlighter.layers_whole, "the fence is not parsed");
+        let layers = layer_languages(&highlighter);
+        assert!(layers.iter().any(|name| name == "markdown_inline"), "{layers:?}");
+        assert!(!layers.iter().any(|layer| layer == name), "{layers:?}");
+
+        // the parse after the pause, off the drawing thread, has it
+        // compiled by then or compiles it itself
+        let data = InjectionParseData {
+            parse_timeout: None,
+            ..highlighter.injection_parse_data().unwrap()
+        };
+        let tree = highlighter.tree().unwrap().clone();
+        let (found, finished) = SyntaxHighlighter::compute_injection_layers(data, &tree, &rope);
+        assert!(finished);
+        assert!(found.iter().any(|layer| layer.language_name == name));
+
+        // and every highlighter after it finds it
+        wait_until_compiled(name);
+        let mut next = SyntaxHighlighter::new("markdown");
+        next.defer_cold_queries();
+        next.update(None, &rope, limit);
+        assert!(layer_languages(&next).iter().any(|layer| layer == name));
+        assert!(next.layers_whole);
+    }
+
+    /// A caller with no parse after the pause, and the parse that is one,
+    /// compile the queries they need where they are.
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_a_parse_with_no_pause_after_it_compiles_the_queries_it_needs() {
+        let name = "kvist-test-compiled-here";
+        register_rust_as(name);
+        let text = format!("# Title\n\n```{name}\nfn f() {{}}\n```\n");
+        let mut highlighter = SyntaxHighlighter::new("markdown");
+        highlighter.update(None, &Rope::from_str(&text), Some(Duration::from_secs(60)));
+        assert!(layer_languages(&highlighter).iter().any(|layer| layer == name));
+        assert!(highlighter.layers_whole);
+    }
+
+    /// The queries of a language are compiled once for all its
+    /// highlighters, and again where the language is registered again
+    /// under its name with other sources.
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_the_queries_of_a_language_are_made_once_for_every_highlighter() {
+        let name = "kvist-test-queries";
+        let rust = LanguageRegistry::singleton().language("rust").unwrap();
+        let grammar = rust.language.clone().unwrap();
+        let register = |highlights: &str| {
+            LanguageRegistry::singleton()
+                .register(name, &LanguageConfig::new(name, grammar.clone(), vec![], highlights, "", ""));
+        };
+        register("(identifier) @variable");
+        let (first, second) = (SyntaxHighlighter::new(name), SyntaxHighlighter::new(name));
+        let (first, second) = (first.query.unwrap(), second.query.unwrap());
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.pattern_count(), 1);
+        register("(identifier) @variable\n(type_identifier) @type");
+        let third = SyntaxHighlighter::new(name).query.unwrap();
+        assert!(!Arc::ptr_eq(&first, &third));
+        assert_eq!(third.pattern_count(), 2);
+        // as one registered under another name is not
+        let again = SyntaxHighlighter::new("rust").query.unwrap();
+        assert!(!Arc::ptr_eq(&again, &third));
+    }
+
+    /// A text handed again while its parse is the pause's, a parse that ran
+    /// out of its time or a tree to be parsed again, is the pause's still:
+    /// said done, it cancelled the parse after the pause, and the text
+    /// stood without a tree, or with one the first key would build again.
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_a_text_handed_again_while_its_parse_is_the_pauses_is_not_done() {
+        let rope = Rope::from_str(&readme(60));
+        let mut highlighter = SyntaxHighlighter::new("markdown");
+        assert!(!highlighter.update(None, &rope, Some(Duration::ZERO)), "out of its time");
+        assert!(highlighter.tree().is_none());
+        assert!(!highlighter.update(None, &rope, Some(Duration::ZERO)), "the pause's still");
+
+        let mut highlighter = SyntaxHighlighter::new("markdown");
+        assert!(!highlighter.update(None, &rope, Some(Duration::from_secs(60))));
+        assert!(highlighter.again_pending());
+        assert!(!highlighter.update(None, &rope, Some(Duration::from_secs(60))), "the pause's still");
+
+        // parsed, it is done
+        let mut highlighter = SyntaxHighlighter::new("markdown");
+        assert!(highlighter.update(None, &rope, None));
+        assert!(highlighter.update(None, &rope, Some(Duration::ZERO)));
+    }
+
+    /// A Markdown tree made from nothing at the key, where the parse again
+    /// from itself would rebuild every node of the text on the drawing
+    /// thread, is left to the parse after the pause, which makes the tree
+    /// the next key's parse reuses: parsed again on the drawing thread it
+    /// ran out of its time, and where it did, was never parsed again
+    /// (elundqvist/kvist#593).
+    #[test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_a_markdown_tree_made_at_the_key_is_parsed_again_by_the_parse_after_the_pause() {
+        let text = without_front_matter(&readme(30));
+        let rope = Rope::from_str(&text);
+        let config = LanguageRegistry::singleton().language("markdown").unwrap();
+        let mut parser = Parser::new();
+        parser.set_language(config.language.as_ref().unwrap()).unwrap();
+        let fresh = parser.parse(&text, None).unwrap();
+        let from_fresh = key_steps(&mut parser, &fresh, &text);
+        let limit = Some(Duration::from_secs(60));
+
+        let mut highlighter = SyntaxHighlighter::new("markdown");
+        assert!(!highlighter.update(None, &rope, limit), "left to the parse after the pause");
+        assert!(highlighter.again_pending());
+        let kept = highlighter.tree().unwrap().clone();
+        let from_kept = key_steps(&mut parser, &kept, &text);
+        assert!(from_kept * 2 > from_fresh, "{from_kept} steps from the tree, {from_fresh} from a fresh one");
+
+        // the parse after the pause, as the editor's makes it
+        let again = parser
+            .parse(&text, Some(&edited_at_its_start(highlighter.tree_of_text().unwrap())))
+            .unwrap();
+        assert!(highlighter.apply_background_tree(again, &rope, Vec::new()).is_none());
+        assert!(!highlighter.again_pending());
+        let again = highlighter.tree().unwrap().clone();
+        let from_again = key_steps(&mut parser, &again, &text);
+        assert!(from_again * 10 < from_fresh, "{from_again} steps, {from_fresh} from a fresh tree");
+
+        // a key's parse before the pause parses from it as it is, and
+        // what it makes is a tree the next key reuses
+        let mut highlighter = SyntaxHighlighter::new("markdown");
+        highlighter.update(None, &rope, limit);
+        let at = text.find("Paragraph 3 says").unwrap();
+        let mut typed = text.clone();
+        typed.insert(at, 'x');
+        let point = |text: &str, at: usize| {
+            let row = text[..at].matches('\n').count();
+            Point::new(row, at - text[..at].rfind('\n').map_or(0, |n| n + 1))
+        };
+        let edit = InputEdit {
+            start_byte: at,
+            old_end_byte: at,
+            new_end_byte: at + 1,
+            start_position: point(&text, at),
+            old_end_position: point(&text, at),
+            new_end_position: point(&typed, at + 1),
+        };
+        highlighter.update(Some(edit), &Rope::from_str(&typed), limit);
+        assert!(!highlighter.again_pending());
+        let after_a_key = highlighter.tree().unwrap().clone();
+        assert!(key_steps(&mut parser, &after_a_key, &typed) * 10 < from_fresh);
+
+        // with no time limit, there is no parse after the pause
+        let mut highlighter = SyntaxHighlighter::new("markdown");
+        assert!(highlighter.update(None, &rope, None));
+        assert!(!highlighter.again_pending());
     }
 
     /// A key typed after a whole parse that ran out of its time, before

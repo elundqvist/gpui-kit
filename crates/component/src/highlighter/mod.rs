@@ -22,6 +22,8 @@ mod highlighter;
 #[cfg(feature = "tree-sitter")]
 mod languages;
 #[cfg(feature = "tree-sitter")]
+mod queries;
+#[cfg(feature = "tree-sitter")]
 mod registry;
 
 #[cfg(feature = "tree-sitter")]

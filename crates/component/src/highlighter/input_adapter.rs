@@ -89,8 +89,12 @@ impl Drop for TreeSitterInputHighlighter {
 
 impl TreeSitterInputHighlighter {
     fn new(language: &str) -> Self {
+        let mut highlighter = SyntaxHighlighter::new(language);
+        // a fence's language that no one has compiled the query of is
+        // compiled on a thread, not at the key (elundqvist/kvist#593)
+        highlighter.defer_cold_queries();
         Self {
-            inner: Rc::new(RefCell::new(SyntaxHighlighter::new(language))),
+            inner: Rc::new(RefCell::new(highlighter)),
             parse_task: Rc::new(RefCell::new(None)),
             slow: Rc::new(Cell::new(false)),
         }
@@ -248,9 +252,13 @@ impl TreeSitterInputHighlighter {
             // to move them, and the tree's nodes it went through, a list of
             // 3,000 items' 3,000 children with them (elundqvist/kvist#376).
             // Trees kept from a text made anew are no start for its parse.
-            let (old_tree, injection_source) = {
+            let (old_tree, injection_source, again) = {
                 let highlighter = highlighter.borrow();
-                (highlighter.tree_of_text().cloned(), highlighter.injection_parse_source())
+                (
+                    highlighter.tree_of_text().cloned(),
+                    highlighter.injection_parse_source(),
+                    highlighter.again_pending(),
+                )
             };
 
             let parse_cancel = cancel.clone();
@@ -286,13 +294,23 @@ impl TreeSitterInputHighlighter {
                         }
                     };
                     let options = ParseOptions::new().progress_callback(&mut progress);
-                    let mut tree =
-                        parser.parse_with_options(&mut read, old_tree.as_ref(), Some(options))?;
                     // a tree made from nothing that the next parse would
-                    // not reuse is parsed again from itself, edited at its
-                    // start, here, so the first key after a README opens
-                    // does not build all of it again on the drawing thread
-                    // (elundqvist/kvist#376, #593)
+                    // not reuse, which the key's parse left to this one,
+                    // is parsed from itself, edited at its start, so the
+                    // first key after a README opens does not build all of
+                    // it again on the drawing thread, nor does this parse
+                    // build it twice (elundqvist/kvist#376, #593)
+                    let again_from = old_tree
+                        .as_ref()
+                        .filter(|_| again)
+                        .map(super::highlighter::edited_at_its_start);
+                    let mut tree = parser.parse_with_options(
+                        &mut read,
+                        again_from.as_ref().or(old_tree.as_ref()),
+                        Some(options),
+                    )?;
+                    // and where there was none, the parse of the text from
+                    // nothing is parsed again so
                     if old_tree.is_none() && super::highlighter::parsed_again_from_itself(grammar) {
                         let options = ParseOptions::new().progress_callback(&mut progress);
                         let again = super::highlighter::edited_at_its_start(&tree);
@@ -656,6 +674,100 @@ mod tests {
                 "{from_landed} steps from the tree that landed, {from_fresh} from a fresh one"
             );
         }
+    }
+
+    /// A README opened at the key, parsed there from nothing, is left to
+    /// the parse after the pause to parse again from itself, which the keys
+    /// after it reuse: on the drawing thread that rebuilt every node of the
+    /// text, and where it ran out of its time left the tree as it was, for
+    /// the first key to build again (elundqvist/kvist#593).
+    #[gpui::test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_a_readme_opened_at_the_key_is_parsed_again_by_the_pause_not_at_the_key(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::super::highlighter::tests::{key_steps, readme, without_front_matter};
+
+        cx.update(crate::init);
+        let (editor, cx) = cx.add_window_view(|window, cx| EditorState::new(window, cx));
+        // small enough for the key's 2 ms, even unoptimised, where it
+        // does not run out of them (then the pause parses it from nothing,
+        // as the test of `readme(60)` has it)
+        let text = without_front_matter(&readme(12));
+        assert!(parsed_at_the_key("markdown", text.len(), false));
+        let rope = Rope::from(text.as_str());
+        let mut h = TreeSitterInputHighlighter::new("markdown");
+        cx.update(|window, cx| editor.update(cx, |_, cx| h.update(None, &rope, true, window, cx)));
+        if h.inner.borrow().tree().is_some() {
+            assert!(h.inner.borrow().again_pending(), "not parsed again at the key");
+        }
+        assert!(h.parse_task.borrow().is_some(), "left to the pause");
+        // the same text handed again with an empty edit, as an open is,
+        // leaves the pause its parse
+        let start = gpui_base::input::Point::new(0, 0);
+        let open = BaseInputEdit {
+            start_byte: 0,
+            old_end_byte: 0,
+            new_end_byte: 0,
+            start_position: start,
+            old_end_position: start,
+            new_end_position: start,
+        };
+        cx.update(|window, cx| editor.update(cx, |_, cx| h.update(Some(open), &rope, true, window, cx)));
+        assert!(h.parse_task.borrow().is_some(), "still left to the pause");
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(!h.inner.borrow().again_pending());
+        let landed = h.inner.borrow().tree_of_text().cloned().expect("the parse after the pause");
+        let config = LanguageRegistry::singleton().language("markdown").unwrap();
+        let mut parser = Parser::new();
+        parser.set_language(config.language.as_ref().unwrap()).unwrap();
+        let fresh = parser.parse(&text, None).unwrap();
+        let (from_landed, from_fresh) = (
+            key_steps(&mut parser, &landed, &text),
+            key_steps(&mut parser, &fresh, &text),
+        );
+        assert!(from_landed * 5 < from_fresh, "{from_landed} steps from the tree that landed, {from_fresh} from a fresh one");
+    }
+
+    /// A fence of a language no one has compiled the highlight query of
+    /// stands plain at the key, which compiles nothing, and is coloured
+    /// once the parse after the pause lands; the same text opened again
+    /// after it is coloured at the key (elundqvist/kvist#593).
+    #[gpui::test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_a_fence_of_a_language_not_compiled_yet_is_coloured_once_the_pause_parse_lands(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::super::HighlightTheme;
+        use super::super::highlighter::tests::{fresh_highlighter, register_rust_as};
+
+        cx.update(crate::init);
+        let (editor, cx) = cx.add_window_view(|window, cx| EditorState::new(window, cx));
+        // two names of a length, the second compiled for the colours to
+        // compare with
+        let (name, twin) = ("kvist-test-adapter-cold", "kvist-test-adapter-twin");
+        register_rust_as(name);
+        register_rust_as(twin);
+        let make = |name: &str| format!("# Title\n\nA paragraph.\n\n```{name}\nfn f() {{}}\n```\n");
+        let (text, twin_text) = (make(name), make(twin));
+        let theme = HighlightTheme::default_dark();
+        let keyword = text.find("fn f").unwrap();
+        let range = keyword..keyword + 2;
+        let want = fresh_highlighter("markdown", &twin_text).styles(&range, theme.as_ref());
+        assert!(want.iter().any(|(_, style)| style.color.is_some()));
+
+        let rope = Rope::from(text.as_str());
+        let mut h = TreeSitterInputHighlighter::new("markdown");
+        cx.update(|window, cx| editor.update(cx, |_, cx| h.update(None, &rope, true, window, cx)));
+        assert_ne!(h.styles(&range, theme.as_ref()), want, "left to the pause");
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(h.styles(&range, theme.as_ref()), want);
+
+        let mut again = TreeSitterInputHighlighter::new("markdown");
+        cx.update(|window, cx| editor.update(cx, |_, cx| again.update(None, &rope, true, window, cx)));
+        assert_eq!(again.styles(&range, theme.as_ref()), want, "at the key");
     }
 
     /// A large text made anew is kept coloured by the old text's trees
