@@ -1176,6 +1176,13 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx.notify();
     }
 
+    /// Whether a fold candidate the highlighter gave starts at `line`: what
+    /// a test of a highlighter that hands them later reads.
+    #[doc(hidden)]
+    pub fn is_fold_candidate(&self, line: usize) -> bool {
+        self.display_map.is_fold_candidate(line)
+    }
+
     #[inline]
     pub fn diagnostics(&self) -> Option<&DiagnosticSet> {
         self.mode.diagnostics()

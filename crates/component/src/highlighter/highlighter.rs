@@ -779,6 +779,44 @@ impl SyntaxHighlighter {
         }
     }
 
+    /// `new`, where it compiles nothing: `None` where `lang` has a grammar
+    /// whose queries no one has compiled yet (`queries::host`), which
+    /// `compile_queries` compiles elsewhere. The editor's highlighter is
+    /// made so, as a file opens, and stands as an `unbuilt` one until a
+    /// thread has compiled them: compiled where it was made, they took the
+    /// drawing thread 4 ms (Markdown), 13 (Rust) and 39 (TypeScript) as
+    /// the first file of a language opened (elundqvist/kvist#597).
+    pub(crate) fn if_compiled(lang: &str) -> Option<Self> {
+        let cold = LanguageRegistry::singleton()
+            .language(lang)
+            .is_some_and(|config| config.has_grammar() && !queries::host_compiled(&config));
+        (!cold).then(|| Self::new(lang))
+    }
+
+    /// Send a task of `executor` to compile the queries a highlighter of
+    /// `lang` takes, where no one has and none is at it, for `new` to find:
+    /// what `if_compiled` leaves to a thread. The future is ready once they
+    /// are compiled; `None` for a language without a grammar.
+    pub(super) fn compile_queries(
+        lang: &str,
+        executor: &gpui::BackgroundExecutor,
+    ) -> Option<queries::HostCompiled> {
+        let config = LanguageRegistry::singleton().language(lang)?;
+        config
+            .has_grammar()
+            .then(|| queries::compiling_host(&config, executor))
+    }
+
+    /// A highlighter of `lang` that holds the text and neither parses nor
+    /// colours it, for one whose queries are not compiled yet
+    /// (`if_compiled`).
+    pub(crate) fn unbuilt(lang: &str) -> Self {
+        let language = LanguageRegistry::singleton()
+            .language(lang)
+            .map_or_else(|| SharedString::from(lang.to_string()), |config| config.name.clone());
+        Self::build_inert(language)
+    }
+
     /// Build an inert highlighter that never parses and creates no styles,
     /// for languages without a grammar.
     fn build_inert(language: SharedString) -> Self {

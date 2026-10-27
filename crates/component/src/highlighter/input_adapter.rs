@@ -29,13 +29,44 @@ pub(crate) fn input_highlighter_factory() -> InputHighlighterFactory {
 }
 
 struct TreeSitterInputHighlighter {
+    shared: Shared,
+    /// The language's queries compiled on a thread and the highlighter
+    /// built from them (`Shared::build`), where the process had none as it
+    /// was made: begun with its first text, and gone with it, as when the
+    /// editor's language changes.
+    building: Option<Task<()>>,
+}
+
+/// What the editor's highlighter shares with the tasks it starts, the
+/// parse after the pause and its build.
+#[derive(Clone)]
+struct Shared {
+    /// The key the highlighter was asked for by (`new`): the registry's,
+    /// which is not always the name of the config it holds, and the one the
+    /// build asks for the language by (elundqvist/kvist#597).
+    key: SharedString,
     inner: Rc<RefCell<SyntaxHighlighter>>,
     parse_task: Rc<RefCell<Option<Task<()>>>>,
     /// The last parse a keystroke made took more than its share of the
     /// key (`PARSE_SHARE`): the keys after it edit the trees alone, until
     /// the parse once the typing pauses lands (`parsed_at_the_key`).
     slow: Rc<Cell<bool>>,
+    /// `inner` holds the text and neither parses nor colours it
+    /// (`SyntaxHighlighter::unbuilt`): the process had not compiled the
+    /// language's queries as the highlighter was made, and a thread
+    /// compiles them (`TreeSitterInputHighlighter::building`).
+    unbuilt: Rc<Cell<bool>>,
+    /// Whether the editor looks for fold candidates, as the last text
+    /// handed said: the build gives them for the text it parses.
+    folding: Rc<Cell<bool>>,
+    /// How long a parse at the key runs before it is left to the pause
+    /// (`SYNC_PARSE_TIMEOUT`): a test sets another.
+    sync_parse_timeout: Duration,
 }
+
+/// What of a keystroke a parse at the key may run before it is left to the
+/// parse after the pause.
+const SYNC_PARSE_TIMEOUT: Duration = Duration::from_millis(2);
 
 /// The largest text a keystroke parses on the drawing thread: a larger
 /// one has its trees edited there, what the edit touched left plain, and
@@ -77,7 +108,7 @@ const FREE_ELSEWHERE_BYTES: usize = 256 * 1024;
 
 impl Drop for TreeSitterInputHighlighter {
     fn drop(&mut self) {
-        let Ok(mut inner) = self.inner.try_borrow_mut() else {
+        let Ok(mut inner) = self.shared.inner.try_borrow_mut() else {
             return;
         };
         let (parse, bytes) = inner.take_parse();
@@ -88,15 +119,45 @@ impl Drop for TreeSitterInputHighlighter {
 }
 
 impl TreeSitterInputHighlighter {
+    /// The editor's highlighter of `language`: built at once where the
+    /// process has the language's queries, else unbuilt, the text plain,
+    /// until a thread has compiled them (`SyntaxHighlighter::if_compiled`,
+    /// elundqvist/kvist#597).
     fn new(language: &str) -> Self {
-        let mut highlighter = SyntaxHighlighter::new(language);
+        let built = SyntaxHighlighter::if_compiled(language);
+        let unbuilt = built.is_none();
+        let mut highlighter = built.unwrap_or_else(|| SyntaxHighlighter::unbuilt(language));
         // a fence's language that no one has compiled the query of is
         // compiled on a thread, not at the key (elundqvist/kvist#593)
         highlighter.defer_cold_queries();
         Self {
-            inner: Rc::new(RefCell::new(highlighter)),
-            parse_task: Rc::new(RefCell::new(None)),
-            slow: Rc::new(Cell::new(false)),
+            shared: Shared {
+                key: SharedString::from(language.to_string()),
+                inner: Rc::new(RefCell::new(highlighter)),
+                parse_task: Rc::new(RefCell::new(None)),
+                slow: Rc::new(Cell::new(false)),
+                unbuilt: Rc::new(Cell::new(unbuilt)),
+                folding: Rc::new(Cell::new(false)),
+                sync_parse_timeout: SYNC_PARSE_TIMEOUT,
+            },
+            building: None,
+        }
+    }
+
+    /// `Shared::take_edit`, and where the highlighter is unbuilt, its
+    /// build begun, once.
+    fn take_edit(
+        &mut self,
+        steps: &[InputEdit],
+        edit: Option<BaseInputEdit>,
+        text: &Rope,
+        folding: bool,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<EditorState>,
+    ) {
+        self.shared.take_edit(steps, edit, text, folding, window, cx);
+        if self.shared.unbuilt.get() && self.building.is_none() {
+            self.building = Some(self.shared.build(window, cx));
         }
     }
 }
@@ -114,7 +175,7 @@ impl SyntaxHighlighter {
 
 impl InputHighlighter for TreeSitterInputHighlighter {
     fn language(&self) -> SharedString {
-        self.inner.borrow().language().clone()
+        self.shared.inner.borrow().language().clone()
     }
 
     fn update(
@@ -146,10 +207,11 @@ impl InputHighlighter for TreeSitterInputHighlighter {
         range: &Range<usize>,
         resolver: &dyn HighlightStyleResolver,
     ) -> Vec<(Range<usize>, HighlightStyle)> {
-        self.inner.borrow().styles(range, resolver)
+        self.shared.inner.borrow().styles(range, resolver)
     }
     fn fold_ranges(&self, _: &Rope) -> Vec<FoldRange> {
-        self.inner
+        self.shared
+            .inner
             .borrow()
             .tree_of_text()
             .map(extract_fold_ranges)
@@ -157,7 +219,8 @@ impl InputHighlighter for TreeSitterInputHighlighter {
     }
 
     fn fold_ranges_for_edit(&self, range: Range<usize>, _: &Rope) -> Vec<FoldRange> {
-        self.inner
+        self.shared
+            .inner
             .borrow()
             .tree_of_text()
             .map(|tree| extract_fold_ranges_in_range(tree, range))
@@ -165,24 +228,30 @@ impl InputHighlighter for TreeSitterInputHighlighter {
     }
 }
 
-impl TreeSitterInputHighlighter {
+impl Shared {
     /// Take the text `edit` made, or the text made anew where there is no
     /// edit, and `steps`, the changes `edit` covers one by one where there
     /// are any (`InputHighlighter::update_steps`): parsed at the key where
     /// the text is small enough, else the trees moved with it and the
-    /// parse left to the pause.
+    /// parse left to the pause. Unbuilt, the highlighter holds the text
+    /// alone, for its build to take. Whether the text is parsed now.
     fn take_edit(
-        &mut self,
+        &self,
         steps: &[InputEdit],
         edit: Option<BaseInputEdit>,
         text: &Rope,
         folding: bool,
         window: &mut gpui::Window,
         cx: &mut gpui::Context<EditorState>,
-    ) {
-        const SYNC_PARSE_TIMEOUT: Duration = Duration::from_millis(2);
+    ) -> bool {
         const PARSE_DEBOUNCE: Duration = Duration::from_millis(150);
 
+        self.folding.set(folding);
+        if self.unbuilt.get() {
+            // an unbuilt highlighter's update takes the text and no more
+            self.inner.borrow_mut().update(None, text, None);
+            return false;
+        }
         let edit = edit.map(to_tree_sitter_edit);
         let completed = {
             let mut highlighter = self.inner.borrow_mut();
@@ -193,7 +262,7 @@ impl TreeSitterInputHighlighter {
             // the same, and stood plain and without its fold chevrons until
             // the next edit; a larger one was plain until its parse
             if edit.is_none() && highlighter.text().eq(text) {
-                return;
+                return false;
             }
             let at_the_key = parsed_at_the_key(highlighter.language(), text.len(), self.slow.get());
             // a text made anew that waits for the parse after the pause:
@@ -217,14 +286,14 @@ impl TreeSitterInputHighlighter {
                     }
                 }
                 let began = Instant::now();
-                let completed = highlighter.update_in_steps(steps, edit, text, Some(SYNC_PARSE_TIMEOUT));
+                let completed = highlighter.update_in_steps(steps, edit, text, Some(self.sync_parse_timeout));
                 self.slow.set(began.elapsed() > PARSE_SHARE);
                 completed
             }
         };
         if completed {
             self.parse_task.borrow_mut().take();
-            return;
+            return true;
         }
 
         let highlighter = self.inner.clone();
@@ -362,6 +431,49 @@ impl TreeSitterInputHighlighter {
             }
         });
         parse_task.borrow_mut().replace(task);
+        false
+    }
+
+    /// Compile the language's queries on a thread, then build the
+    /// highlighter from them on this one and take the text it held as an
+    /// opened file's: parsed at once where it is small enough, its fold
+    /// candidates and its colours drawn, else left to the parse after the
+    /// pause. Compiled as the highlighter was made, they took 13 ms (Rust)
+    /// to 39 (TypeScript) of the frame after the first file of a language
+    /// opened (elundqvist/kvist#597).
+    fn build(&self, window: &mut gpui::Window, cx: &mut gpui::Context<EditorState>) -> Task<()> {
+        let shared = self.clone();
+        // begun here, not by the task, which first runs once the frame it
+        // is made in has been presented: some 30 to 50 ms later under Xvfb.
+        // A second highlighter of the language made meanwhile waits for the
+        // first's task, and the task goes on if the highlighter is gone
+        let compiling = SyntaxHighlighter::compile_queries(&self.key, cx.background_executor());
+        cx.spawn_in(window, async move |entity, cx| {
+            if let Some(compiling) = compiling {
+                compiling.await;
+            }
+            let Some(entity) = entity.upgrade() else {
+                return;
+            };
+            let _ = entity.update_in(cx, |state, window, cx| {
+                let text = shared.inner.borrow().text().clone();
+                let mut highlighter = SyntaxHighlighter::new(&shared.key);
+                highlighter.defer_cold_queries();
+                *shared.inner.borrow_mut() = highlighter;
+                shared.unbuilt.set(false);
+                let folding = shared.folding.get();
+                if shared.take_edit(&[], None, &text, folding, window, cx) {
+                    let folds = shared
+                        .inner
+                        .borrow()
+                        .tree_of_text()
+                        .filter(|_| folding)
+                        .map(extract_fold_ranges)
+                        .unwrap_or_default();
+                    state.apply_highlighter_fold_candidates(folds, cx);
+                }
+            });
+        })
     }
 }
 
@@ -454,6 +566,18 @@ fn extract_fold_ranges_in_range(
 mod tests {
     use super::*;
 
+    /// The editor's highlighter of `language`, the language's queries
+    /// compiled first, as a file of a language opened before finds them:
+    /// built at once.
+    #[cfg(feature = "tree-sitter-languages")]
+    pub(super) fn built(language: &str) -> TreeSitterInputHighlighter {
+        let config = LanguageRegistry::singleton().language(language).unwrap();
+        super::super::queries::host(&config).unwrap();
+        let h = TreeSitterInputHighlighter::new(language);
+        assert!(!h.shared.unbuilt.get(), "{language} built at once");
+        h
+    }
+
     /// What the whole walk found: every named child walked, and those the
     /// range does not reach passed over.
     #[cfg(feature = "tree-sitter-languages")]
@@ -529,16 +653,16 @@ mod tests {
         };
         for (source, functions) in [(small, 20), (large, 2_000)] {
             let rope = Rope::from(source.as_str());
-            let mut h = TreeSitterInputHighlighter::new("rust");
+            let mut h = built("rust");
             // parsed whole, as a pause's parse leaves it
-            assert!(h.inner.borrow_mut().update(None, &rope, None));
+            assert!(h.shared.inner.borrow_mut().update(None, &rope, None));
             assert!(coloured(&h, &source));
             let folds = h.fold_ranges(&rope);
             assert_eq!(folds.len(), 2 * functions, "a function and its `if` each");
             handed(&mut h, &rope);
             assert!(coloured(&h, &source), "the same text, {} bytes", source.len());
             assert_eq!(h.fold_ranges(&rope), folds);
-            assert!(h.parse_task.borrow().is_none(), "nothing to parse");
+            assert!(h.shared.parse_task.borrow().is_none(), "nothing to parse");
             // another text is the trees' no longer: one the keystroke
             // parses is parsed afresh, and a larger one keeps the old
             // colours until the parse after the pause, where it stood
@@ -548,8 +672,8 @@ mod tests {
             handed(&mut h, &other_rope);
             let parsed_now = parsed_at_the_key("rust", other.len(), false);
             assert!(coloured(&h, &other), "{} bytes", other.len());
-            assert_eq!(h.inner.borrow().tree_of_text().is_some(), parsed_now);
-            assert_eq!(h.parse_task.borrow().is_none(), parsed_now);
+            assert_eq!(h.shared.inner.borrow().tree_of_text().is_some(), parsed_now);
+            assert_eq!(h.shared.parse_task.borrow().is_none(), parsed_now);
         }
     }
 
@@ -589,7 +713,7 @@ mod tests {
         let (editor, cx) = cx.add_window_view(|window, cx| EditorState::new(window, cx));
         let mut text = readme(60);
         assert!(parsed_at_the_key("markdown", text.len(), false));
-        let mut h = TreeSitterInputHighlighter::new("markdown");
+        let mut h = built("markdown");
         let mut handed = |h: &mut TreeSitterInputHighlighter, edit: Option<BaseInputEdit>, text: &str| {
             let rope = Rope::from(text);
             cx.update(|window, cx| editor.update(cx, |_, cx| h.update(edit, &rope, true, window, cx)));
@@ -605,20 +729,20 @@ mod tests {
             new_end_position: start,
         };
         handed(&mut h, Some(open), &text);
-        assert!(h.inner.borrow().tree().is_none(), "the whole parse out of its time");
+        assert!(h.shared.inner.borrow().tree().is_none(), "the whole parse out of its time");
         // keys typed before the parse after the pause
         let at = text.find("Paragraph 3 says").unwrap() + "Paragraph 3 says".len();
         for (i, c) in "abc".chars().enumerate() {
             let edit = typed(&mut text, at + i, c);
             handed(&mut h, Some(edit), &text);
         }
-        assert!(h.parse_task.borrow().is_some());
+        assert!(h.shared.parse_task.borrow().is_some());
         // the pause
         cx.executor().advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
-        assert!(h.parse_task.borrow().is_some());
+        assert!(h.shared.parse_task.borrow().is_some());
         let fresh = fresh_highlighter("markdown", &text);
-        let inner = h.inner.borrow();
+        let inner = h.shared.inner.borrow();
         assert_eq!(inner.tree().unwrap().root_node().to_sexp(), fresh.tree().unwrap().root_node().to_sexp());
         let theme = HighlightTheme::default_dark();
         assert!(inner.styles(&(0..text.len()), theme.as_ref()) == fresh.styles(&(0..text.len()), theme.as_ref()));
@@ -645,15 +769,16 @@ mod tests {
         let with_front_matter = readme(400);
         for text in [without_front_matter(&with_front_matter), with_front_matter] {
             assert!(!parsed_at_the_key("markdown", text.len(), false));
-            let mut h = TreeSitterInputHighlighter::new("markdown");
+            let mut h = built("markdown");
             let rope = Rope::from(text.as_str());
             cx.update(|window, cx| {
                 editor.update(cx, |_, cx| h.update(None, &rope, true, window, cx))
             });
-            assert!(h.inner.borrow().tree().is_none());
+            assert!(h.shared.inner.borrow().tree().is_none());
             cx.executor().advance_clock(Duration::from_secs(1));
             cx.run_until_parked();
             let landed = h
+                .shared
                 .inner
                 .borrow()
                 .tree_of_text()
@@ -696,12 +821,12 @@ mod tests {
         let text = without_front_matter(&readme(12));
         assert!(parsed_at_the_key("markdown", text.len(), false));
         let rope = Rope::from(text.as_str());
-        let mut h = TreeSitterInputHighlighter::new("markdown");
+        let mut h = built("markdown");
         cx.update(|window, cx| editor.update(cx, |_, cx| h.update(None, &rope, true, window, cx)));
-        if h.inner.borrow().tree().is_some() {
-            assert!(h.inner.borrow().again_pending(), "not parsed again at the key");
+        if h.shared.inner.borrow().tree().is_some() {
+            assert!(h.shared.inner.borrow().again_pending(), "not parsed again at the key");
         }
-        assert!(h.parse_task.borrow().is_some(), "left to the pause");
+        assert!(h.shared.parse_task.borrow().is_some(), "left to the pause");
         // the same text handed again with an empty edit, as an open is,
         // leaves the pause its parse
         let start = gpui_base::input::Point::new(0, 0);
@@ -714,11 +839,11 @@ mod tests {
             new_end_position: start,
         };
         cx.update(|window, cx| editor.update(cx, |_, cx| h.update(Some(open), &rope, true, window, cx)));
-        assert!(h.parse_task.borrow().is_some(), "still left to the pause");
+        assert!(h.shared.parse_task.borrow().is_some(), "still left to the pause");
         cx.executor().advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
-        assert!(!h.inner.borrow().again_pending());
-        let landed = h.inner.borrow().tree_of_text().cloned().expect("the parse after the pause");
+        assert!(!h.shared.inner.borrow().again_pending());
+        let landed = h.shared.inner.borrow().tree_of_text().cloned().expect("the parse after the pause");
         let config = LanguageRegistry::singleton().language("markdown").unwrap();
         let mut parser = Parser::new();
         parser.set_language(config.language.as_ref().unwrap()).unwrap();
@@ -758,16 +883,198 @@ mod tests {
         assert!(want.iter().any(|(_, style)| style.color.is_some()));
 
         let rope = Rope::from(text.as_str());
-        let mut h = TreeSitterInputHighlighter::new("markdown");
+        let mut h = built("markdown");
         cx.update(|window, cx| editor.update(cx, |_, cx| h.update(None, &rope, true, window, cx)));
         assert_ne!(h.styles(&range, theme.as_ref()), want, "left to the pause");
         cx.executor().advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
         assert_eq!(h.styles(&range, theme.as_ref()), want);
 
-        let mut again = TreeSitterInputHighlighter::new("markdown");
+        let mut again = built("markdown");
         cx.update(|window, cx| editor.update(cx, |_, cx| again.update(None, &rope, true, window, cx)));
         assert_eq!(again.styles(&range, theme.as_ref()), want, "at the key");
+    }
+
+    /// The editor's highlighter of a language whose queries no one has
+    /// compiled compiles nothing as it is made and handed its text: the
+    /// text stands plain, a key typed meanwhile is held, and once a thread
+    /// has compiled them the highlighter is built and colours the text as
+    /// a fresh parse colours it, and hands the editor its fold candidates
+    /// and a repaint. The next of the language is built at once, and one
+    /// gone before its build lands is built for no one. Compiled where the
+    /// highlighter was made, they took the frame after the first file of a
+    /// language opened 13 ms for Rust and 39 for TypeScript
+    /// (elundqvist/kvist#597).
+    #[gpui::test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_a_language_not_compiled_yet_is_built_once_a_thread_has_compiled_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::super::HighlightTheme;
+        use super::super::highlighter::tests::{fresh_highlighter, register_rust_as};
+
+        cx.update(crate::init);
+        let (editor, cx) = cx.add_window_view(|window, cx| EditorState::new(window, cx));
+        let (name, gone) = ("kvist-test-adapter-unbuilt", "kvist-test-adapter-unbuilt-gone");
+        register_rust_as(name);
+        register_rust_as(gone);
+        let config = LanguageRegistry::singleton().language(name).unwrap();
+        let theme = HighlightTheme::default_dark();
+        let coloured = |h: &TreeSitterInputHighlighter, text: &str| {
+            h.styles(&(0..text.len()), theme.as_ref()).iter().any(|(_, style)| style.color.is_some())
+        };
+        let notified = Rc::new(Cell::new(0));
+        let count = notified.clone();
+        cx.update(|_, cx| cx.observe(&editor, move |_, _| count.set(count.get() + 1)).detach());
+        let mut text = (0..20)
+            .map(|i| format!("fn f{i}() {{\n    if {i} > 1 {{\n        let v = {i};\n    }}\n}}\n"))
+            .collect::<String>();
+        let mut h = TreeSitterInputHighlighter::new(name);
+        assert!(h.shared.unbuilt.get());
+        // the build's parse is not out of its time on a busy machine
+        h.shared.sync_parse_timeout = Duration::from_secs(60);
+        let rope = Rope::from(text.as_str());
+        cx.update(|window, cx| editor.update(cx, |_, cx| h.update(None, &rope, true, window, cx)));
+        assert!(!super::super::queries::host_compiled(&config), "nothing compiled on the drawing thread");
+        assert!(!coloured(&h, &text), "plain until built");
+        assert!(h.fold_ranges(&rope).is_empty());
+        let at = text.find("= 7;").unwrap() + "= 7".len();
+        let edit = typed(&mut text, at, '0');
+        let rope = Rope::from(text.as_str());
+        cx.update(|window, cx| editor.update(cx, |_, cx| h.update(Some(edit), &rope, true, window, cx)));
+        assert!(h.building.is_some() && h.shared.unbuilt.get());
+        let before = notified.get();
+        cx.run_until_parked();
+        assert!(!h.shared.unbuilt.get());
+        assert!(super::super::queries::host_compiled(&config));
+        let fresh = fresh_highlighter(name, &text);
+        assert!(coloured(&h, &text));
+        assert!(h.styles(&(0..text.len()), theme.as_ref()) == fresh.styles(&(0..text.len()), theme.as_ref()));
+        assert_eq!(h.fold_ranges(&rope), extract_fold_ranges(fresh.tree().unwrap()));
+        assert_eq!(h.fold_ranges(&rope).len(), 40, "a function and its `if` each");
+        // and the editor has them, and is told to draw again
+        assert!(notified.get() > before, "repainted");
+        let candidates: Vec<usize> =
+            (0..text.lines().count()).filter(|&line| editor.read_with(cx, |state, _| state.is_fold_candidate(line))).collect();
+        let want: Vec<usize> = extract_fold_ranges(fresh.tree().unwrap()).iter().map(|fold| fold.start_line).collect();
+        assert_eq!(candidates, want, "the fold candidates reached the editor");
+
+        assert!(!TreeSitterInputHighlighter::new(name).shared.unbuilt.get(), "built at once");
+
+        let mut h = TreeSitterInputHighlighter::new(gone);
+        cx.update(|window, cx| editor.update(cx, |_, cx| h.update(None, &rope, true, window, cx)));
+        drop(h);
+        cx.run_until_parked();
+    }
+
+    /// A text over what a keystroke parses that an unbuilt highlighter
+    /// held is, once built, left to the parse after the pause as an opened
+    /// file's is: plain until it lands, and then coloured, with its fold
+    /// candidates given to the editor by that parse.
+    #[gpui::test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_a_large_text_held_by_an_unbuilt_highlighter_is_parsed_after_the_pause_once_built(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::super::HighlightTheme;
+        use super::super::highlighter::tests::{fresh_highlighter, register_rust_as};
+
+        cx.update(crate::init);
+        let (editor, cx) = cx.add_window_view(|window, cx| EditorState::new(window, cx));
+        let name = "kvist-test-adapter-unbuilt-large";
+        register_rust_as(name);
+        let theme = HighlightTheme::default_dark();
+        let coloured = |h: &TreeSitterInputHighlighter, text: &str| {
+            h.styles(&(0..text.len()), theme.as_ref()).iter().any(|(_, style)| style.color.is_some())
+        };
+        let text: String = (0..2_000)
+            .map(|i| format!("fn f{i}() {{\n    if {i} > 1 {{\n        let v = {i};\n    }}\n}}\n"))
+            .collect();
+        assert!(!parsed_at_the_key("rust", text.len(), false));
+        let rope = Rope::from(text.as_str());
+        let mut h = TreeSitterInputHighlighter::new(name);
+        assert!(h.shared.unbuilt.get());
+        cx.update(|window, cx| editor.update(cx, |_, cx| h.update(None, &rope, true, window, cx)));
+        cx.run_until_parked();
+        assert!(!h.shared.unbuilt.get(), "built");
+        assert!(h.shared.parse_task.borrow().is_some(), "its parse left to the pause");
+        assert!(h.shared.inner.borrow().tree_of_text().is_none());
+        assert!(!coloured(&h, &text), "plain until then");
+        assert!(!editor.read_with(cx, |state, _| state.is_fold_candidate(0)));
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        let fresh = fresh_highlighter(name, &text);
+        assert!(h.styles(&(0..text.len()), theme.as_ref()) == fresh.styles(&(0..text.len()), theme.as_ref()));
+        assert!(coloured(&h, &text));
+        assert_eq!(h.fold_ranges(&rope).len(), 4_000);
+        assert!(editor.read_with(cx, |state, _| state.is_fold_candidate(0)), "the pause's parse gave the candidates");
+    }
+
+    /// A highlighter asked for by a key the registry holds under another
+    /// name than its config's is built by the key, as it is made: built by
+    /// the config's name, the language was another or none, and the text
+    /// stood plain for good (elundqvist/kvist#597).
+    #[gpui::test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_a_key_unlike_the_name_of_its_config_is_built_by_the_key(cx: &mut gpui::TestAppContext) {
+        use super::super::HighlightTheme;
+        use super::super::highlighter::tests::fresh_highlighter;
+
+        cx.update(crate::init);
+        let (editor, cx) = cx.add_window_view(|window, cx| EditorState::new(window, cx));
+        let (key, name) = ("kvist-test-adapter-key", "kvist-test-adapter-key-name");
+        let rust = LanguageRegistry::singleton().language("rust").unwrap();
+        let config = super::super::LanguageConfig::new(name, rust.language.clone().unwrap(), vec![], &rust.highlights, "", "");
+        LanguageRegistry::singleton().register(key, &config);
+        assert!(LanguageRegistry::singleton().language(name).is_none(), "the name is no key");
+        let theme = HighlightTheme::default_dark();
+        let text = "fn f() {\n    let v = 1;\n}\n";
+        let rope = Rope::from(text);
+        let mut h = TreeSitterInputHighlighter::new(key);
+        assert!(h.shared.unbuilt.get());
+        h.shared.sync_parse_timeout = Duration::from_secs(60);
+        cx.update(|window, cx| editor.update(cx, |_, cx| h.update(None, &rope, true, window, cx)));
+        cx.run_until_parked();
+        assert!(!h.shared.unbuilt.get());
+        assert_eq!(h.language(), name, "the config's name");
+        let range = 0..text.len();
+        assert!(h.styles(&range, theme.as_ref()).iter().any(|(_, style)| style.color.is_some()));
+        assert!(h.styles(&range, theme.as_ref()) == fresh_highlighter(key, text).styles(&range, theme.as_ref()));
+    }
+
+    /// A second highlighter of a language, made while the first's queries
+    /// are being compiled, waits for that task: another would hold a thread
+    /// of the background executor in `queries::host` until the first ended,
+    /// up to 59 ms for TypeScript in a dev build. A highlighter gone before
+    /// the task ended leaves it to end, and the next finds the queries.
+    #[gpui::test(iterations = 30)]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_a_second_highlighter_made_while_the_queries_compile_waits_for_the_task(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::super::highlighter::tests::register_rust_as;
+
+        cx.update(crate::init);
+        let (editor, cx) = cx.add_window_view(|window, cx| EditorState::new(window, cx));
+        // another config per iteration, whose queries no one has compiled
+        static ITERATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let name = &format!("kvist-test-adapter-unbuilt-twice-{}", ITERATIONS.fetch_add(1, Ordering::Relaxed));
+        register_rust_as(name);
+        let config = LanguageRegistry::singleton().language(name).unwrap();
+        let rope = Rope::from("fn f() {\n    let v = 1;\n}\n");
+        let mut highlighters: Vec<_> = (0..3).map(|_| TreeSitterInputHighlighter::new(name)).collect();
+        for h in &mut highlighters {
+            assert!(h.shared.unbuilt.get());
+            cx.update(|window, cx| editor.update(cx, |_, cx| h.update(None, &rope, true, window, cx)));
+        }
+        assert_eq!(super::super::queries::host_tasks_sent(&config), 1, "one task for the three");
+        drop(highlighters.remove(0));
+        cx.run_until_parked();
+        for h in &highlighters {
+            assert!(!h.shared.unbuilt.get(), "built once the one task ended");
+        }
+        assert_eq!(super::super::queries::host_tasks_sent(&config), 1);
+        assert!(super::super::queries::host_compiled(&config));
     }
 
     /// A large text made anew is kept coloured by the old text's trees
@@ -786,14 +1093,14 @@ mod tests {
         let source: String = (0..2_000).map(function).collect();
         let other = source.replace("let v", "let w");
         assert!(!parsed_at_the_key("rust", other.len(), false));
-        let mut h = TreeSitterInputHighlighter::new("rust");
-        assert!(h.inner.borrow_mut().update(None, &Rope::from(source.as_str()), None));
+        let mut h = built("rust");
+        assert!(h.shared.inner.borrow_mut().update(None, &Rope::from(source.as_str()), None));
         let other_rope = Rope::from(other.as_str());
         cx.update(|window, cx| editor.update(cx, |_, cx| h.update(None, &other_rope, true, window, cx)));
-        assert!(h.inner.borrow().tree_of_text().is_none(), "kept, not of the text");
+        assert!(h.shared.inner.borrow().tree_of_text().is_none(), "kept, not of the text");
         cx.executor().advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
-        assert!(h.inner.borrow().tree_of_text().is_some(), "of the text once its parse lands");
+        assert!(h.shared.inner.borrow().tree_of_text().is_some(), "of the text once its parse lands");
         let at = other.find("fn f1000()").unwrap();
         let line = at..at + function(1000).len();
         assert_eq!(h.fold_ranges_for_edit(line, &other_rope).len(), 2, "a function and its `if`");
@@ -817,9 +1124,9 @@ mod tests {
         let function = |i: usize| format!("fn f{i}(sum: u32) -> u32 {{\n    if sum > {i} {{\n        sum + 1\n    }} else {{\n        0\n    }}\n}}\n\n");
         let old: String = (0..1_500).map(function).collect();
         assert!(!parsed_at_the_key("rust", old.len(), false));
-        let mut h = TreeSitterInputHighlighter::new("rust");
+        let mut h = built("rust");
         let old_rope = Rope::from(old.as_str());
-        assert!(h.inner.borrow_mut().update(None, &old_rope, None));
+        assert!(h.shared.inner.borrow_mut().update(None, &old_rope, None));
         // `sum` renamed `total` in every function, the last first, each
         // change where it is in the text the ones before it left
         let places: Vec<usize> = old.rmatch_indices("sum").map(|(at, _)| at).collect();
@@ -850,7 +1157,7 @@ mod tests {
             new_end_position: new_rope.offset_to_point(new_last),
         };
         cx.update(|window, cx| editor.update(cx, |_, cx| h.update_steps(&steps, covering, &new_rope, true, window, cx)));
-        assert!(h.parse_task.borrow().is_some(), "moved, its parse left to the pause");
+        assert!(h.shared.parse_task.borrow().is_some(), "moved, its parse left to the pause");
         let config = LanguageRegistry::singleton().language("rust").unwrap();
         let mut parser = Parser::new();
         parser.set_language(config.language.as_ref().unwrap()).unwrap();
@@ -951,6 +1258,7 @@ mod tests {
 mod typing_at_any_pace {
     use super::super::HighlightTheme;
     use super::super::highlighter::tests::fresh_highlighter;
+    use super::tests::built;
     use super::*;
 
     /// A character typed at `at` of `text`: the edit the editor hands its
@@ -1018,7 +1326,7 @@ mod typing_at_any_pace {
                 (state >> 33) % n
             };
             let mut text = source.clone();
-            let mut h = TreeSitterInputHighlighter::new(language);
+            let mut h = built(language);
             let rope = Rope::from(text.as_str());
             cx.update(|window, cx| editor.update(cx, |_, cx| h.update(None, &rope, true, window, cx)));
             cx.executor().advance_clock(Duration::from_secs(1));
@@ -1052,7 +1360,7 @@ mod typing_at_any_pace {
             cx.run_until_parked();
             let fresh = fresh_highlighter(language, &text);
             let line = at - "    let doubled = value * 2;".len()..at + typing.len();
-            let got = h.inner.borrow().styles(&line, theme.as_ref());
+            let got = h.shared.inner.borrow().styles(&line, theme.as_ref());
             let want = fresh.styles(&line, theme.as_ref());
             if got != want {
                 failures.push(format!("seed {seed}:\n got {got:?}\nwant {want:?}"));
@@ -1081,7 +1389,7 @@ mod typing_at_any_pace {
         cx.update(crate::init);
         let (editor, cx) = cx.add_window_view(|window, cx| EditorState::new(window, cx));
         let mut text = big_rust();
-        let mut h = TreeSitterInputHighlighter::new("rust");
+        let mut h = built("rust");
         let rope = Rope::from(text.as_str());
         cx.update(|window, cx| editor.update(cx, |_, cx| h.update(None, &rope, true, window, cx)));
         cx.executor().advance_clock(Duration::from_secs(1));
