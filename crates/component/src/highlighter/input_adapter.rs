@@ -257,6 +257,11 @@ impl TreeSitterInputHighlighter {
             let result = cx
                 .background_executor()
                 .spawn(async move {
+                    // the parse after the pause, as the one at the key, and
+                    // marked as cut short where a key typed meanwhile
+                    // cancelled it
+                    let _parse =
+                        super::highlighter::PauseParse::enter(&language, text.len(), &parse_cancel);
                     // the layers made the parse's own first, so that a key
                     // typed during the host's parse finds them held by its
                     // highlighter alone, and moves them in place
@@ -931,5 +936,30 @@ mod typing_at_any_pace {
     #[gpui::test]
     fn in_a_markdown_fence(cx: &mut gpui::TestAppContext) {
         typed_at_any_pace(cx, "markdown", small_md(), 0..40);
+    }
+
+    /// A key typed into a text too large to parse at the key has its
+    /// parse after the pause as a span of the performance recorder's, of
+    /// the whole text (elundqvist/kvist#589).
+    #[gpui::test]
+    fn the_parse_after_the_pause_is_a_perf_span(cx: &mut gpui::TestAppContext) {
+        let (closed, _watching) = super::super::highlighter::tests::watch_perf_spans();
+        cx.update(crate::init);
+        let (editor, cx) = cx.add_window_view(|window, cx| EditorState::new(window, cx));
+        let mut text = big_rust();
+        let mut h = TreeSitterInputHighlighter::new("rust");
+        let rope = Rope::from(text.as_str());
+        cx.update(|window, cx| editor.update(cx, |_, cx| h.update(None, &rope, true, window, cx)));
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        closed.lock().unwrap().clear();
+        let at = text.find("value * 2;").unwrap() + "value * 2;".len();
+        let edit = typed(&mut text, at, ' ');
+        let rope = Rope::from(text.as_str());
+        cx.update(|window, cx| editor.update(cx, |_, cx| h.update(Some(edit), &rope, true, window, cx)));
+        assert_eq!(*closed.lock().unwrap(), Vec::<String>::new(), "the key moves the trees and parses nothing");
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(*closed.lock().unwrap(), [format!("parse language=rust bytes={}", text.len())]);
     }
 }

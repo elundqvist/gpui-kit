@@ -35,6 +35,44 @@ const INJECTION_PARSE_TIMEOUT: Duration = Duration::from_millis(20);
 /// of the trees costs what it reaches, 33 ms for all of 1.4 MB.
 const KEEP_ANEW_EDIT_BYTES: usize = 64 * 1024;
 
+/// Whether a tracing subscriber takes trace-level spans. A highlighter's
+/// parse and its highlight query are spans of target `gpui::perf` then,
+/// as gpui's frames are, for an app that times its drawing thread
+/// (elundqvist/kvist#589): with no subscriber, or one that takes less,
+/// each costs this one relaxed load and allocates nothing.
+#[inline]
+pub(crate) fn perf_spans() -> bool {
+    tracing::level_filters::LevelFilter::current() == tracing::level_filters::LevelFilter::TRACE
+}
+
+/// The span of the parse that runs after the typing pauses, off the
+/// drawing thread. A key typed meanwhile cancels the parse and lets its
+/// tree go: the span says so as it closes (`outcome` is `cancelled`), so
+/// that a parse cut short is not counted with the ones that ran to their
+/// end (elundqvist/kvist#589).
+pub(crate) struct PauseParse(Option<(tracing::span::EnteredSpan, Arc<AtomicBool>)>);
+
+impl PauseParse {
+    /// The parse of `bytes` of `language` begins, `cancel` the flag a key
+    /// typed meanwhile sets.
+    pub(crate) fn enter(language: &str, bytes: usize, cancel: &Arc<AtomicBool>) -> Self {
+        Self(perf_spans().then(|| {
+            let span = tracing::trace_span!(target: "gpui::perf", "parse", language, bytes = bytes as u64, outcome = tracing::field::Empty);
+            (span.entered(), cancel.clone())
+        }))
+    }
+}
+
+impl Drop for PauseParse {
+    fn drop(&mut self) {
+        if let Some((span, cancel)) = &self.0 {
+            if cancel.load(Ordering::Relaxed) {
+                span.record("outcome", "cancelled");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// How many injection layers this thread has parsed, for the tests.
@@ -1323,6 +1361,12 @@ impl SyntaxHighlighter {
             self.text = text.clone();
             return true;
         }
+        // the parse, its injections' and what the edit moves, wherever it
+        // ends
+        let _parse = perf_spans().then(|| {
+            tracing::trace_span!(target: "gpui::perf", "parse", language = self.language.as_ref(), bytes = text.len() as u64)
+                .entered()
+        });
 
         // trees kept from a text made anew are no start for a parse of
         // this one: it starts afresh, and they colour it until it finishes
@@ -2358,6 +2402,10 @@ impl SyntaxHighlighter {
         range: &Range<usize>,
         theme: &dyn gpui_base::input::HighlightStyleResolver,
     ) -> Vec<(Range<usize>, HighlightStyle)> {
+        let _highlight = perf_spans().then(|| {
+            tracing::trace_span!(target: "gpui::perf", "highlight", language = self.language.as_ref(), bytes = range.len() as u64)
+                .entered()
+        });
         let mut styles = vec![];
         let start_offset = range.start;
 
@@ -2675,6 +2723,80 @@ pub(super) mod tests {
         let mut style = HighlightStyle::default();
         style.color = Some(color);
         style
+    }
+
+    /// The spans of target `gpui::perf` a subscriber is handed, as
+    /// `name field=value…` once each has closed, in the order they closed.
+    struct PerfSpans {
+        next: std::sync::atomic::AtomicU64,
+        open: std::sync::Mutex<HashMap<u64, String>>,
+        closed: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    struct Said<'a>(&'a mut String);
+
+    impl tracing::field::Visit for Said<'_> {
+        fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+            self.0.push_str(&format!(" {}={v}", f.name()));
+        }
+
+        fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+            self.0.push_str(&format!(" {}={v:?}", f.name()));
+        }
+    }
+
+    impl tracing::Subscriber for PerfSpans {
+        fn enabled(&self, m: &tracing::Metadata<'_>) -> bool {
+            m.target() == "gpui::perf"
+        }
+
+        fn new_span(&self, a: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            let mut said = a.metadata().name().to_string();
+            a.record(&mut Said(&mut said));
+            let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+            self.open.lock().unwrap().insert(id, said);
+            tracing::span::Id::from_u64(id)
+        }
+
+        fn record(&self, id: &tracing::span::Id, v: &tracing::span::Record<'_>) {
+            if let Some(said) = self.open.lock().unwrap().get_mut(&id.into_u64()) {
+                v.record(&mut Said(said));
+            }
+        }
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+
+        fn try_close(&self, id: tracing::span::Id) -> bool {
+            if let Some(said) = self.open.lock().unwrap().remove(&id.into_u64()) {
+                self.closed.lock().unwrap().push(said);
+            }
+            true
+        }
+    }
+
+    /// What `PerfSpans` is handed, as long as it lives.
+    pub(crate) struct WatchedPerfSpans {
+        _default: tracing::subscriber::DefaultGuard,
+        _other: tracing::Dispatch,
+    }
+
+    /// A subscriber of this thread's that is handed every span of target
+    /// `gpui::perf`, and the spans it was handed once each has closed. A
+    /// second dispatcher, so that a span's site another test's thread
+    /// meets first is asked of this one too: with a scoped one alone,
+    /// tracing asks the thread that meets it, and keeps its never.
+    pub(crate) fn watch_perf_spans() -> (Arc<std::sync::Mutex<Vec<String>>>, WatchedPerfSpans) {
+        let closed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _other = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let _default = tracing::subscriber::set_default(PerfSpans {
+            next: Default::default(),
+            open: Default::default(),
+            closed: closed.clone(),
+        });
+        (closed, WatchedPerfSpans { _default, _other })
     }
 
     #[test]
@@ -5142,6 +5264,54 @@ $x = 1;
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    /// A parse after an edit and a highlight query are spans for a
+    /// subscriber that takes trace-level spans, as gpui's frames are, with
+    /// the language and the bytes parsed or looked at; a text with no
+    /// grammar, which is never parsed, is none (elundqvist/kvist#589).
+    #[cfg(feature = "tree-sitter-languages")]
+    #[test]
+    fn test_a_parse_and_a_highlight_query_are_perf_spans() {
+        let (closed, _watching) = watch_perf_spans();
+        let source = "fn main() {}\n";
+        let mut highlighter = SyntaxHighlighter::new("rust");
+        assert!(highlighter.update(None, &Rope::from_str(source), None));
+        let (edit, typed) = replace(source, 11..11, " 1 ");
+        assert!(highlighter.update(Some(edit), &Rope::from_str(&typed), Some(Duration::MAX)));
+        let theme = HighlightTheme::default_dark();
+        highlighter.styles(&(3..7), theme.as_ref());
+        let mut plain = SyntaxHighlighter::new("text");
+        assert!(plain.update(None, &Rope::from_str(source), None));
+        assert_eq!(
+            *closed.lock().unwrap(),
+            [
+                "parse language=rust bytes=13",
+                "parse language=rust bytes=16",
+                "highlight language=rust bytes=4"
+            ]
+        );
+    }
+
+    /// The parse after the pause is a span, and one that a key typed
+    /// meanwhile cancelled says so as it closes, where one that ran to its
+    /// end says nothing of how it ended (elundqvist/kvist#589).
+    #[test]
+    fn test_a_parse_after_the_pause_says_whether_a_key_cancelled_it() {
+        let (closed, _watching) = watch_perf_spans();
+        let cancel = Arc::new(AtomicBool::new(false));
+        drop(PauseParse::enter("rust", 90_000, &cancel));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cut_short = PauseParse::enter("rust", 91_000, &cancel);
+        cancel.store(true, Ordering::Relaxed);
+        drop(cut_short);
+        assert_eq!(
+            *closed.lock().unwrap(),
+            [
+                "parse language=rust bytes=90000",
+                "parse language=rust bytes=91000 outcome=cancelled"
+            ]
+        );
     }
 
     #[test]
