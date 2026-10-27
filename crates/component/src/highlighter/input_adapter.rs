@@ -1072,8 +1072,9 @@ mod typing_at_any_pace {
     }
 
     /// A key typed into a text too large to parse at the key has its
-    /// parse after the pause as a span of the performance recorder's, of
-    /// the whole text (elundqvist/kvist#589).
+    /// trees moved at the key, and its parse after the pause, as spans of
+    /// the performance recorder's, of the whole text (elundqvist/kvist#589,
+    /// #594).
     #[gpui::test]
     fn the_parse_after_the_pause_is_a_perf_span(cx: &mut gpui::TestAppContext) {
         let (closed, _watching) = super::super::highlighter::tests::watch_perf_spans();
@@ -1089,10 +1090,20 @@ mod typing_at_any_pace {
         let at = text.find("value * 2;").unwrap() + "value * 2;".len();
         let edit = typed(&mut text, at, ' ');
         let rope = Rope::from(text.as_str());
-        cx.update(|window, cx| editor.update(cx, |_, cx| h.update(Some(edit), &rope, true, window, cx)));
-        assert_eq!(*closed.lock().unwrap(), Vec::<String>::new(), "the key moves the trees and parses nothing");
+        cx.update(|window, cx| {
+            editor.update(cx, |_, cx| h.update(Some(edit), &rope, true, window, cx))
+        });
+        let moved = format!("move language=rust bytes={}", text.len());
+        assert_eq!(
+            *closed.lock().unwrap(),
+            [moved.as_str()],
+            "the key moves the trees and parses nothing"
+        );
         cx.executor().advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
-        assert_eq!(*closed.lock().unwrap(), [format!("parse language=rust bytes={}", text.len())]);
+        assert_eq!(
+            *closed.lock().unwrap(),
+            [moved, format!("parse language=rust bytes={}", text.len())]
+        );
     }
 }

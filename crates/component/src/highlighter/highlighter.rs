@@ -38,10 +38,11 @@ const INJECTION_PARSE_TIMEOUT: Duration = Duration::from_millis(20);
 const KEEP_ANEW_EDIT_BYTES: usize = 64 * 1024;
 
 /// Whether a tracing subscriber takes trace-level spans. A highlighter's
-/// parse and its highlight query are spans of target `gpui::perf` then,
-/// as gpui's frames are, for an app that times its drawing thread
-/// (elundqvist/kvist#589): with no subscriber, or one that takes less,
-/// each costs this one relaxed load and allocates nothing.
+/// parse, its trees moved with an edit and not parsed, and its highlight
+/// query are spans of target `gpui::perf` then, as gpui's frames are, for
+/// an app that times its drawing thread (elundqvist/kvist#589, #594):
+/// with no subscriber, or one that takes less, each costs this one
+/// relaxed load and allocates nothing.
 #[inline]
 pub(crate) fn perf_spans() -> bool {
     tracing::level_filters::LevelFilter::current() == tracing::level_filters::LevelFilter::TRACE
@@ -916,6 +917,7 @@ impl SyntaxHighlighter {
             self.text = text.clone();
             return;
         }
+        let _move = self.move_span(text);
         let old = &self.text;
         let (old_len, new_len) = (old.len(), text.len());
         let head = common_prefix(old, text);
@@ -957,6 +959,7 @@ impl SyntaxHighlighter {
     /// `edit_tree` for changes made one after another, `steps`, which
     /// `edit` covers (`move_trees`).
     pub(crate) fn edit_tree_in_steps(&mut self, steps: &[InputEdit], edit: Option<InputEdit>, text: &Rope) {
+        let _move = self.move_span(text);
         match edit {
             Some(edit) => self.move_trees(steps, &edit),
             // the whole text is new, and the tree knows none of it: it is
@@ -976,6 +979,22 @@ impl SyntaxHighlighter {
         }
         self.mark_stale();
         self.text = text.clone();
+    }
+
+    /// The span of the trees moved with an edit and not parsed, of the
+    /// text's size, while a subscriber takes trace-level spans
+    /// (`perf_spans`): what a key in a text too large to parse at the key,
+    /// or a text made anew over all of one (a paste, a reload from disk, an
+    /// undo or redo through an action), costs the drawing thread, where the
+    /// parse that follows the pause has a span of its own. Of a text made
+    /// anew it is the comparing of the two texts too, where they differ by
+    /// more than `KEEP_ANEW_EDIT_BYTES` and nothing is moved
+    /// (elundqvist/kvist#594).
+    fn move_span(&self, text: &Rope) -> Option<tracing::span::EnteredSpan> {
+        perf_spans().then(|| {
+            tracing::trace_span!(target: "gpui::perf", "move", language = self.language.as_ref(), bytes = text.len() as u64)
+                .entered()
+        })
     }
 
     /// Move the tree and every layer with `edit`, not parsed again, and
@@ -5581,6 +5600,26 @@ $x = 1;
                 "parse language=rust bytes=16",
                 "highlight language=rust bytes=4"
             ]
+        );
+    }
+
+    /// The trees moved with an edit and not parsed, a key's in a text too
+    /// large to parse at the key and a paste's over all of one, are a
+    /// span, `move`, of the text's size: what such a key costs the
+    /// drawing thread was in no span (elundqvist/kvist#594).
+    #[test]
+    fn test_trees_moved_without_a_parse_are_a_perf_span() {
+        let (closed, _watching) = watch_perf_spans();
+        let source = "fn main() {}\n";
+        let mut highlighter = SyntaxHighlighter::new("rust");
+        assert!(highlighter.update(None, &Rope::from_str(source), None));
+        closed.lock().unwrap().clear();
+        let (edit, typed) = replace(source, 11..11, " 1 ");
+        highlighter.edit_tree(Some(edit), &Rope::from_str(&typed));
+        highlighter.keep_colours_through(&Rope::from_str("fn other() {}\n"));
+        assert_eq!(
+            *closed.lock().unwrap(),
+            ["move language=rust bytes=16", "move language=rust bytes=14"]
         );
     }
 
