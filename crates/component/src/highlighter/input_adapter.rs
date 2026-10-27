@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::VecDeque,
     ops::Range,
     rc::Rc,
     sync::{
@@ -47,10 +48,9 @@ struct Shared {
     key: SharedString,
     inner: Rc<RefCell<SyntaxHighlighter>>,
     parse_task: Rc<RefCell<Option<Task<()>>>>,
-    /// The last parse a keystroke made took more than its share of the
-    /// key (`PARSE_SHARE`): the keys after it edit the trees alone, until
-    /// the parse once the typing pauses lands (`parsed_at_the_key`).
-    slow: Rc<Cell<bool>>,
+    /// How long the parses at the key take, and whether the last took
+    /// more than its share of the key (`ParsePace`).
+    pace: Rc<RefCell<ParsePace>>,
     /// `inner` holds the text and neither parses nor colours it
     /// (`SyntaxHighlighter::unbuilt`): the process had not compiled the
     /// language's queries as the highlighter was made, and a thread
@@ -84,17 +84,66 @@ const SYNC_PARSE_MAX_BYTES: usize = 48 * 1024;
 /// of 190 KB (#54).
 const MARKDOWN_SYNC_PARSE_MAX_BYTES: usize = 256 * 1024;
 
-/// What of a keystroke's 4 ms its parse may take, what is left once the
-/// frame has its 2 to 3: a parse that took longer leaves the keys after
-/// it to edit the trees alone until the typing pauses. On a machine
-/// busy with builds, a key in a 47 KB file took 4.6 to 5.7 ms, its parse
-/// some 1 to 1.4 of it, every one of 31 over (elundqvist/kvist#370).
-const PARSE_SHARE: Duration = Duration::from_millis(1);
+/// The least and the most of a keystroke's 4 ms its parse may take
+/// (`ParsePace::share`): the least what is left once the frame has its 2
+/// to 3. On a machine busy with builds, a key in a 47 KB file took 4.6 to
+/// 5.7 ms, its parse some 1 to 1.4 of it, every one of 31 over the least
+/// (elundqvist/kvist#370).
+const PARSE_SHARE_LEAST: Duration = Duration::from_millis(1);
+const PARSE_SHARE_MOST: Duration = Duration::from_millis(4);
+
+/// How many of the last parses at the key a parse's share is taken from.
+const PACE_PARSES: usize = 9;
+
+/// How long the parses at the key take: a parse that takes more than
+/// its share of the key, twice the median of the ones before it, from
+/// `PARSE_SHARE_LEAST` to `PARSE_SHARE_MOST`, leaves the keys after it to
+/// edit the trees alone until the typing pauses. A fixed 1 ms made a
+/// loaded machine, whose parses all took a little over it, flap: a key
+/// parsed, the next only moved, its parse 150 ms later after the pause,
+/// the next parsed again (elundqvist/kvist#598).
+#[derive(Default)]
+struct ParsePace {
+    /// How long the last parses at the key took, the newest last.
+    recent: VecDeque<Duration>,
+    /// The last parse at the key took more than its share (`parsed`): the
+    /// keys after it edit the trees alone, until the parse once the typing
+    /// pauses lands (`parsed_at_the_key`).
+    slow: bool,
+}
+
+impl ParsePace {
+    /// What the next parse at the key may take.
+    fn share(&self) -> Duration {
+        let mut recent: Vec<Duration> = self.recent.iter().copied().collect();
+        recent.sort_unstable();
+        recent.get(recent.len() / 2).map_or(PARSE_SHARE_LEAST, |median| {
+            (*median * 2).clamp(PARSE_SHARE_LEAST, PARSE_SHARE_MOST)
+        })
+    }
+
+    /// A parse at the key took `took`, and ran out of its time where
+    /// `ran_out`: then the parse is the pause's whatever its share, and a
+    /// key's parse after it would run out as it did.
+    fn parsed(&mut self, took: Duration, ran_out: bool) {
+        self.slow = ran_out || took > self.share();
+        if self.recent.len() == PACE_PARSES {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(took);
+    }
+
+    /// The parse after the pause landed: the next key parses again.
+    fn paused(&mut self) {
+        self.slow = false;
+    }
+}
 
 /// Whether a keystroke in a text of `len` bytes in `language` parses it
 /// then: one within its language's limit, where the last a key parsed
-/// took its share of the key and no more (`slow`). A Markdown text goes
-/// by its old limit alone (`MARKDOWN_SYNC_PARSE_MAX_BYTES`).
+/// took its share of the key and no more (`slow`, `ParsePace`). A
+/// Markdown text goes by its old limit alone
+/// (`MARKDOWN_SYNC_PARSE_MAX_BYTES`).
 fn parsed_at_the_key(language: &str, len: usize, slow: bool) -> bool {
     if language == "markdown" {
         return len <= MARKDOWN_SYNC_PARSE_MAX_BYTES;
@@ -135,7 +184,7 @@ impl TreeSitterInputHighlighter {
                 key: SharedString::from(language.to_string()),
                 inner: Rc::new(RefCell::new(highlighter)),
                 parse_task: Rc::new(RefCell::new(None)),
-                slow: Rc::new(Cell::new(false)),
+                pace: Rc::default(),
                 unbuilt: Rc::new(Cell::new(unbuilt)),
                 folding: Rc::new(Cell::new(false)),
                 sync_parse_timeout: SYNC_PARSE_TIMEOUT,
@@ -264,7 +313,8 @@ impl Shared {
             if edit.is_none() && highlighter.text().eq(text) {
                 return false;
             }
-            let at_the_key = parsed_at_the_key(highlighter.language(), text.len(), self.slow.get());
+            let at_the_key =
+                parsed_at_the_key(highlighter.language(), text.len(), self.pace.borrow().slow);
             // a text made anew that waits for the parse after the pause:
             // the old text's trees colour it until then, as VS Code and
             // IntelliJ keep the old colours, where it stood plain
@@ -287,7 +337,8 @@ impl Shared {
                 }
                 let began = Instant::now();
                 let completed = highlighter.update_in_steps(steps, edit, text, Some(self.sync_parse_timeout));
-                self.slow.set(began.elapsed() > PARSE_SHARE);
+                let ran_out = !completed && highlighter.is_stale();
+                self.pace.borrow_mut().parsed(began.elapsed(), ran_out);
                 completed
             }
         };
@@ -298,7 +349,7 @@ impl Shared {
 
         let highlighter = self.inner.clone();
         let parse_task = self.parse_task.clone();
-        let slow = self.slow.clone();
+        let pace = self.pace.clone();
         let language = highlighter.borrow().language().clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let text = text.clone();
@@ -424,7 +475,7 @@ impl Shared {
                     std::thread::spawn(move || drop(replaced));
                 }
                 // the typing paused: the next key tries a parse again
-                slow.set(false);
+                pace.borrow_mut().paused();
                 let _ = entity.update(cx, |state, cx| {
                     state.apply_highlighter_fold_candidates(folds, cx);
                 });
@@ -623,6 +674,56 @@ mod tests {
         assert!(parsed_at_the_key("markdown", 190_000, false), "#54's README");
         assert!(parsed_at_the_key("markdown", 190_000, true));
         assert!(!parsed_at_the_key("markdown", 300_000, false));
+    }
+
+    /// A parse at the key may take twice the median of the last ones, from
+    /// 1 to 4 ms; one that took more, or ran out of its time, leaves the
+    /// keys after it to move the trees until the pause. With a fixed 1 ms
+    /// a loaded machine whose parses all took a little over it flapped: a
+    /// key parsed, the keys after it only moved until the pause, and the
+    /// next key parsed again and went over again (elundqvist/kvist#598).
+    #[test]
+    fn test_a_parse_at_the_key_may_take_twice_the_median_of_the_last() {
+        let us = Duration::from_micros;
+        let mut pace = ParsePace::default();
+        assert_eq!(pace.share(), PARSE_SHARE_LEAST, "nothing parsed yet");
+
+        // a loaded machine, every parse a little over 1 ms: the first,
+        // with nothing to go by, is over, and once the typing has paused
+        // none after it is
+        let loaded = [1200, 1100, 1400, 1300, 1500, 1200, 1100, 1300, 1400, 1200, 1500, 1100, 1300, 1200, 1400, 1300];
+        pace.parsed(us(loaded[0]), false);
+        assert!(pace.slow);
+        pace.paused();
+        for (i, took) in loaded[1..].iter().enumerate() {
+            pace.parsed(us(*took), false);
+            assert!(!pace.slow, "parse {} of {took} µs within {:?}", i + 2, pace.share());
+        }
+        assert_eq!(pace.share(), us(2600), "twice the median, 1.3 ms");
+        // a parse far over the ones before it is over, and moves the
+        // median little
+        pace.parsed(us(5000), false);
+        assert!(pace.slow);
+        pace.paused();
+        assert_eq!(pace.share(), us(2600));
+        // one that ran out of its time is the pause's whatever it took
+        pace.parsed(us(2000), true);
+        assert!(pace.slow);
+        pace.paused();
+
+        // the share is taken from the last parses alone, at least 1 ms
+        let mut quick = ParsePace::default();
+        for _ in 0..PACE_PARSES {
+            quick.parsed(us(5000), false);
+        }
+        assert_eq!(quick.share(), PARSE_SHARE_MOST, "at most 4 ms");
+        for _ in 0..PACE_PARSES / 2 + 1 {
+            quick.parsed(us(200), false);
+        }
+        assert_eq!(quick.share(), PARSE_SHARE_LEAST, "the newer, quicker parses");
+        quick.parsed(us(1100), false);
+        assert!(quick.slow);
+        assert_eq!(quick.recent.len(), PACE_PARSES);
     }
 
     /// A text made anew that is the text it was, a paste of the whole text
@@ -1075,6 +1176,68 @@ mod tests {
         }
         assert_eq!(super::super::queries::host_tasks_sent(&config), 1);
         assert!(super::super::queries::host_compiled(&config));
+    }
+
+    /// A parse at the key that ran out of its 2 ms is the pause's whatever
+    /// share the key allows, and one that returned for another reason, a
+    /// fence whose query no one has compiled left to the pause, is not: it
+    /// is judged by the time it took. The share is the most the key gives,
+    /// 4 ms, and a parse that stopped at once took none of it.
+    #[gpui::test]
+    #[cfg(feature = "tree-sitter-languages")]
+    fn test_only_a_parse_that_ran_out_of_its_time_is_slow_whatever_the_share(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::super::highlighter::tests::register_rust_as;
+
+        cx.update(crate::init);
+        let (editor, cx) = cx.add_window_view(|window, cx| EditorState::new(window, cx));
+        let generous = |h: &TreeSitterInputHighlighter| {
+            let mut pace = h.shared.pace.borrow_mut();
+            for _ in 0..PACE_PARSES {
+                pace.parsed(Duration::from_millis(5), false);
+            }
+            pace.paused();
+            assert_eq!(pace.share(), PARSE_SHARE_MOST);
+        };
+        let function = |i: usize| format!("fn f{i}() {{\n    if {i} > 1 {{\n        let v = {i};\n    }}\n}}\n");
+        let source: String = (0..800).map(function).collect();
+        assert!(parsed_at_the_key("rust", source.len(), false));
+
+        // a text made anew, parsed at the key, which has no time at all
+        let mut h = built("rust");
+        h.shared.sync_parse_timeout = Duration::from_secs(60);
+        let rope = Rope::from(source.as_str());
+        cx.update(|window, cx| editor.update(cx, |_, cx| h.update(None, &rope, true, window, cx)));
+        assert!(h.shared.inner.borrow().tree_of_text().is_some() && !h.shared.inner.borrow().is_stale());
+        generous(&h);
+        assert!(!h.shared.pace.borrow().slow);
+        h.shared.sync_parse_timeout = Duration::ZERO;
+        let other = source.replace("let v", "let w");
+        let other_rope = Rope::from(other.as_str());
+        cx.update(|window, cx| editor.update(cx, |_, cx| h.update(None, &other_rope, true, window, cx)));
+        assert!(h.shared.inner.borrow().is_stale(), "ran out");
+        assert!(h.shared.pace.borrow().slow, "the pause's, whatever its share");
+        assert!(h.shared.parse_task.borrow().is_some());
+
+        // a README whose fence is of a language no one has compiled: the
+        // update returns false, the parse is the pause's, and the trees
+        // are not stale
+        let name = "kvist-test-adapter-pace-fence";
+        register_rust_as(name);
+        let text = format!("# Title\n\nA paragraph.\n\n```{name}\nfn f() {{}}\n```\n");
+        let mut h = built("markdown");
+        h.shared.sync_parse_timeout = Duration::from_secs(60);
+        generous(&h);
+        let rope = Rope::from(text.as_str());
+        cx.update(|window, cx| editor.update(cx, |_, cx| h.update(None, &rope, true, window, cx)));
+        assert!(h.shared.parse_task.borrow().is_some(), "left to the pause");
+        assert!(!h.shared.inner.borrow().is_stale(), "not out of its time");
+        let pace = h.shared.pace.borrow();
+        let took = *pace.recent.back().unwrap();
+        assert_eq!(pace.recent.len(), PACE_PARSES);
+        // judged by the time it took, if a busy machine let it take little
+        assert!(pace.slow == (took > PARSE_SHARE_MOST), "took {took:?}");
     }
 
     /// A large text made anew is kept coloured by the old text's trees

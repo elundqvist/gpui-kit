@@ -925,6 +925,12 @@ impl SyntaxHighlighter {
         self.again_pending && !self.anew
     }
 
+    /// Whether the tree was moved with an edit and not parsed since, as a
+    /// parse with a time limit that ran out of it leaves it.
+    pub(crate) fn is_stale(&self) -> bool {
+        self.stale
+    }
+
     /// Leave a span whose language's highlight query no one has compiled
     /// to the parse after the pause, by an update with a time limit
     /// (`defer_cold_queries`).
