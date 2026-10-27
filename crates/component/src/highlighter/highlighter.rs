@@ -534,21 +534,46 @@ fn match_range(
 }
 
 /// Whether a tree of `grammar` that a parse made from nothing is parsed
-/// again once, from itself and the same text, before an edit is parsed
-/// from it: tree-sitter-md's block grammar (0.5.3) reuses nothing of a
-/// tree a parse made from nothing of a text that begins with front matter,
-/// as a README often does, so the first key after one opened parsed all
-/// of it again, 34 to 40 ms of a 190 KB README where the keys after it
-/// take 0.2 to 0.7, and ran out of the 2 ms a key has. Parsed again from
-/// itself, unchanged, which takes about what the first parse did, the
-/// tree is one the parse after an edit reuses: 14 steps of the parser for
-/// a key in a paragraph where it took 405 (elundqvist/kvist#376). A tree
-/// the parse after an edit reuses as it is, one with no front matter, is
-/// parsed again for next to nothing. Other grammars reuse a tree made
-/// from nothing as they reuse any: Rust's first key costs what its second
-/// does.
+/// again once, from itself edited at its start (`edited_at_its_start`)
+/// and the same text, before an edit is parsed from it: tree-sitter-md's
+/// block grammar (0.5.3) leaves a tree made from nothing whose nodes the
+/// parse after an edit cannot reuse whole, and breaks down to their
+/// leaves and builds again, from the edit to the end of the text. The
+/// first key after a README opened did so on the drawing thread: 34 to
+/// 40 ms of a 190 KB README that begins with front matter, where the keys
+/// after it take 0.2 to 0.7 (elundqvist/kvist#376), and in one without,
+/// 213 of the parser's steps for a key in a 40 KB file where the keys
+/// after it take 12: 1.9 ms, or all of the 2 ms a key has, against 0.13
+/// (elundqvist/kvist#593). The parse again builds those nodes as a
+/// parse after an edit builds them, and the tree is one the next key's
+/// parse reuses; it takes a quarter to three quarters of what the first
+/// parse took. Other grammars reuse a tree made from nothing as they
+/// reuse any: Rust's first key costs what its second does, and so do
+/// those of HTML, JavaScript, Python, YAML and the rest but Java and PHP,
+/// whose first key in 30 KB takes 73 and 112 steps where it takes 20 and
+/// 71 after the parse again, too little to parse them again for.
 pub(crate) fn parsed_again_from_itself(grammar: &tree_sitter::Language) -> bool {
     is_markdown_blocks(grammar)
+}
+
+/// `tree`, made from nothing, edited by nothing at its start, for the
+/// parse again from itself to start from (`parsed_again_from_itself`).
+/// Unedited, that parse reused the tree whole and left it as it was, but
+/// for a text that begins with front matter, whose first node is never
+/// reused: every node after it was built again, by chance, as the edit
+/// at the start has every one built again now.
+pub(crate) fn edited_at_its_start(tree: &Tree) -> Tree {
+    let mut tree = tree.clone();
+    let start = Point::new(0, 0);
+    tree.edit(&InputEdit {
+        start_byte: 0,
+        old_end_byte: 0,
+        new_end_byte: 0,
+        start_position: start,
+        old_end_position: start,
+        new_end_position: start,
+    });
+    tree
 }
 
 /// Whether `grammar` is tree-sitter-md's block grammar, told by its own
@@ -1499,8 +1524,8 @@ impl SyntaxHighlighter {
 
         let mut new_tree = new_tree.unwrap();
         // a tree made from nothing that the next parse would not reuse is
-        // parsed again from itself, in what is left of the time limit; one
-        // that runs out of it is left as it is
+        // parsed again from itself, edited at its start, in what is left
+        // of the time limit; one that runs out of it is left as it is
         if from_nothing && parsed_again_from_itself(&new_tree.language()) {
             let mut out_of_time = false;
             let mut progress = |_: &tree_sitter::ParseState| -> ControlFlow<()> {
@@ -1522,7 +1547,7 @@ impl SyntaxHighlighter {
                         &chunk[offset - chunk_byte_ix..]
                     }
                 },
-                Some(&new_tree),
+                Some(&edited_at_its_start(&new_tree)),
                 Some(options),
             );
             match again {
@@ -3213,19 +3238,30 @@ console.log(answer);
     }
 
     /// A Markdown tree made from nothing is not reused by the parse after
-    /// an edit, which parses all of it again; parsed again from itself,
-    /// it is, and that parse does a small part of the work, as a Rust
-    /// tree's does without it. The work is counted in the parser's calls
-    /// to its progress callback, made every so many steps of a parse. The
-    /// first key after a README opened ran out of its 2 ms, the whole of
-    /// it parsed again (elundqvist/kvist#376).
+    /// an edit, which builds all of it again; parsed again from itself,
+    /// edited at its start (`edited_at_its_start`), it is, and that parse
+    /// does a small part of the work, as a Rust tree's does without it.
+    /// The work is counted in the parser's calls to its progress callback,
+    /// made every so many steps of a parse. The first key after a README
+    /// opened ran out of its 2 ms, the whole of it parsed again
+    /// (elundqvist/kvist#376), and so did the first key in a README with
+    /// no front matter, which a parse again from itself unedited reused
+    /// whole and left as it was: 405 steps where the keys after it take 13
+    /// (elundqvist/kvist#593).
     #[test]
     #[cfg(feature = "tree-sitter-languages")]
     fn test_a_markdown_tree_made_from_nothing_is_parsed_again_from_itself() {
         let markdown = readme(30);
-        let rust: String = (0..300).map(|i| format!("fn f{i}(x: u32) -> u32 {{\n    x * {i}\n}}\n\n")).collect();
+        let no_front_matter = without_front_matter(&markdown);
+        let rust: String = (0..300)
+            .map(|i| format!("fn f{i}(x: u32) -> u32 {{\n    x * {i}\n}}\n\n"))
+            .collect();
         let steps = key_steps;
-        for (language, text, again) in [("markdown", &markdown, true), ("rust", &rust, false)] {
+        for (language, text, again) in [
+            ("markdown", &markdown, true),
+            ("markdown", &no_front_matter, true),
+            ("rust", &rust, false),
+        ] {
             let config = LanguageRegistry::singleton().language(language).unwrap();
             let grammar = config.language.as_ref().unwrap();
             assert_eq!(parsed_again_from_itself(grammar), again, "{language}");
@@ -3233,24 +3269,57 @@ console.log(answer);
             parser.set_language(grammar).unwrap();
             let fresh = parser.parse(text, None).unwrap();
             let from_fresh = steps(&mut parser, &fresh, text);
-            let again_tree = parser.parse(text, Some(&fresh)).unwrap();
+            let again_tree = parser
+                .parse(text, Some(&edited_at_its_start(&fresh)))
+                .unwrap();
+            assert_eq!(
+                again_tree.root_node().to_sexp(),
+                fresh.root_node().to_sexp(),
+                "{language}"
+            );
             let from_again = steps(&mut parser, &again_tree, text);
             if again {
-                assert!(from_again * 10 < from_fresh, "{language}: {from_again} steps from the tree parsed again, {from_fresh} from the fresh one");
+                assert!(
+                    from_again * 10 < from_fresh,
+                    "{language}: {from_again} steps from the tree parsed again, {from_fresh} from the fresh one"
+                );
             } else {
-                assert!(from_fresh <= from_again + 2, "{language}: {from_fresh} steps from the fresh tree, {from_again} from one parsed again");
+                assert!(
+                    from_fresh <= from_again + 2,
+                    "{language}: {from_fresh} steps from the fresh tree, {from_again} from one parsed again"
+                );
             }
         }
-        // and the highlighter's own whole parse leaves such a tree
-        let mut highlighter = SyntaxHighlighter::new("markdown");
-        assert!(highlighter.update(None, &Rope::from_str(&markdown), None));
+        // and the highlighter's own whole parse leaves such a tree, of a
+        // README with front matter and of one without
         let config = LanguageRegistry::singleton().language("markdown").unwrap();
         let mut parser = Parser::new();
-        parser.set_language(config.language.as_ref().unwrap()).unwrap();
-        let fresh = parser.parse(&markdown, None).unwrap();
-        let kept = highlighter.tree().unwrap().clone();
-        let (from_kept, from_fresh) = (steps(&mut parser, &kept, &markdown), steps(&mut parser, &fresh, &markdown));
-        assert!(from_kept * 10 < from_fresh, "{from_kept} steps from the highlighter's tree, {from_fresh} from a fresh one");
+        parser
+            .set_language(config.language.as_ref().unwrap())
+            .unwrap();
+        for text in [&markdown, &no_front_matter] {
+            let mut highlighter = SyntaxHighlighter::new("markdown");
+            assert!(highlighter.update(None, &Rope::from_str(text), None));
+            let fresh = parser.parse(text, None).unwrap();
+            let kept = highlighter.tree().unwrap().clone();
+            let (from_kept, from_fresh) = (
+                steps(&mut parser, &kept, text),
+                steps(&mut parser, &fresh, text),
+            );
+            assert!(
+                from_kept * 10 < from_fresh,
+                "{from_kept} steps from the highlighter's tree, {from_fresh} from a fresh one"
+            );
+        }
+    }
+
+    /// `readme`'s text from its first heading on, with no front matter.
+    #[cfg(feature = "tree-sitter-languages")]
+    pub(crate) fn without_front_matter(readme: &str) -> String {
+        readme
+            .split_once("---\n\n")
+            .map_or(readme, |(_, rest)| rest)
+            .to_string()
     }
 
     /// A key typed after a whole parse that ran out of its time, before

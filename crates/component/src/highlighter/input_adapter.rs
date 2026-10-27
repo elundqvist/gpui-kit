@@ -289,12 +289,14 @@ impl TreeSitterInputHighlighter {
                     let mut tree =
                         parser.parse_with_options(&mut read, old_tree.as_ref(), Some(options))?;
                     // a tree made from nothing that the next parse would
-                    // not reuse is parsed again from itself, here, so the
-                    // first key after a README opens does not parse all
-                    // of it on the drawing thread (elundqvist/kvist#376)
+                    // not reuse is parsed again from itself, edited at its
+                    // start, here, so the first key after a README opens
+                    // does not build all of it again on the drawing thread
+                    // (elundqvist/kvist#376, #593)
                     if old_tree.is_none() && super::highlighter::parsed_again_from_itself(grammar) {
                         let options = ParseOptions::new().progress_callback(&mut progress);
-                        tree = parser.parse_with_options(&mut read, Some(&tree), Some(options))?;
+                        let again = super::highlighter::edited_at_its_start(&tree);
+                        tree = parser.parse_with_options(&mut read, Some(&again), Some(options))?;
                     }
                     if parse_cancel.load(Ordering::Relaxed) {
                         return None;
@@ -609,32 +611,51 @@ mod tests {
     /// tree-sitter-md reused nothing of a tree made from nothing of a text
     /// that begins with front matter, and the first key after a README
     /// opened parsed all of it again on the drawing thread, out of its
-    /// time (elundqvist/kvist#376).
+    /// time (elundqvist/kvist#376). Nor of one with none, where the parse
+    /// again from itself, unedited, reused the tree whole and left it as it
+    /// was (elundqvist/kvist#593).
     #[gpui::test]
     #[cfg(feature = "tree-sitter-languages")]
     fn test_a_readme_parsed_after_the_pause_from_nothing_is_parsed_again_from_itself(
         cx: &mut gpui::TestAppContext,
     ) {
-        use super::super::highlighter::tests::{key_steps, readme};
+        use super::super::highlighter::tests::{key_steps, readme, without_front_matter};
 
         cx.update(crate::init);
         let (editor, cx) = cx.add_window_view(|window, cx| EditorState::new(window, cx));
         // past what a keystroke parses: the whole parse is the pause's
-        let text = readme(400);
-        assert!(!parsed_at_the_key("markdown", text.len(), false));
-        let mut h = TreeSitterInputHighlighter::new("markdown");
-        let rope = Rope::from(text.as_str());
-        cx.update(|window, cx| editor.update(cx, |_, cx| h.update(None, &rope, true, window, cx)));
-        assert!(h.inner.borrow().tree().is_none());
-        cx.executor().advance_clock(Duration::from_secs(1));
-        cx.run_until_parked();
-        let landed = h.inner.borrow().tree_of_text().cloned().expect("the parse after the pause");
-        let config = LanguageRegistry::singleton().language("markdown").unwrap();
-        let mut parser = Parser::new();
-        parser.set_language(config.language.as_ref().unwrap()).unwrap();
-        let fresh = parser.parse(&text, None).unwrap();
-        let (from_landed, from_fresh) = (key_steps(&mut parser, &landed, &text), key_steps(&mut parser, &fresh, &text));
-        assert!(from_landed * 10 < from_fresh, "{from_landed} steps from the tree that landed, {from_fresh} from a fresh one");
+        let with_front_matter = readme(400);
+        for text in [without_front_matter(&with_front_matter), with_front_matter] {
+            assert!(!parsed_at_the_key("markdown", text.len(), false));
+            let mut h = TreeSitterInputHighlighter::new("markdown");
+            let rope = Rope::from(text.as_str());
+            cx.update(|window, cx| {
+                editor.update(cx, |_, cx| h.update(None, &rope, true, window, cx))
+            });
+            assert!(h.inner.borrow().tree().is_none());
+            cx.executor().advance_clock(Duration::from_secs(1));
+            cx.run_until_parked();
+            let landed = h
+                .inner
+                .borrow()
+                .tree_of_text()
+                .cloned()
+                .expect("the parse after the pause");
+            let config = LanguageRegistry::singleton().language("markdown").unwrap();
+            let mut parser = Parser::new();
+            parser
+                .set_language(config.language.as_ref().unwrap())
+                .unwrap();
+            let fresh = parser.parse(&text, None).unwrap();
+            let (from_landed, from_fresh) = (
+                key_steps(&mut parser, &landed, &text),
+                key_steps(&mut parser, &fresh, &text),
+            );
+            assert!(
+                from_landed * 10 < from_fresh,
+                "{from_landed} steps from the tree that landed, {from_fresh} from a fresh one"
+            );
+        }
     }
 
     /// A large text made anew is kept coloured by the old text's trees
