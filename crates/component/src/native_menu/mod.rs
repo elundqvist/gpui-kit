@@ -196,13 +196,33 @@ impl NativeMenu {
     /// off GPUI's call stack, so GPUI is not borrowed while it is open. When an
     /// item is selected, its action is dispatched via [`Window::dispatch_action`].
     pub fn show(self, position: Point<Pixels>, window: &mut Window, cx: &mut App) {
+        self.show_until_closed(position, window, cx, |_| {});
+    }
+
+    /// [`Self::show`], and `closed` is called once the menu is gone: an item
+    /// chosen, the menu dismissed, another shown in its place, or at once
+    /// where there is nothing to show, or the OS draws the menu and the
+    /// window keeps the keyboard throughout. Where the menu is drawn by gpui
+    /// (the fallback) it takes the keyboard from the focused element while
+    /// it is up, which `closed` is for to tell: the right-click menu of an
+    /// input keeps the input's selection marked meanwhile
+    /// (elundqvist/kvist#623).
+    pub fn show_until_closed(
+        self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+        closed: impl FnOnce(&mut App) + 'static,
+    ) {
         if self.items.is_empty() {
+            closed(cx);
             return;
         }
 
         #[cfg(target_os = "macos")]
         {
             macos::show(self.items, cx.asset_source().clone(), position, window, cx);
+            closed(cx);
         }
         #[cfg(target_os = "windows")]
         {
@@ -214,9 +234,10 @@ impl NativeMenu {
                 window,
                 cx,
             );
+            closed(cx);
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        fallback::show(self.items, position, window, cx);
+        fallback::show(self.items, position, Box::new(closed), window, cx);
     }
 }
 

@@ -91,7 +91,7 @@ pub use mask_pattern::MaskPattern;
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub use native::set_text_content_type;
-pub use native::{NativeMenu, NativeMenuItem};
+pub use native::{ContextMenuClosed, NativeMenu, NativeMenuItem};
 pub use rope_ext::{InputEdit, Point, RopeExt, RopeLines};
 pub use ropey::Rope;
 pub use search::{SearchMatcher, SearchSession};

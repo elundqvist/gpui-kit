@@ -123,6 +123,7 @@ impl TextInputState {
                 gpui_base::input::NativeMenu,
                 gpui_base::input::InputContextMenuCapabilities,
                 gpui::Point<gpui::Pixels>,
+                gpui_base::input::ContextMenuClosed,
                 &mut Window,
                 &mut App,
             ),

@@ -109,6 +109,13 @@ pub use macos::set_text_content_type;
 
 use gpui::SharedString;
 
+/// What a context menu calls when it is gone: the keyboard is the input's
+/// again, or never left it. An input without the keyboard fills its
+/// selection as long as the right-click menu it opened is up, the menu
+/// being what the selection is cut or copied through
+/// (elundqvist/kvist#623).
+pub type ContextMenuClosed = std::rc::Rc<dyn Fn(&mut gpui::App)>;
+
 /// Presentation-independent context-menu model produced by the editor.
 #[derive(Default)]
 pub struct NativeMenu {

@@ -426,7 +426,7 @@ impl RenderOnce for Input {
         state.set_text_align(text_align, cx);
         let custom = self.context_menu_builder.clone();
         state.on_context_menu(
-            Rc::new(move |_, capabilities, position, window, cx| {
+            Rc::new(move |_, capabilities, position, closed, window, cx| {
                 let menu = if let Some(custom) = custom.as_ref() {
                     custom(NativeMenu::new(), window, cx)
                 } else {
@@ -475,7 +475,7 @@ impl RenderOnce for Input {
                         Box::new(gpui_base::input::SelectAll),
                     )
                 };
-                menu.show(position, window, cx);
+                menu.show_until_closed(position, window, cx, move |cx| closed(cx));
             }),
             cx,
         );

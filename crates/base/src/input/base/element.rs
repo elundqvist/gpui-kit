@@ -2433,7 +2433,8 @@ impl<M: InputModeKind> Element for TextElement<M> {
 
         // Paint selections: a search's matches and the word under the
         // mouse in the active window, the selection in any, paler where
-        // the input has not the keyboard (`selection_fill`)
+        // an editor or a multi-line input has not the keyboard, and none
+        // where a single-line one has not (`selection_fill`)
         let secondary_selection = Hsla {
             s: 0.1,
             ..editor_style.selection
@@ -2449,9 +2450,9 @@ impl<M: InputModeKind> Element for TextElement<M> {
         }
 
         #[cfg(test)]
-        let painted_selection = prepaint.selection_path.is_some();
-        if let Some(path) = prepaint.selection_path.take() {
-            window.paint_path(path, selection_fill);
+        let painted_selection = prepaint.selection_path.is_some() && selection_fill.is_some();
+        if let Some((path, fill)) = prepaint.selection_path.take().zip(selection_fill) {
+            window.paint_path(path, fill);
         }
 
         // Paint hover highlight

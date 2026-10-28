@@ -20,7 +20,7 @@ use sum_tree::Bias;
 use unicode_segmentation::*;
 
 use super::{
-    DiagnosticSet, DisplayMap, InputContextMenuCapabilities, InputEditorStyle,
+    ContextMenuClosed, DiagnosticSet, DisplayMap, InputContextMenuCapabilities, InputEditorStyle,
     InputHighlighterFactory, MASK_CHAR, MaskPattern, NativeMenu, NumberStep, WrappingIndent,
     blink_cursor::BlinkCursor,
     change::Change,
@@ -39,9 +39,10 @@ use crate::input::{
 use crate::{AutoScroll, StepAction};
 
 /// The share of the theme's selection alpha a selection is filled with
-/// where its input has not the keyboard (`selection_fill`): half, as VS
-/// Code's `editor.inactiveSelectionBackground` is by default. Public for
-/// the apps that hold that colour to a contrast of its own.
+/// where its editor or multi-line input has not the keyboard
+/// (`selection_fill`): half, as VS Code's
+/// `editor.inactiveSelectionBackground` is by default. Public for the apps
+/// that hold that colour to a contrast of its own.
 pub const INACTIVE_SELECTION_ALPHA: f32 = 0.5;
 
 /// A value read off the UI thread for
@@ -726,9 +727,22 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) diagnostic_popover: Option<Rc<crate::input::DiagnosticEntry>>,
 
     context_menu_handler: Option<
-        Rc<dyn Fn(NativeMenu, InputContextMenuCapabilities, Point<Pixels>, &mut Window, &mut App)>,
+        Rc<
+            dyn Fn(
+                NativeMenu,
+                InputContextMenuCapabilities,
+                Point<Pixels>,
+                ContextMenuClosed,
+                &mut Window,
+                &mut App,
+            ),
+        >,
     >,
     pending_context_menu: Option<(Point<Pixels>, usize)>,
+    /// The right-click menu this input opened is up: it takes the keyboard
+    /// from the input where the platform draws it, and the selection it cuts
+    /// or copies stays marked meanwhile (`selection_fill`).
+    context_menu_shown: bool,
 
     /// Whether the context menu that shows on right-click is enabled.
     ///
@@ -988,10 +1002,20 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx.notify();
     }
 
+    /// The handler shows the menu, and calls the `ContextMenuClosed` it is
+    /// given once the menu is gone, at once where it was never drawn over the
+    /// input's keyboard.
     pub fn on_context_menu(
         &mut self,
         handler: Rc<
-            dyn Fn(NativeMenu, InputContextMenuCapabilities, Point<Pixels>, &mut Window, &mut App),
+            dyn Fn(
+                NativeMenu,
+                InputContextMenuCapabilities,
+                Point<Pixels>,
+                ContextMenuClosed,
+                &mut Window,
+                &mut App,
+            ),
         >,
     ) {
         self.context_menu_handler = Some(handler);
@@ -1081,6 +1105,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             projected_editor_style: InputEditorStyle::default(),
             diagnostic_popover: None,
             context_menu_handler: None,
+            context_menu_shown: false,
             pending_context_menu: None,
             enable_context_menu: true,
             completion_inserting: false,
@@ -2195,9 +2220,35 @@ impl<M: InputModeKind> InputBaseState<M> {
 
         if let Some(handler) = self.context_menu_handler.clone() {
             let capabilities = self.context_menu_capabilities();
-            cx.defer_in(window, move |_, window, cx| {
-                handler(NativeMenu::new(), capabilities, position, window, cx);
+            let this = cx.weak_entity();
+            cx.defer_in(window, move |state, window, cx| {
+                state.context_menu_shown = true;
+                cx.notify();
+                // deferred: a menu with nothing to show is closed from the
+                // handler, while the state is being updated
+                let closed: ContextMenuClosed = Rc::new(move |cx| {
+                    let this = this.clone();
+                    cx.defer(move |cx| {
+                        this.update(cx, |state, cx| state.context_menu_closed(cx))
+                            .ok();
+                    });
+                });
+                handler(
+                    NativeMenu::new(),
+                    capabilities,
+                    position,
+                    closed,
+                    window,
+                    cx,
+                );
             });
+        }
+    }
+
+    /// The right-click menu is gone.
+    fn context_menu_closed(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.context_menu_shown) {
+            cx.notify();
         }
     }
 
@@ -3195,20 +3246,25 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// What the selection is filled with: the theme's where the input has
     /// the keyboard, or its completion or code-action menu is open, in the
     /// active window, and where not the same at `INACTIVE_SELECTION_ALPHA`
-    /// of its alpha. The right-click menu is not among them: it takes the
-    /// keyboard, and the selection it acts on is the paler one while it is
-    /// up, as in VS Code, whose menus of their own take it from the editor
-    /// too. Without the keyboard the selection was not drawn, and the
-    /// editor's selection that the Assistant sends was out of sight while
-    /// its prompt had the keyboard (elundqvist/kvist#610).
-    pub(crate) fn selection_fill(&self, window: &Window, cx: &App) -> gpui::Hsla {
+    /// of its alpha in an editor or a multi-line input, and nothing in a
+    /// single-line one, as VS Code's find and filter boxes have it
+    /// (elundqvist/kvist#623). The right-click menu is not among them: it
+    /// takes the keyboard, and the selection it cuts or copies stays marked
+    /// while it is up, as VS Code's context menus leave an input's: the
+    /// paler one, in a single-line input too (`context_menu_shown`). Without
+    /// the keyboard the selection was not drawn, and the editor's selection
+    /// that the Assistant sends was out of sight while its prompt had the
+    /// keyboard (elundqvist/kvist#610).
+    pub(crate) fn selection_fill(&self, window: &Window, cx: &App) -> Option<gpui::Hsla> {
         let keyboard = (self.focus_handle.is_focused(window) || M::is_context_menu_open(self, cx))
             && window.is_window_active();
         let selection = self.editor_style.selection;
         if keyboard {
-            selection
+            Some(selection)
+        } else if self.is_single_line() && !self.context_menu_shown {
+            None
         } else {
-            selection.opacity(INACTIVE_SELECTION_ALPHA)
+            Some(selection.opacity(INACTIVE_SELECTION_ALPHA))
         }
     }
 
@@ -4342,7 +4398,7 @@ mod tests {
             input.update(cx, |state, cx| {
                 let calls2 = calls.clone();
                 let items2 = items.clone();
-                state.on_context_menu(Rc::new(move |menu, _, _, _, _| {
+                state.on_context_menu(Rc::new(move |menu, _, _, _, _, _| {
                     calls2.set(calls2.get() + 1);
                     items2.set(menu.items.len());
                 }));
@@ -7796,20 +7852,22 @@ mod tests {
         });
     }
 
-    /// An input without the keyboard fills its selection at half the
-    /// alpha of the theme's, and so does one in a window that is not
-    /// active, where neither filled any: the editor's selection that the
-    /// Assistant sends was out of sight while its prompt had the keyboard
-    /// (elundqvist/kvist#610). With the keyboard it is the theme's. A
-    /// frame paints the selection with the keyboard, without it and in a
-    /// window that is not active, and none where none is selected.
-    #[gpui::test]
-    fn test_a_selection_without_the_keyboard_is_filled_paler(cx: &mut TestAppContext) {
-        let input_view = InputView::build(cx, |state| state);
+    /// An editor or a multi-line input without the keyboard fills its
+    /// selection at half the alpha of the theme's, and so does one in a
+    /// window that is not active, where neither filled any: the editor's
+    /// selection that the Assistant sends was out of sight while its prompt
+    /// had the keyboard (elundqvist/kvist#610). A single-line input fills
+    /// none without it (elundqvist/kvist#623). With the keyboard each fills
+    /// the theme's. A frame paints the selection where it is filled, and
+    /// none where none is selected.
+    fn assert_selection_filled<M: InputModeKind>(
+        input_view: InputView<M>,
+        cx: &mut TestAppContext,
+        without: Option<gpui::Hsla>,
+        selection: gpui::Hsla,
+    ) {
         let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
         let input = input_view.input;
-        let selection = gpui::hsla(0.6, 0.8, 0.5, 0.4);
-        let paler = gpui::hsla(0.6, 0.8, 0.5, 0.2);
         cx.update(|window, cx| {
             input.update(cx, |state, cx| {
                 state.set_value("hello world", window, cx);
@@ -7836,20 +7894,120 @@ mod tests {
         };
         let keyboard = cx.update(|_, cx| input.read(cx).focus_handle.clone());
         focus(&mut cx, &keyboard);
-        assert_eq!(fill(&mut cx), selection, "with the keyboard");
+        assert_eq!(fill(&mut cx), Some(selection), "with the keyboard");
         assert!(painted(&mut cx), "painted with the keyboard");
         let elsewhere = cx.update(|_, cx| cx.focus_handle());
         focus(&mut cx, &elsewhere);
-        assert_eq!(fill(&mut cx), paler, "without it");
-        assert!(painted(&mut cx), "painted without it");
+        assert_eq!(fill(&mut cx), without, "without it");
+        assert_eq!(painted(&mut cx), without.is_some(), "painted without it");
         focus(&mut cx, &keyboard);
-        assert_eq!(fill(&mut cx), selection, "with it again");
+        assert_eq!(fill(&mut cx), Some(selection), "with it again");
         cx.deactivate_window();
-        assert_eq!(fill(&mut cx), paler, "in a window that is not active");
-        assert!(painted(&mut cx), "painted in a window that is not active");
+        assert_eq!(fill(&mut cx), without, "in a window that is not active");
+        assert_eq!(
+            painted(&mut cx),
+            without.is_some(),
+            "painted in a window that is not active"
+        );
         // no selection, none painted
-        cx.update(|_, cx| input.update(cx, |state, cx| state.set_selected_range(3..3, cx)));
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| state.set_selected_range(3..3, cx));
+            window.activate_window();
+        });
+        cx.run_until_parked();
         assert!(!painted(&mut cx), "none painted for none selected");
+    }
+
+    #[gpui::test]
+    fn test_a_selection_without_the_keyboard_is_filled_paler(cx: &mut TestAppContext) {
+        let selection = gpui::hsla(0.6, 0.8, 0.5, 0.4);
+        let paler = gpui::hsla(0.6, 0.8, 0.5, 0.2);
+        let textarea = InputView::build_textarea(cx, |state| state);
+        assert_selection_filled(textarea, cx, Some(paler), selection);
+        let editor = InputView::build_editor(cx, |state| state);
+        assert_selection_filled(editor, cx, Some(paler), selection);
+    }
+
+    #[gpui::test]
+    fn test_a_single_line_selection_without_the_keyboard_is_not_filled(
+        cx: &mut TestAppContext,
+    ) {
+        let selection = gpui::hsla(0.6, 0.8, 0.5, 0.4);
+        let input = InputView::build(cx, |state| state);
+        assert_selection_filled(input, cx, None, selection);
+    }
+
+    /// The right-click menu takes the keyboard from a single-line input
+    /// where gpui draws it, and the selection it cuts or copies stays marked
+    /// at half the theme's alpha while it is up, none again once it is gone
+    /// (elundqvist/kvist#623). A menu that is closed at once, as one with
+    /// nothing to show is, leaves none.
+    #[gpui::test]
+    fn test_a_single_line_selection_stays_marked_while_its_context_menu_is_up(
+        cx: &mut TestAppContext,
+    ) {
+        use std::{cell::RefCell, rc::Rc};
+        let selection = gpui::hsla(0.6, 0.8, 0.5, 0.4);
+        let paler = gpui::hsla(0.6, 0.8, 0.5, 0.2);
+        cx.update(crate::init);
+        let input_view = InputView::build(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let closer: Rc<RefCell<Option<ContextMenuClosed>>> = Rc::default();
+        let close_at_once = Rc::new(std::cell::Cell::new(false));
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("hello world", window, cx);
+                let mut style = state.editor_style.clone();
+                style.selection = selection;
+                state.set_editor_style(style);
+                state.set_selected_range(0..5, cx);
+                let (closer, close_at_once) = (closer.clone(), close_at_once.clone());
+                state.on_context_menu(Rc::new(move |_, _, _, closed, _, cx| {
+                    if close_at_once.get() {
+                        closed(cx);
+                    } else {
+                        *closer.borrow_mut() = Some(closed);
+                    }
+                }));
+            });
+            window.activate_window();
+        });
+        cx.run_until_parked();
+        let fill = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| input.read(cx).selection_fill(window, cx))
+        };
+        let painted = |cx: &mut VisualTestContext| {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            cx.update(|_, cx| input.read(cx).painted_selection)
+        };
+        let right_click = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| {
+                input.update(cx, |state, cx| {
+                    state.handle_right_click_menu(point(px(0.), px(0.)), 2, window, cx)
+                })
+            });
+            cx.run_until_parked();
+        };
+        let elsewhere = cx.update(|_, cx| cx.focus_handle());
+        cx.update(|window, cx| window.focus(&elsewhere, cx));
+        cx.run_until_parked();
+        assert_eq!(fill(&mut cx), None, "no menu, no keyboard");
+        assert!(!painted(&mut cx));
+
+        right_click(&mut cx);
+        assert_eq!(fill(&mut cx), Some(paler), "the menu is up");
+        assert!(painted(&mut cx), "painted while it is up");
+        let closed = closer.borrow_mut().take().expect("the menu was shown");
+        cx.update(|_, cx| closed(cx));
+        cx.run_until_parked();
+        assert_eq!(fill(&mut cx), None, "the menu is gone");
+        assert!(!painted(&mut cx), "none painted once it is gone");
+
+        close_at_once.set(true);
+        right_click(&mut cx);
+        assert_eq!(fill(&mut cx), None, "a menu closed at once");
     }
 
     /// `replace_all` on a single-line input replaces the text, puts the
