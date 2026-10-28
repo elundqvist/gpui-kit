@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre 0.3.3 as published to crates.io: FORK.md at the
+// crate's root lists the changes.
 use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, ContentMask, Context, Element, ElementId,
     Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintIndex,
@@ -7,7 +9,6 @@ use crate::{Empty, Window};
 use anyhow::Result;
 use collections::FxHashSet;
 use refineable::Refineable;
-use std::mem;
 use std::{any::TypeId, fmt, ops::Range};
 
 /// A dynamically-typed view handle that can be downcast to a specific `Entity<V>`.
@@ -282,11 +283,43 @@ impl<V: View> IntoElement for ViewElement<V> {
     }
 }
 
-struct ViewElementState {
+pub(crate) struct ViewElementState {
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
+    /// The frames the two ranges index, by the window's count of its draws
+    /// (`Window::draws`): a view is taken from the frame drawn last only
+    /// where both its ranges index that frame. The paint's is 0, no frame,
+    /// until the view is painted: a view prepainted and not painted, under
+    /// an element that is hidden, has no paint range to take.
+    prepaint_drawn: u64,
+    paint_drawn: u64,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
+}
+
+impl ViewElementState {
+    /// A cached view inside a part of the frame drawn last that is taken
+    /// into the frame being drawn (`Window::reuse_prepaint`) goes with it:
+    /// its range is moved to where that part lands, `from` being where the
+    /// part began in the frame drawn last and `to` where it begins now, so
+    /// that the view can be taken from this frame in the next, inside a
+    /// parent drawn anew (elundqvist/kvist#611). A range that does not
+    /// index the frame drawn last is left, and the view drawn anew.
+    pub(crate) fn carry_prepaint(&mut self, from: &PrepaintStateIndex, to: &PrepaintStateIndex, drawn: u64) {
+        if self.prepaint_drawn + 1 == drawn {
+            self.prepaint_range = self.prepaint_range.start.moved(from, to)..self.prepaint_range.end.moved(from, to);
+            self.prepaint_drawn = drawn;
+        }
+    }
+
+    /// The paint's range, as `carry_prepaint` moves the prepaint's
+    /// (`Window::reuse_paint`).
+    pub(crate) fn carry_paint(&mut self, from: &PaintIndex, to: &PaintIndex, drawn: u64) {
+        if self.paint_drawn + 1 == drawn {
+            self.paint_range = self.paint_range.start.moved(from, to)..self.paint_range.end.moved(from, to);
+            self.paint_drawn = drawn;
+        }
+    }
 }
 
 struct ViewElementCacheKey {
@@ -389,6 +422,8 @@ impl<V: View> Element for ViewElement<V> {
                             && element_state.cache_key.text_style == text_style
                             && !window.dirty_views.contains(&entity_id)
                             && !window.refreshing
+                            && element_state.prepaint_drawn + 1 == window.draws
+                            && element_state.paint_drawn + 1 == window.draws
                         {
                             let prepaint_start = window.prepaint_index();
                             window.reuse_prepaint(element_state.prepaint_range.clone());
@@ -396,11 +431,15 @@ impl<V: View> Element for ViewElement<V> {
                                 .extend_accessed(&element_state.accessed_entities);
                             let prepaint_end = window.prepaint_index();
                             element_state.prepaint_range = prepaint_start..prepaint_end;
+                            element_state.prepaint_drawn = window.draws;
 
                             return (None, element_state);
                         }
 
-                        let refreshing = mem::replace(&mut window.refreshing, true);
+                        // drawn anew, it draws anew only those of the cached
+                        // views inside it that changed: the rest are taken
+                        // from the frame drawn last, where upstream had the
+                        // window refresh them all (elundqvist/kvist#611)
                         let prepaint_start = window.prepaint_index();
                         let (mut element, accessed_entities) = cx.detect_accessed_entities(|cx| {
                             let mut element = self
@@ -415,7 +454,6 @@ impl<V: View> Element for ViewElement<V> {
                         });
 
                         let prepaint_end = window.prepaint_index();
-                        window.refreshing = refreshing;
 
                         (
                             Some(element),
@@ -423,6 +461,8 @@ impl<V: View> Element for ViewElement<V> {
                                 accessed_entities,
                                 prepaint_range: prepaint_start..prepaint_end,
                                 paint_range: PaintIndex::default()..PaintIndex::default(),
+                                prepaint_drawn: window.draws,
+                                paint_drawn: 0,
                                 cache_key: ViewElementCacheKey {
                                     bounds,
                                     content_mask,
@@ -468,15 +508,15 @@ impl<V: View> Element for ViewElement<V> {
                             let paint_start = window.paint_index();
 
                             if let Some(element) = element {
-                                let refreshing = mem::replace(&mut window.refreshing, true);
                                 element.paint(window, cx);
-                                window.refreshing = refreshing;
                             } else {
+                                debug_assert_eq!(element_state.paint_drawn + 1, window.draws);
                                 window.reuse_paint(element_state.paint_range.clone());
                             }
 
                             let paint_end = window.paint_index();
                             element_state.paint_range = paint_start..paint_end;
+                            element_state.paint_drawn = window.draws;
 
                             ((), element_state)
                         },
@@ -503,5 +543,405 @@ pub struct EmptyView;
 impl Render for EmptyView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         Empty
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        AnyElement, App, Background, Bounds, Context, Element, ElementId, Entity,
+        GlobalElementId, InspectorElementId, LayoutId, Modifiers, Pixels, Style,
+        StyleRefinement, TestAppContext, Window, div, point, prelude::*, px, relative, rgb,
+    };
+    use std::{cell::Cell, rc::Rc};
+
+    const INNER: u32 = 0x123456;
+
+    /// A cached view: a box of its own colour that counts how often it was
+    /// drawn and clicked.
+    struct Inner {
+        drawn: Rc<Cell<usize>>,
+        clicks: Rc<Cell<usize>>,
+    }
+
+    impl Render for Inner {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.drawn.set(self.drawn.get() + 1);
+            let clicks = self.clicks.clone();
+            div()
+                .id("inner")
+                .size_full()
+                .bg(rgb(INNER))
+                .on_click(move |_, _, _| clicks.set(clicks.get() + 1))
+        }
+    }
+
+    /// A cached view around it, as Kvist docks a drawer whose parts are
+    /// cached views of their own.
+    struct Outer {
+        inner: Entity<Inner>,
+        drawn: Rc<Cell<usize>>,
+    }
+
+    impl Render for Outer {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.drawn.set(self.drawn.get() + 1);
+            div()
+                .size_full()
+                .child(self.inner.clone().cached(StyleRefinement::default().size_full()))
+        }
+    }
+
+    /// The window's root: `before` boxes that take clicks, drawn ahead of
+    /// the cached view and away from it, so that as their count changes the
+    /// view's part of the frame begins elsewhere in it, in the same place
+    /// on screen.
+    struct Root {
+        outer: Entity<Outer>,
+        before: usize,
+    }
+
+    impl Render for Root {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .relative()
+                .size_full()
+                .child(
+                    div().absolute().top(px(200.)).left_0().w(px(100.)).children(
+                        (0..self.before).map(|i| {
+                            div().id(i).h(px(10.)).w_full().bg(rgb(0xff0000)).on_click(|_, _, _| {})
+                        }),
+                    ),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .w(px(100.))
+                        .h(px(100.))
+                        .child(self.outer.clone().cached(StyleRefinement::default().size_full())),
+                )
+        }
+    }
+
+    struct Counts {
+        outer: Rc<Cell<usize>>,
+        inner: Rc<Cell<usize>>,
+        clicks: Rc<Cell<usize>>,
+    }
+
+    fn open(cx: &mut TestAppContext) -> (Entity<Root>, &mut crate::VisualTestContext, Counts) {
+        let counts = Counts {
+            outer: Rc::default(),
+            inner: Rc::default(),
+            clicks: Rc::default(),
+        };
+        let (outer_drawn, inner_drawn, clicks) =
+            (counts.outer.clone(), counts.inner.clone(), counts.clicks.clone());
+        let (root, cx) = cx.add_window_view(move |_, cx| {
+            let inner = cx.new(|_| Inner {
+                drawn: inner_drawn,
+                clicks,
+            });
+            let outer = cx.new(|_| Outer {
+                inner,
+                drawn: outer_drawn,
+            });
+            Root { outer, before: 0 }
+        });
+        (root, cx, counts)
+    }
+
+    fn quads_of_inner(cx: &mut crate::VisualTestContext) -> usize {
+        cx.update(|window, _| {
+            window
+                .rendered_frame
+                .scene
+                .quads
+                .iter()
+                .filter(|q| q.background == Background::from(rgb(INNER)))
+                .count()
+        })
+    }
+
+    /// A cached view drawn again draws again only those of the cached views
+    /// inside it that changed: upstream had the window refresh every one of
+    /// them, so a drawer's parts were laid out with each of its frames
+    /// (elundqvist/kvist#611).
+    #[gpui::test]
+    fn a_cached_view_inside_one_drawn_again_is_taken_from_the_frame_before(cx: &mut TestAppContext) {
+        let (root, cx, counts) = open(cx);
+        assert_eq!((counts.outer.get(), counts.inner.get()), (1, 1));
+
+        let outer = root.read_with(cx, |root, _| root.outer.clone());
+        outer.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!((counts.outer.get(), counts.inner.get()), (2, 1));
+        assert_eq!(quads_of_inner(cx), 1);
+
+        let inner = outer.read_with(cx, |outer, _| outer.inner.clone());
+        inner.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!((counts.outer.get(), counts.inner.get()), (3, 2));
+
+        // the whole window drawn anew draws every cached view anew
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert_eq!((counts.outer.get(), counts.inner.get()), (4, 3));
+    }
+
+    /// A cached view taken whole from the frame before carries the ranges
+    /// of the cached views inside it to where its part lands in the new
+    /// frame: taken from there in the next, inside it drawn anew, the inner
+    /// view still has its box and takes its clicks, where it took what lay
+    /// at its old place, the boxes drawn ahead of it now.
+    #[gpui::test]
+    fn a_cached_view_inside_one_taken_whole_keeps_its_part_of_the_frame(cx: &mut TestAppContext) {
+        let (root, cx, counts) = open(cx);
+        let outer = root.read_with(cx, |root, _| root.outer.clone());
+
+        // the root drawn anew with boxes ahead of the views, which are taken
+        // whole from the frame before, and further on in this one
+        for before in [3, 1, 6] {
+            root.update(cx, |root, cx| {
+                root.before = before;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert_eq!((counts.outer.get(), counts.inner.get()), (1, 1));
+        }
+
+        // the outer view drawn anew, the inner taken from the frame before
+        outer.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!((counts.outer.get(), counts.inner.get()), (2, 1));
+        assert_eq!(quads_of_inner(cx), 1);
+        cx.simulate_click(point(px(50.), px(50.)), Modifiers::default());
+        assert_eq!(counts.clicks.get(), 1);
+
+        // and again, with the boxes moved once more in between; the click
+        // drew the window whole, every view anew
+        let drawn = (counts.outer.get(), counts.inner.get());
+        root.update(cx, |root, cx| {
+            root.before = 2;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        outer.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!((counts.outer.get(), counts.inner.get()), (drawn.0 + 1, drawn.1));
+        assert_eq!(quads_of_inner(cx), 1);
+        cx.simulate_click(point(px(50.), px(50.)), Modifiers::default());
+        assert_eq!(counts.clicks.get(), 2);
+    }
+
+    /// A view prepainted and not painted, in a div that is hidden, has no
+    /// part of the frame to take for its paint: shown again, it is drawn
+    /// anew, and draws its box, where taken from the frame it was last
+    /// prepainted in it drew nothing, or took what lay at the place of a
+    /// part of another frame.
+    struct Hideable {
+        inner: Entity<Inner>,
+        shown: bool,
+    }
+
+    impl Render for Hideable {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().relative().size_full().child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(px(100.))
+                    .h(px(100.))
+                    .when(!self.shown, |div| div.invisible())
+                    .child(self.inner.clone().cached(StyleRefinement::default().size_full())),
+            )
+        }
+    }
+
+    fn show(hideable: &Entity<Hideable>, shown: bool, cx: &mut crate::VisualTestContext) {
+        hideable.update(cx, |hideable, cx| {
+            hideable.shown = shown;
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn a_cached_view_shown_again_after_it_was_hidden_is_drawn_anew(cx: &mut TestAppContext) {
+        let (drawn, clicks) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let (inner_drawn, inner_clicks) = (drawn.clone(), clicks.clone());
+        // hidden when first drawn: prepainted, never painted
+        let (hideable, cx) = cx.add_window_view(move |_, cx| Hideable {
+            inner: cx.new(|_| Inner {
+                drawn: inner_drawn,
+                clicks: inner_clicks,
+            }),
+            shown: false,
+        });
+        assert_eq!(quads_of_inner(cx), 0);
+
+        show(&hideable, true, cx);
+        assert_eq!(quads_of_inner(cx), 1);
+        cx.simulate_click(point(px(50.), px(50.)), Modifiers::default());
+        assert_eq!(clicks.get(), 1);
+
+        // painted, then prepainted taken whole and not painted, then shown
+        show(&hideable, false, cx);
+        assert_eq!(quads_of_inner(cx), 0);
+        show(&hideable, true, cx);
+        assert_eq!(quads_of_inner(cx), 1);
+        cx.simulate_click(point(px(50.), px(50.)), Modifiers::default());
+        assert_eq!(clicks.get(), 2);
+        assert!(drawn.get() >= 3);
+    }
+
+    /// An element that prepaints a cached view twice, the first try given up
+    /// as `List` gives up one to scroll, and the second kept.
+    struct Retried {
+        view: Entity<Inner>,
+    }
+
+    impl IntoElement for Retried {
+        type Element = Self;
+
+        fn into_element(self) -> Self {
+            self
+        }
+    }
+
+    impl Element for Retried {
+        type RequestLayoutState = ();
+        type PrepaintState = AnyElement;
+
+        fn id(&self) -> Option<ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, ()) {
+            let mut style = Style::default();
+            style.size.width = relative(1.).into();
+            style.size.height = relative(1.).into();
+            (window.request_layout(style, None, cx), ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            bounds: Bounds<Pixels>,
+            _: &mut (),
+            window: &mut Window,
+            cx: &mut App,
+        ) -> AnyElement {
+            let prepaint = |window: &mut Window, cx: &mut App| {
+                let mut view = self
+                    .view
+                    .clone()
+                    .cached(StyleRefinement::default().size_full())
+                    .into_any_element();
+                view.layout_as_root(bounds.size.into(), window, cx);
+                view.prepaint_at(bounds.origin, window, cx);
+                view
+            };
+            let _ = window.transact(|window| {
+                prepaint(window, cx);
+                Err::<(), ()>(())
+            });
+            prepaint(window, cx)
+        }
+
+        fn paint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            _: Bounds<Pixels>,
+            _: &mut (),
+            view: &mut AnyElement,
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            view.paint(window, cx);
+        }
+    }
+
+    struct RetryRoot {
+        inner: Entity<Inner>,
+        before: usize,
+    }
+
+    impl Render for RetryRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .relative()
+                .size_full()
+                .child(
+                    div().absolute().top(px(200.)).left_0().w(px(100.)).children(
+                        (0..self.before).map(|i| {
+                            div().id(i).h(px(10.)).w_full().bg(rgb(0xff0000)).on_click(|_, _, _| {})
+                        }),
+                    ),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .w(px(100.))
+                        .h(px(100.))
+                        .child(Retried {
+                            view: self.inner.clone(),
+                        }),
+                )
+        }
+    }
+
+    /// A prepaint begun again in `Window::transact` draws a cached view
+    /// anew, where the view's ranges index the try that was given up and not
+    /// the frame drawn last: taken from them, it would have taken what lay at
+    /// those places of the frame before, or nothing there.
+    #[gpui::test]
+    fn a_cached_view_prepainted_again_in_a_transaction_is_not_taken_from_the_try_given_up(
+        cx: &mut TestAppContext,
+    ) {
+        let (drawn, clicks) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let (inner_drawn, inner_clicks) = (drawn.clone(), clicks.clone());
+        let (root, cx) = cx.add_window_view(move |_, cx| RetryRoot {
+            inner: cx.new(|_| Inner {
+                drawn: inner_drawn,
+                clicks: inner_clicks,
+            }),
+            before: 0,
+        });
+        assert_eq!(quads_of_inner(cx), 1);
+
+        // the boxes ahead of the view change in number, so that its ranges
+        // in a try are not those it had in the frame before
+        for (i, before) in [3, 1, 6, 6].into_iter().enumerate() {
+            let was = drawn.get();
+            root.update(cx, |root, cx| {
+                root.before = before;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            // the first try takes the view from the frame before, the
+            // second draws it anew
+            assert_eq!(drawn.get(), was + 1, "round {i}");
+            assert_eq!(quads_of_inner(cx), 1, "round {i}");
+            cx.simulate_click(point(px(50.), px(50.)), Modifiers::default());
+            assert_eq!(clicks.get(), i + 1, "round {i}");
+        }
     }
 }

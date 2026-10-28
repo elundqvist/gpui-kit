@@ -175,6 +175,38 @@ asks (section 4(b)); each says so at its top:
   only where tracing's max level is trace (`perf_spans`), so with no
   subscriber, or one that takes less, a span's site costs one relaxed
   load and allocates nothing. A test of the spans and their order.
+- `src/view.rs`, `src/window.rs` and `src/text_system/line_layout.rs`:
+  a cached view drawn anew draws anew only those of the cached views
+  inside it that changed, and takes the rest from the frame before
+  (elundqvist/kvist#611). Upstream had the window refresh every cached
+  view inside one drawn anew (`window.refreshing`), so a cached view
+  holding cached views, a drawer whose parts are views of their own,
+  laid them all out again whenever anything of it changed, a frame of
+  one part's output the others too. It could not take them as they
+  were, since a view's ranges index the frame it was last drawn in,
+  and one taken whole into the next frame lands elsewhere in it: the
+  cached views inside it kept ranges into the frame before, and were
+  taken from where something else now was. Now a view taken whole from
+  the frame before (`Window::reuse_prepaint`, `Window::reuse_paint`)
+  carries the cached views among the element states it holds to where
+  their parts land (`ViewElementState::carry_prepaint`, `carry_paint`,
+  each index moved by as much as its range's start, as every part is
+  taken whole and in order), and each view's ranges say which frame
+  they index, by the window's count of its draws (`Window::draws`), so
+  that a view is taken only from the frame drawn last, and drawn anew
+  where its ranges index another: a prepaint begun again in
+  `Window::transact` no longer takes a nested view from the ranges of
+  the try it gave up, and neither does a view prepainted and not
+  painted, under a hidden element, take a paint range that is not there
+  once it is shown (the paint's frame is none until the view is
+  painted, and a view is taken only where both ranges index the frame
+  drawn last). The whole window drawn anew, a refresh, still draws every
+  cached view anew. Tests of a nested view not drawn again with its
+  parent, drawn again at its own change and at a refresh, of one taken
+  from a frame its parent was taken whole into, at a new place in it,
+  which keeps its box and takes its clicks, of one prepainted again in
+  a transaction that gave up its first try, and of one shown again
+  after it was hidden, which draws its box.
 
 ## Tests
 

@@ -6,6 +6,7 @@ use crate::DebugFrameOverlayMode;
 use crate::Inspector;
 #[cfg(feature = "profiler")]
 use crate::profiler;
+use crate::view::ViewElementState;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncApp, AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds,
@@ -1075,6 +1076,40 @@ pub(crate) struct PaintIndex {
     line_layout_index: LineLayoutIndex,
 }
 
+impl PrepaintStateIndex {
+    /// This index, inside a range of a frame that began at `from`, where
+    /// that range lands in a frame it is taken into at `to`: every part is
+    /// taken whole and in order, so each moves by as much as its range's
+    /// start did.
+    pub(crate) fn moved(&self, from: &Self, to: &Self) -> Self {
+        PrepaintStateIndex {
+            hitboxes_index: self.hitboxes_index - from.hitboxes_index + to.hitboxes_index,
+            tooltips_index: self.tooltips_index - from.tooltips_index + to.tooltips_index,
+            deferred_draws_index: self.deferred_draws_index - from.deferred_draws_index + to.deferred_draws_index,
+            dispatch_tree_index: self.dispatch_tree_index - from.dispatch_tree_index + to.dispatch_tree_index,
+            accessed_element_states_index: self.accessed_element_states_index - from.accessed_element_states_index
+                + to.accessed_element_states_index,
+            line_layout_index: self.line_layout_index.moved(&from.line_layout_index, &to.line_layout_index),
+        }
+    }
+}
+
+impl PaintIndex {
+    /// This index moved as `PrepaintStateIndex::moved` moves one.
+    pub(crate) fn moved(&self, from: &Self, to: &Self) -> Self {
+        PaintIndex {
+            scene_index: self.scene_index - from.scene_index + to.scene_index,
+            mouse_listeners_index: self.mouse_listeners_index - from.mouse_listeners_index + to.mouse_listeners_index,
+            input_handlers_index: self.input_handlers_index - from.input_handlers_index + to.input_handlers_index,
+            cursor_styles_index: self.cursor_styles_index - from.cursor_styles_index + to.cursor_styles_index,
+            accessed_element_states_index: self.accessed_element_states_index - from.accessed_element_states_index
+                + to.accessed_element_states_index,
+            tab_handle_index: self.tab_handle_index - from.tab_handle_index + to.tab_handle_index,
+            line_layout_index: self.line_layout_index.moved(&from.line_layout_index, &to.line_layout_index),
+        }
+    }
+}
+
 impl Frame {
     pub(crate) fn new(dispatch_tree: DispatchTree) -> Self {
         Frame {
@@ -1264,6 +1299,9 @@ pub struct Window {
     long_press_timer: Option<Task<()>>,
     long_press_capture: Option<EntityId>,
     pub(crate) refreshing: bool,
+    /// How many times the window was drawn, the draw under way counted: a
+    /// cached view's ranges say which frame they index by it (`view.rs`).
+    pub(crate) draws: u64,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -2107,6 +2145,7 @@ impl Window {
             long_press_timer: None,
             long_press_capture: None,
             refreshing: false,
+            draws: 0,
             activation_observers: SubscriberSet::new(),
             focus: None,
             focus_enabled: true,
@@ -3231,6 +3270,8 @@ impl Window {
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_draw();
 
+        self.draws += 1;
+
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
         let arena_scope = ElementArenaScope::enter(&cx.element_arena);
@@ -3791,6 +3832,14 @@ impl Window {
     }
 
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
+        // the cached views inside it go with it, to be taken from this frame
+        // in the next where the view around them is drawn anew
+        let to = self.prepaint_index();
+        let draws = self.draws;
+        self.carry_view_states(
+            range.start.accessed_element_states_index..range.end.accessed_element_states_index,
+            |state| state.carry_prepaint(&range.start, &to, draws),
+        );
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
@@ -3854,6 +3903,12 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        let to = self.paint_index();
+        let draws = self.draws;
+        self.carry_view_states(
+            range.start.accessed_element_states_index..range.end.accessed_element_states_index,
+            |state| state.carry_paint(&range.start, &to, draws),
+        );
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
@@ -3889,6 +3944,26 @@ impl Window {
             range.start.scene_index..range.end.scene_index,
             &self.rendered_frame.scene,
         );
+    }
+
+    /// The states of the cached views among the element states the frame
+    /// drawn last accessed in `range`, which nothing in the frame being
+    /// drawn has taken yet.
+    fn carry_view_states(&mut self, range: Range<usize>, mut carry: impl FnMut(&mut ViewElementState)) {
+        let Frame {
+            accessed_element_states,
+            element_states,
+            ..
+        } = &mut self.rendered_frame;
+        let view_state = TypeId::of::<ViewElementState>();
+        for key in &accessed_element_states[range] {
+            if key.1 == view_state
+                && let Some(state) = element_states.get_mut(key)
+                && let Some(Some(state)) = state.inner.downcast_mut::<Option<ViewElementState>>()
+            {
+                carry(state);
+            }
+        }
     }
 
     /// Push a text style onto the stack, and call a function with that style active.
