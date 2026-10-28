@@ -207,6 +207,23 @@ asks (section 4(b)); each says so at its top:
   which keeps its box and takes its clicks, of one prepainted again in
   a transaction that gave up its first try, and of one shown again
   after it was hidden, which draws its box.
+- `src/scene.rs` and `src/bounds_tree.rs`: a stretch of the frame before
+  taken whole into a scene (`Scene::replay`, a cached view's paint) keeps
+  the orders it was drawn at, all moved up by as much, so that it is
+  drawn over the highest order under it, and goes into the bounds tree as
+  one leaf that covers it at its highest order (`Stretch`,
+  `BoundsTree::insert_at`), so that what is drawn after it over any of it
+  is drawn over all of it (elundqvist/kvist#611; `insert_at` checks in a
+  debug build the order it is given, and the plain `insert` that every
+  primitive of a scene takes does not search the tree twice). Each of
+  its primitives was ordered again against the whole scene, a bounds
+  tree insert each: a cached panel of some 1300 primitives, a table of
+  containers, taken into every frame cost 0.3 ms a frame, 0.04 ms now.
+  A stretch inside a layer, whose primitives take the layer's order and
+  go into no tree, or one whose layers do not close within it, is taken
+  a primitive at a time as before. Tests of a stretch drawn over what it
+  covers and under what covers it, its own primitives in their order,
+  and of the two taken a primitive at a time.
 
 ## Tests
 

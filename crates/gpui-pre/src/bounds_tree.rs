@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre 0.3.3 as published to crates.io: FORK.md at the
+// crate's root lists the changes.
 use crate::{Bounds, Half};
 use std::{
     cmp,
@@ -121,7 +123,32 @@ where
         // Find maximum ordering among intersecting bounds
         let max_intersecting = self.find_max_ordering(&new_bounds);
         let ordering = max_intersecting + 1;
+        self.place(new_bounds, ordering);
+        ordering
+    }
 
+    /// How many bounds were inserted.
+    #[cfg(test)]
+    pub fn leaves(&self) -> usize {
+        self.nodes.iter().filter(|node| matches!(node.kind, NodeKind::Leaf { .. })).count()
+    }
+
+    /// The maximum ordering of any bounds in the tree that intersect `bounds`, 0 for none.
+    pub fn max_intersecting(&mut self, bounds: &Bounds<U>) -> u32 {
+        self.find_max_ordering(bounds)
+    }
+
+    /// Inserts bounds at `ordering`, which is greater than that of every bounds it
+    /// intersects: the bounds of a stretch of a scene taken whole, at the highest of its
+    /// orderings (elundqvist/kvist#611).
+    pub fn insert_at(&mut self, new_bounds: Bounds<U>, ordering: u32) {
+        debug_assert!(ordering > self.find_max_ordering(&new_bounds));
+        self.place(new_bounds, ordering);
+    }
+
+    /// Inserts bounds at `ordering` without checking it: `insert` has just found it, and
+    /// searching again for each primitive of a scene would cost them all a second search.
+    fn place(&mut self, new_bounds: Bounds<U>, ordering: u32) {
         // Insert the new leaf
         let new_leaf_idx = self.insert_leaf(new_bounds, ordering);
 
@@ -131,8 +158,6 @@ where
             Some(old_idx) if self.nodes[old_idx].max_order < ordering => Some(new_leaf_idx),
             some => some,
         };
-
-        ordering
     }
 
     /// Finds the maximum ordering among all bounds that intersect with the query.

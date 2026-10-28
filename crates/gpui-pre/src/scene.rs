@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre 0.3.3 as published to crates.io: FORK.md at the
+// crate's root lists the changes.
 // todo("windows"): remove
 #![cfg_attr(windows, allow(dead_code))]
 
@@ -85,7 +87,7 @@ impl Scene {
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
-        let mut primitive = primitive.into();
+        let primitive = primitive.into();
         let clipped_bounds = primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds);
@@ -99,6 +101,11 @@ impl Scene {
             .last()
             .copied()
             .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+        self.push_primitive(primitive, order);
+    }
+
+    /// `primitive` drawn at `order`, after everything before it.
+    fn push_primitive(&mut self, mut primitive: Primitive, order: DrawOrder) {
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
@@ -139,7 +146,33 @@ impl Scene {
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
-        for operation in &prev_scene.paint_operations[range] {
+        let operations = &prev_scene.paint_operations[range];
+        // a stretch outside any layer keeps the orders it was drawn at, all moved up by as much,
+        // so that it is drawn over what it covers here, under one leaf of the bounds tree that
+        // holds all of it: what it holds is not each ordered again against the rest, which
+        // cost a cached panel of some 1300 primitives, taken from the frame before into every
+        // frame, 0.3 ms a frame (elundqvist/kvist#611). Inside a layer every primitive takes the
+        // layer's order, and none goes into the tree.
+        if self.layer_stack.is_empty()
+            && let Some(stretch) = Stretch::of(operations)
+        {
+            let base = self.primitive_bounds.max_intersecting(&stretch.bounds) + 1;
+            self.primitive_bounds
+                .insert_at(stretch.bounds, stretch.max - stretch.min + base);
+            for operation in operations {
+                match operation {
+                    PaintOperation::Primitive(primitive) => {
+                        self.push_primitive(primitive.clone(), primitive.order() - stretch.min + base)
+                    }
+                    PaintOperation::StartLayer(bounds) => self
+                        .paint_operations
+                        .push(PaintOperation::StartLayer(*bounds)),
+                    PaintOperation::EndLayer => self.paint_operations.push(PaintOperation::EndLayer),
+                }
+            }
+            return;
+        }
+        for operation in operations {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
@@ -230,8 +263,68 @@ pub enum Primitive {
     Surface(PaintSurface),
 }
 
+/// What a stretch of a scene's paint operations, taken whole into another scene, covers and
+/// was drawn at (`Scene::replay`).
+struct Stretch {
+    /// The clipped bounds of its primitives and the bounds of its layers.
+    bounds: Bounds<ScaledPixels>,
+    /// The least and the greatest order its primitives were drawn at.
+    min: DrawOrder,
+    max: DrawOrder,
+}
+
+impl Stretch {
+    /// `None` for a stretch with no primitive, or one whose layers do not close within it.
+    fn of(operations: &[PaintOperation]) -> Option<Stretch> {
+        let mut stretch: Option<Stretch> = None;
+        let mut bounds: Option<Bounds<ScaledPixels>> = None;
+        let mut depth = 0usize;
+        for operation in operations {
+            let covered = match operation {
+                PaintOperation::Primitive(primitive) => {
+                    let order = primitive.order();
+                    let s = stretch.get_or_insert(Stretch {
+                        bounds: Bounds::default(),
+                        min: order,
+                        max: order,
+                    });
+                    s.min = s.min.min(order);
+                    s.max = s.max.max(order);
+                    primitive.bounds().intersect(&primitive.content_mask().bounds)
+                }
+                PaintOperation::StartLayer(layer) => {
+                    depth += 1;
+                    *layer
+                }
+                PaintOperation::EndLayer => {
+                    depth = depth.checked_sub(1)?;
+                    continue;
+                }
+            };
+            bounds = Some(bounds.map_or(covered, |b| b.union(&covered)));
+        }
+        let mut stretch = stretch.filter(|_| depth == 0)?;
+        stretch.bounds = bounds?;
+        Some(stretch)
+    }
+}
+
 #[expect(missing_docs)]
 impl Primitive {
+    /// The order it was drawn at.
+    pub(crate) fn order(&self) -> DrawOrder {
+        match self {
+            Primitive::Shadow(shadow) => shadow.order,
+            Primitive::Quad(quad) => quad.order,
+            Primitive::Path(path) => path.order,
+            Primitive::Underline(underline) => underline.order,
+            Primitive::MonochromeSprite(sprite) => sprite.order,
+            Primitive::SubpixelSprite(sprite) => sprite.order,
+            Primitive::PolychromeSprite(sprite) => sprite.order,
+            Primitive::Surface(surface) => surface.order,
+        }
+    }
+
     pub fn bounds(&self) -> &Bounds<ScaledPixels> {
         match self {
             Primitive::Shadow(shadow) => &shadow.bounds,
@@ -945,5 +1038,127 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PaintOperation, Quad, Scene, Stretch};
+    use crate::{Bounds, ContentMask, ScaledPixels, point, size};
+
+    fn quad(x: f32, y: f32, w: f32, h: f32) -> Quad {
+        let at = |x, y, w, h| Bounds::new(point(ScaledPixels(x), ScaledPixels(y)), size(ScaledPixels(w), ScaledPixels(h)));
+        Quad {
+            bounds: at(x, y, w, h),
+            content_mask: ContentMask {
+                bounds: at(0., 0., 1000., 1000.),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The primitives of a scene in the order they were drawn, with the order each is at.
+    fn drawn(scene: &Scene) -> Vec<(Bounds<ScaledPixels>, u32)> {
+        scene
+            .paint_operations
+            .iter()
+            .filter_map(|op| match op {
+                PaintOperation::Primitive(p) => Some((*p.bounds(), p.order())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Each primitive is drawn over every one drawn before it that it overlaps.
+    fn over_what_it_covers(scene: &Scene) {
+        let drawn = drawn(scene);
+        for (i, (b, order)) in drawn.iter().enumerate() {
+            for (under, under_order) in &drawn[..i] {
+                if b.intersects(under) {
+                    assert!(order > under_order, "{b:?} at {order} over {under:?} at {under_order}");
+                }
+            }
+        }
+    }
+
+    /// A panel taken whole from the scene before, drawn in this one over other things, and
+    /// under a popover drawn after it: each of its primitives is over what it covers here and
+    /// under what covers it, its own in the order they were drawn, though none of them was
+    /// ordered against the rest one at a time (elundqvist/kvist#611).
+    #[test]
+    fn a_stretch_taken_whole_is_drawn_over_what_it_covers_and_under_what_covers_it() {
+        let mut before = Scene::default();
+        for q in [quad(0., 0., 400., 40.), quad(0., 30., 50., 50.)] {
+            before.insert_primitive(q);
+        }
+        let start = before.len();
+        // a panel: its ground, two rows on it, a mark on the first row
+        for q in [quad(0., 100., 400., 200.), quad(10., 110., 380., 20.), quad(10., 140., 380., 20.), quad(20., 112., 8., 8.)] {
+            before.insert_primitive(q);
+        }
+        let end = before.len();
+        before.insert_primitive(quad(500., 500., 10., 10.));
+
+        let mut scene = Scene::default();
+        // more under it than before, so that its orders are not those it had
+        for q in [quad(0., 0., 400., 400.), quad(0., 90., 400., 20.), quad(5., 105., 30., 30.), quad(600., 0., 10., 10.)] {
+            scene.insert_primitive(q);
+        }
+        scene.replay(start..end, &before);
+        // one leaf for all of it, not one for each
+        assert_eq!(scene.primitive_bounds.leaves(), 5);
+        // a popover over the second row
+        scene.insert_primitive(quad(200., 150., 100., 100.));
+        over_what_it_covers(&scene);
+
+        let taken: Vec<_> = drawn(&scene)[4..8].iter().map(|(b, _)| *b).collect();
+        let was: Vec<_> = drawn(&before)[2..6].iter().map(|(b, _)| *b).collect();
+        assert_eq!(taken, was);
+        assert_eq!(scene.quads.len(), 9);
+    }
+
+    /// A stretch inside a layer, or one whose layers do not close within it, is taken a
+    /// primitive at a time, at the orders it gets drawn so.
+    #[test]
+    fn a_stretch_in_a_layer_or_with_a_layer_left_open_is_taken_a_primitive_at_a_time() {
+        let square = |side: f32| Bounds::new(point(ScaledPixels(0.), ScaledPixels(0.)), size(ScaledPixels(side), ScaledPixels(side)));
+        let mut before = Scene::default();
+        before.insert_primitive(quad(0., 0., 100., 100.));
+        before.push_layer(square(100.));
+        before.insert_primitive(quad(10., 10., 10., 10.));
+        before.insert_primitive(quad(10., 10., 20., 20.));
+        let open = before.len();
+        before.pop_layer();
+        let closed = before.len();
+        assert!(Stretch::of(&before.paint_operations[0..open]).is_none());
+        let whole = Stretch::of(&before.paint_operations[0..closed]).unwrap();
+        assert_eq!((whole.min, whole.max, whole.bounds), (1, 2, square(100.)));
+
+        // the same drawn a primitive at a time, in a layer and not
+        let drawn_anew = |in_layer: bool| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(quad(0., 0., 300., 300.));
+            if in_layer {
+                scene.push_layer(square(300.));
+            }
+            scene.insert_primitive(quad(0., 0., 100., 100.));
+            scene.push_layer(square(100.));
+            scene.insert_primitive(quad(10., 10., 10., 10.));
+            scene.insert_primitive(quad(10., 10., 20., 20.));
+            scene.pop_layer();
+            drawn(&scene)
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0., 0., 300., 300.));
+        scene.push_layer(square(300.));
+        scene.replay(0..closed, &before);
+        scene.pop_layer();
+        assert_eq!(drawn(&scene), drawn_anew(true));
+
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(0., 0., 300., 300.));
+        scene.replay(0..open, &before);
+        scene.pop_layer();
+        assert_eq!(drawn(&scene), drawn_anew(false));
     }
 }
