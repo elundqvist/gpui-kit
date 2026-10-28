@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre 0.3.3 as published to crates.io: FORK.md at the
+// crate's root lists the changes.
 //! KeyDispatch is where GPUI deals with binding actions to key events.
 //!
 //! The key pieces to making a key binding work are to define an action,
@@ -1687,5 +1689,77 @@ mod tests {
 
         cx.simulate_keystrokes("ctrl-b [");
         test.update(cx, |test, _| assert_eq!(test.text.borrow().as_str(), "["))
+    }
+
+    /// A key an interceptor stops goes no further: no action is dispatched
+    /// for it, and no key listener is handed it, where the first capture
+    /// listener on the focus path still was; and the interceptor is told
+    /// whether the key is held (elundqvist/kvist#613).
+    #[crate::test]
+    fn test_an_intercepted_key_reaches_no_listener(cx: &mut TestAppContext) {
+        struct HeldView {
+            focus_handle: FocusHandle,
+            actions: Rc<Cell<usize>>,
+            keys: Rc<Cell<usize>>,
+        }
+
+        impl Render for HeldView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                use crate::InteractiveElement as _;
+                let (actions, keys) = (self.actions.clone(), self.keys.clone());
+                crate::div()
+                    .track_focus(&self.focus_handle)
+                    .key_context("Held")
+                    .on_action(move |_: &TestAction, _, _| actions.set(actions.get() + 1))
+                    .capture_key_down(move |_, _, _| keys.set(keys.get() + 1))
+            }
+        }
+
+        cx.update(|cx| cx.bind_keys([KeyBinding::new("enter", TestAction, Some("Held"))]));
+        let (view, cx) = cx.add_window_view(|_, cx| HeldView {
+            focus_handle: cx.focus_handle(),
+            actions: Rc::default(),
+            keys: Rc::default(),
+        });
+        let heard: Rc<RefCell<Vec<(String, bool)>>> = Rc::default();
+        let _interceptor = cx.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.clone();
+            window.focus(&focus_handle, cx);
+            window.activate_window();
+            let heard = heard.clone();
+            cx.intercept_keystrokes(move |event, _, cx| {
+                heard
+                    .borrow_mut()
+                    .push((event.keystroke.key.clone(), event.is_held));
+                if event.is_held {
+                    cx.stop_propagation();
+                }
+            })
+        });
+        let key = |key: &str, is_held: bool| crate::KeyDownEvent {
+            keystroke: Keystroke::parse(key).unwrap(),
+            is_held,
+            prefer_character_input: false,
+        };
+        let counts = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| (view.actions.get(), view.keys.get()))
+        };
+
+        cx.simulate_event(key("enter", false));
+        assert_eq!(counts(cx), (1, 0), "the press is the binding's");
+        cx.simulate_event(key("enter", true));
+        cx.simulate_event(key("x", true));
+        assert_eq!(counts(cx), (1, 0), "the repeats the interceptor stopped");
+        cx.simulate_event(key("x", false));
+        assert_eq!(counts(cx), (1, 1), "a press no binding takes is the listener's");
+        assert_eq!(
+            *heard.borrow(),
+            [
+                ("enter".to_string(), false),
+                ("enter".to_string(), true),
+                ("x".to_string(), true),
+                ("x".to_string(), false),
+            ]
+        );
     }
 }

@@ -277,6 +277,31 @@ asks (section 4(b)); each says so at its top:
   app can take a screenshot of its own window, whatever is stacked over
   it (elundqvist/kvist#577); a window whose GPU device was lost says so.
   The Wayland window does not yet, and says it is not implemented.
+- `src/linux/x11.rs`, `src/linux/x11/held_keys.rs` and
+  `src/linux/x11/client.rs`: a key down on X11 says whether the key is
+  held, a press of a key that is down being its repeat
+  (`KeyDownEvent::is_held`, elundqvist/kvist#613), where every press was
+  one of its own, so that an app can let a held key's repeats go nowhere
+  once its press moved the keyboard, as IntelliJ and VS Code do: Return
+  that opened a file typed newlines into it. The client asks for XKB's
+  detectable auto-repeat, under which a held key sends its press again
+  and again and its release once, as it is let go, and drops the release
+  before a repeat only where the server does not grant it, as it dropped
+  every release within 20 ms of a press of the same key: a script's two
+  quick presses were one press held. The keys down are heard as the
+  server sends them, before an input method sees them, and the presses
+  that were repeats are kept until the client handles them
+  (`HeldKeys`), so that a key the input method keeps for itself, its
+  press or its release, leaves no key down for good; the window losing
+  the keyboard lets every key go, their releases going to the window
+  that has it, whether it is still there to handle the event or not.
+  The windows select `KEYMAP_STATE`, and the keys down as the server
+  has them, which it sends right after each `FocusIn`, replace what was
+  heard, so that a key held as the keyboard comes to the window (a file
+  chooser closed with Return held) has its repeats known for repeats,
+  and a bit left by a release the window never heard goes. Tests of a
+  repeat, of one handled after others, of the keys let go, of the
+  keymap and of the releases dropped.
 
 ## Trying a drag by hand
 

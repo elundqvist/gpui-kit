@@ -521,6 +521,9 @@ impl X11WindowState {
                 xproto::EventMask::EXPOSURE
                     | xproto::EventMask::STRUCTURE_NOTIFY
                     | xproto::EventMask::FOCUS_CHANGE
+                    // Added in elundqvist/gpui-kit (elundqvist/kvist#613): the
+                    // keys down, sent right after each `FocusIn` (`HeldKeys`)
+                    | xproto::EventMask::KEYMAP_STATE
                     | xproto::EventMask::KEY_PRESS
                     | xproto::EventMask::KEY_RELEASE
                     | xproto::EventMask::PROPERTY_CHANGE

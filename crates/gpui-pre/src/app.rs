@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre 0.3.3 as published to crates.io: FORK.md at the
+// crate's root lists the changes.
 use scheduler::Instant;
 use std::{
     any::{TypeId, type_name},
@@ -3018,6 +3020,12 @@ pub struct KeystrokeEvent {
 
     /// The context stack at the time
     pub context_stack: Vec<KeyContext>,
+
+    /// Whether the key was held down: the keyboard's repeat of a press,
+    /// not a press of its own (`KeyDownEvent::is_held`). Added in
+    /// elundqvist/gpui-kit (elundqvist/kvist#613), so that an interceptor
+    /// can tell a held key's repeats from its press.
+    pub is_held: bool,
 }
 
 struct NullHttpClient;

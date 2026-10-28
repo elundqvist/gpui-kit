@@ -2581,6 +2581,7 @@ impl Window {
                     keystroke: key_down_event.keystroke.clone(),
                     action: action.as_ref().map(|action| action.boxed_clone()),
                     context_stack: context_stack.clone(),
+                    is_held: key_down_event.is_held,
                 },
                 self,
                 cx,
@@ -2606,6 +2607,7 @@ impl Window {
                         keystroke: key_down_event.keystroke.clone(),
                         action: None,
                         context_stack: context_stack.clone(),
+                        is_held: key_down_event.is_held,
                     },
                     self,
                     cx,
@@ -6171,7 +6173,9 @@ impl Window {
         cx.propagate_event = true;
         self.dispatch_keystroke_interceptors(event, self.context_stack(), cx);
         if !cx.propagate_event {
-            self.finish_dispatch_key_event(event, dispatch_path, self.context_stack(), cx);
+            // Changed in elundqvist/gpui-kit (elundqvist/kvist#613): a key an
+            // interceptor stopped goes to no key listener either, where the
+            // first capture listener on the focus path was handed it
             return;
         }
 

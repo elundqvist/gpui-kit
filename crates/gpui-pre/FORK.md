@@ -224,6 +224,13 @@ asks (section 4(b)); each says so at its top:
   a primitive at a time as before. Tests of a stretch drawn over what it
   covers and under what covers it, its own primitives in their order,
   and of the two taken a primitive at a time.
+- `src/app.rs` and `src/window.rs`: `KeystrokeEvent::is_held`, the key
+  down's own, so that an interceptor can tell a held key's repeats from
+  its press (elundqvist/kvist#613), and a key an interceptor stopped goes
+  to no key listener, where the first capture listener on the focus path
+  was still handed it. `src/key_dispatch.rs`: a test of a held key an
+  interceptor stops, which reaches neither its binding nor a listener,
+  and of the interceptor told whether a key is held.
 
 ## Tests
 
