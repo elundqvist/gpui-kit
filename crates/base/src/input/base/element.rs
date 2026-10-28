@@ -487,7 +487,7 @@ impl<M: InputModeKind> TextElement<M> {
         if let Some(ime_marked_range) = &state.ime_marked_range {
             selected_range = (ime_marked_range.end..ime_marked_range.end).into();
         }
-        let is_selected_all = selected_range.len() == state.text.len();
+        let is_selected_all = state.selected_all && selected_range.len() == state.text.len();
 
         let mut cursor = state.cursor();
         // Buffer rows from the raw (pre-mask) offsets, used to locate the cursor line.
@@ -2627,6 +2627,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             state.last_cursor = Some(state.cursor());
             state.set_input_bounds(input_bounds, cx);
             state.last_selected_range = Some(selected_range);
+            state.selected_all = false;
             state.scroll_size = prepaint.scroll_size;
             state.fold_placeholders = fold_placeholders;
             // the scroll the frame applied is told above, by `bounds`, whose

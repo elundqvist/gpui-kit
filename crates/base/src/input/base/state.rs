@@ -649,6 +649,12 @@ pub struct InputBaseState<M: InputModeKind> {
     /// The text bounds
     pub(super) last_bounds: Option<Bounds<Pixels>>,
     pub(super) last_selected_range: Option<Selection>,
+    /// The selection is the whole text `select_all` made, which the layout
+    /// does not follow the caret for, until the paint after it. Told by the
+    /// selection's length, a Shift+Home or Shift+End that selected the
+    /// whole of a long line left its caret out of sight
+    /// (elundqvist/kvist#609).
+    pub(super) selected_all: bool,
     pub(super) selecting: bool,
     pub(crate) disabled: bool,
     pub(crate) readonly: bool,
@@ -1045,6 +1051,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             last_layout: None,
             last_bounds: None,
             last_selected_range: None,
+            selected_all: false,
             last_cursor: None,
             scroll_handle: ScrollHandle::new(),
             scroll_size: gpui::size(px(0.), px(0.)),
@@ -2887,9 +2894,13 @@ impl<M: InputModeKind> InputBaseState<M> {
             .filter(|range| !range.is_empty())
     }
 
+    /// Select the whole text, the caret at its end, and leave the view where
+    /// it is (`selected_all`).
     pub fn select_all(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         self.undo_manager.break_transaction_coalescing();
         self.selected_range = (0..self.text.len()).into();
+        self.selection_reversed = false;
+        self.selected_all = true;
         cx.notify();
     }
 
@@ -7579,6 +7590,178 @@ mod tests {
                     "long value should display from its start, not its tail"
                 );
             });
+        });
+    }
+
+    /// A Shift+Home or a Shift+End that selects the whole of a long
+    /// single line follows its caret into view, as any other selection
+    /// does: told by the selection's length, it was taken for select all,
+    /// which leaves the view where it is, and the caret was left out of
+    /// sight (elundqvist/kvist#609). Select all still leaves the view,
+    /// with its caret at the end, whichever way the selection before it
+    /// went, until the next paint: after it a Shift+End follows its caret
+    /// again.
+    #[gpui::test]
+    fn test_a_shift_home_or_end_over_the_whole_text_follows_its_caret(cx: &mut TestAppContext) {
+        let input_view = InputView::build(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let value = format!("https://example.com/v1/users?{}", "x=1&".repeat(120));
+        let len = value.len();
+        cx.update(|window, cx| input.update(cx, |state, cx| state.set_value(value, window, cx)));
+        cx.run_until_parked();
+        let scroll_x = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| input.read_with(cx, |state, _| state.scroll_handle.offset().x))
+        };
+
+        // End, then Shift+Home: the whole text, the caret at its start
+        cx.update(|_, cx| input.update(cx, |state, cx| state.move_to(len, None, cx)));
+        cx.run_until_parked();
+        assert!(scroll_x(&mut cx) < px(0.), "the view went to the end");
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.select_to_start_of_line(&SelectToStartOfLine, window, cx)
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.selected_range(), 0..len);
+                assert_eq!(state.cursor(), 0);
+                assert_caret_in_view_across(state, "Shift+Home");
+            })
+        });
+
+        // Home, then Shift+End: the whole text, the caret at its end
+        cx.update(|_, cx| input.update(cx, |state, cx| state.move_to(0, None, cx)));
+        cx.run_until_parked();
+        assert_eq!(scroll_x(&mut cx), px(0.), "the view went to the start");
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.select_to_end_of_line(&SelectToEndOfLine, window, cx)
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.selected_range(), 0..len);
+                assert_eq!(state.cursor(), len);
+                assert_caret_in_view_across(state, "Shift+End");
+            })
+        });
+
+        // Shift+Home over a part, then select all: the caret at the end and
+        // out of sight, as the selection is not reversed, and the view where
+        // it was
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.move_to(10, None, cx);
+                state.select_to_start_of_line(&SelectToStartOfLine, window, cx);
+            })
+        });
+        cx.run_until_parked();
+        assert!(cx.update(|_, cx| input.read_with(cx, |state, _| state.selection_reversed)));
+        let before = scroll_x(&mut cx);
+        cx.update(|window, cx| input.update(cx, |state, cx| state.select_all(window, cx)));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.selected_range(), 0..len);
+                assert!(!state.selection_reversed, "select all is not reversed");
+                assert_eq!(state.cursor(), len);
+            })
+        });
+        assert_eq!(scroll_x(&mut cx), before, "select all leaves the view");
+        // and a paint after it leaves it too
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert_eq!(scroll_x(&mut cx), before);
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                let at = state.range_to_bounds(&(len..len)).expect("the end has a place");
+                assert!(
+                    at.left() > state.input_bounds.right(),
+                    "the caret at {at:?} is out of sight, right of {:?}",
+                    state.input_bounds
+                );
+            })
+        });
+
+        // the paint ended select all: Home, then Shift+End, follows the
+        // caret again (a flag that stayed set took it for select all)
+        cx.update(|_, cx| input.update(cx, |state, cx| state.move_to(0, None, cx)));
+        cx.run_until_parked();
+        assert_eq!(scroll_x(&mut cx), px(0.), "the view went to the start");
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.select_to_end_of_line(&SelectToEndOfLine, window, cx)
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.selected_range(), 0..len);
+                assert_caret_in_view_across(state, "Shift+End after select all");
+            })
+        });
+    }
+
+    /// A Ctrl+Shift+End from the top of a text of more lines than the view
+    /// holds and a Ctrl+Shift+Home from its end select the whole text and
+    /// follow the caret down and up, where the length-told select all left
+    /// the view where it was and the caret off screen
+    /// (elundqvist/kvist#609).
+    #[gpui::test]
+    fn test_a_ctrl_shift_end_or_home_over_the_whole_text_follows_its_caret(
+        cx: &mut TestAppContext,
+    ) {
+        let view = InputView::build_editor(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let text = numbered_lines(0..400);
+        let len = text.len();
+        cx.update(|window, cx| input.update(cx, |state, cx| state.set_value(text, window, cx)));
+        cx.run_until_parked();
+        // a selection ending far from the view is followed over some frames
+        let settle = |cx: &mut VisualTestContext| {
+            for _ in 0..4 {
+                cx.update(|window, _| window.refresh());
+                cx.run_until_parked();
+            }
+        };
+
+        // from the top: the whole text, the caret at the end
+        cx.update(|_, cx| input.update(cx, |state, cx| state.move_to(0, None, cx)));
+        settle(&mut cx);
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.select_to_end(&SelectToEnd, window, cx)
+            })
+        });
+        settle(&mut cx);
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.selected_range(), 0..len);
+                assert_eq!(state.cursor(), len);
+                assert_caret_in_view(state, "Ctrl+Shift+End");
+            })
+        });
+
+        // from the end: the whole text, the caret at the start
+        cx.update(|_, cx| input.update(cx, |state, cx| state.move_to(len, None, cx)));
+        settle(&mut cx);
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.select_to_start(&SelectToStart, window, cx)
+            })
+        });
+        settle(&mut cx);
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.selected_range(), 0..len);
+                assert_eq!(state.cursor(), 0);
+                assert_caret_in_view(state, "Ctrl+Shift+Home");
+            })
         });
     }
 
