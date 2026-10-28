@@ -917,6 +917,14 @@ impl SyntaxHighlighter {
         self.tree.as_ref().filter(|_| !self.anew)
     }
 
+    /// The spans parsed at the key given all the time they take, as the
+    /// parse after the pause gives them, for a test that asserts what a
+    /// key parsed and not how long it took (elundqvist/kvist#608).
+    #[cfg(all(test, feature = "tree-sitter-languages"))]
+    pub(crate) fn untimed_spans(&mut self) {
+        self.injection_parse_timeout = Duration::MAX;
+    }
+
     /// Whether `tree_of_text` is a tree a parse made from nothing that the
     /// next parse would not reuse whole, which the parse after the pause
     /// is to parse again from itself, edited at its start
@@ -1624,7 +1632,7 @@ impl SyntaxHighlighter {
 
     /// Returns the data needed to compute injection layers on a background thread.
     /// Returns `None` if this language has no injections.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tree-sitter-languages"))]
     pub(crate) fn injection_parse_data(&self) -> Option<InjectionParseData> {
         self.injection_parse_source().map(InjectionParseSource::into_data)
     }
@@ -3422,6 +3430,7 @@ console.log(answer);
         }
     }
 
+    #[cfg(feature = "tree-sitter-languages")]
     fn layer_languages(highlighter: &SyntaxHighlighter) -> Vec<String> {
         highlighter
             .injection_layers
@@ -5651,6 +5660,7 @@ $x = 1;
     /// large to parse at the key and a paste's over all of one, are a
     /// span, `move`, of the text's size: what such a key costs the
     /// drawing thread was in no span (elundqvist/kvist#594).
+    #[cfg(feature = "tree-sitter-languages")]
     #[test]
     fn test_trees_moved_without_a_parse_are_a_perf_span() {
         let (closed, _watching) = watch_perf_spans();

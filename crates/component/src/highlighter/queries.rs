@@ -176,7 +176,7 @@ fn claim(entry: &Arc<Entry>, owner: ThreadId) -> Option<Compiled> {
 }
 
 /// How many tasks `compiling_host` sent for `config`'s host queries.
-#[cfg(test)]
+#[cfg(all(test, feature = "tree-sitter-languages"))]
 pub(super) fn host_tasks_sent(config: &LanguageConfig) -> usize {
     entry(config).sent.load(Ordering::Relaxed)
 }

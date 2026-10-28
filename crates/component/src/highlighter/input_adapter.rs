@@ -629,6 +629,16 @@ mod tests {
         h
     }
 
+    /// `h`'s parses at the key, the text's and its spans', given all the
+    /// time they take, so that a test asserts what a key parsed and not
+    /// how long it took: on a busy machine a parse at the key ran out of
+    /// its 2 ms, and a test of one failed (elundqvist/kvist#608).
+    #[cfg(feature = "tree-sitter-languages")]
+    fn untimed(h: &mut TreeSitterInputHighlighter) {
+        h.shared.sync_parse_timeout = Duration::from_secs(60);
+        h.shared.inner.borrow_mut().untimed_spans();
+    }
+
     /// What the whole walk found: every named child walked, and those the
     /// range does not reach passed over.
     #[cfg(feature = "tree-sitter-languages")]
@@ -732,7 +742,8 @@ mod tests {
     /// made anew that differs is parsed afresh, a larger one coloured as
     /// the old was until then. The trees taken, the small text was taken
     /// for parsed, as it was the same, and stood plain and without its
-    /// chevrons until the next edit (elundqvist/kvist#384).
+    /// chevrons until the next edit (elundqvist/kvist#384), whatever the
+    /// key's parse takes (`untimed`, elundqvist/kvist#608).
     #[gpui::test]
     #[cfg(feature = "tree-sitter-languages")]
     fn test_a_text_made_anew_as_it_was_keeps_its_colours(cx: &mut gpui::TestAppContext) {
@@ -755,6 +766,7 @@ mod tests {
         for (source, functions) in [(small, 20), (large, 2_000)] {
             let rope = Rope::from(source.as_str());
             let mut h = built("rust");
+            untimed(&mut h);
             // parsed whole, as a pause's parse leaves it
             assert!(h.shared.inner.borrow_mut().update(None, &rope, None));
             assert!(coloured(&h, &source));
@@ -801,7 +813,9 @@ mod tests {
     /// text. Each such key handed the tree of the empty text, edited by the
     /// key alone, to the parse as its start, which finished at once with a
     /// tree of nothing: the README stood plain, whatever was typed after,
-    /// until it was opened again (elundqvist/kvist#376).
+    /// until it was opened again (elundqvist/kvist#376). The key's parse
+    /// has no time at all, so that it runs out of it on a fast machine too
+    /// (elundqvist/kvist#608).
     #[gpui::test]
     #[cfg(feature = "tree-sitter-languages")]
     fn test_keys_typed_before_an_opened_readme_is_parsed_are_coloured_once_it_is(
@@ -815,6 +829,7 @@ mod tests {
         let mut text = readme(60);
         assert!(parsed_at_the_key("markdown", text.len(), false));
         let mut h = built("markdown");
+        h.shared.sync_parse_timeout = Duration::ZERO;
         let mut handed = |h: &mut TreeSitterInputHighlighter, edit: Option<BaseInputEdit>, text: &str| {
             let rope = Rope::from(text);
             cx.update(|window, cx| editor.update(cx, |_, cx| h.update(edit, &rope, true, window, cx)));
@@ -959,7 +974,8 @@ mod tests {
     /// A fence of a language no one has compiled the highlight query of
     /// stands plain at the key, which compiles nothing, and is coloured
     /// once the parse after the pause lands; the same text opened again
-    /// after it is coloured at the key (elundqvist/kvist#593).
+    /// after it is coloured at the key (elundqvist/kvist#593), whatever
+    /// the key's parse takes (`untimed`, elundqvist/kvist#608).
     #[gpui::test]
     #[cfg(feature = "tree-sitter-languages")]
     fn test_a_fence_of_a_language_not_compiled_yet_is_coloured_once_the_pause_parse_lands(
@@ -985,13 +1001,24 @@ mod tests {
 
         let rope = Rope::from(text.as_str());
         let mut h = built("markdown");
+        untimed(&mut h);
         cx.update(|window, cx| editor.update(cx, |_, cx| h.update(None, &rope, true, window, cx)));
-        assert_ne!(h.styles(&range, theme.as_ref()), want, "left to the pause");
+        assert!(
+            h.shared.inner.borrow().tree().is_some(),
+            "the text parsed at the key"
+        );
+        assert_ne!(
+            h.styles(&range, theme.as_ref()),
+            want,
+            "the fence left to the pause"
+        );
+        assert!(h.shared.parse_task.borrow().is_some(), "left to the pause");
         cx.executor().advance_clock(Duration::from_secs(1));
         cx.run_until_parked();
         assert_eq!(h.styles(&range, theme.as_ref()), want);
 
         let mut again = built("markdown");
+        untimed(&mut again);
         cx.update(|window, cx| editor.update(cx, |_, cx| again.update(None, &rope, true, window, cx)));
         assert_eq!(again.styles(&range, theme.as_ref()), want, "at the key");
     }
