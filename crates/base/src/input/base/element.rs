@@ -875,18 +875,16 @@ impl<M: InputModeKind> TextElement<M> {
         paths
     }
 
+    /// The selection's path, with the keyboard or without it
+    /// (`InputBaseState::selection_fill`).
     fn layout_selections(
         &self,
         last_layout: &LastLayout,
         bounds: &mut Bounds<Pixels>,
-        window: &mut Window,
+        _: &mut Window,
         cx: &mut App,
     ) -> Option<Path<Pixels>> {
         let state = self.state.read(cx);
-        if !state.focus_handle.is_focused(window) {
-            return None;
-        }
-
         let mut selected_range = state.selected_range;
         if let Some(ime_marked_range) = &state.ime_marked_range {
             if !ime_marked_range.is_empty() {
@@ -2313,7 +2311,15 @@ impl<M: InputModeKind> Element for TextElement<M> {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let (focus_handle, show_cursor, disabled, selected_range, editor_style, editor_paddings) = {
+        let (
+            focus_handle,
+            show_cursor,
+            disabled,
+            selected_range,
+            editor_style,
+            editor_paddings,
+            selection_fill,
+        ) = {
             let state = self.state.read(cx);
             (
                 state.focus_handle.clone(),
@@ -2322,6 +2328,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 state.selected_range,
                 state.editor_style.clone(),
                 state.editor_paddings,
+                state.selection_fill(window, cx),
             )
         };
         let focused = focus_handle.is_focused(window);
@@ -2424,12 +2431,14 @@ impl<M: InputModeKind> Element for TextElement<M> {
             window.paint_path(path, editor_style.border.opacity(0.85));
         }
 
-        // Paint selections
+        // Paint selections: a search's matches and the word under the
+        // mouse in the active window, the selection in any, paler where
+        // the input has not the keyboard (`selection_fill`)
+        let secondary_selection = Hsla {
+            s: 0.1,
+            ..editor_style.selection
+        };
         if window.is_window_active() {
-            let secondary_selection = Hsla {
-                s: 0.1,
-                ..editor_style.selection
-            };
             for (path, is_active) in prepaint.search_match_paths.iter() {
                 window.paint_path(path.clone(), secondary_selection);
 
@@ -2437,12 +2446,16 @@ impl<M: InputModeKind> Element for TextElement<M> {
                     window.paint_path(path.clone(), editor_style.selection);
                 }
             }
+        }
 
-            if let Some(path) = prepaint.selection_path.take() {
-                window.paint_path(path, editor_style.selection);
-            }
+        #[cfg(test)]
+        let painted_selection = prepaint.selection_path.is_some();
+        if let Some(path) = prepaint.selection_path.take() {
+            window.paint_path(path, selection_fill);
+        }
 
-            // Paint hover highlight
+        // Paint hover highlight
+        if window.is_window_active() {
             if let Some(path) = prepaint.hover_highlight_path.take() {
                 window.paint_path(path, secondary_selection);
             }
@@ -2628,6 +2641,10 @@ impl<M: InputModeKind> Element for TextElement<M> {
             state.set_input_bounds(input_bounds, cx);
             state.last_selected_range = Some(selected_range);
             state.selected_all = false;
+            #[cfg(test)]
+            {
+                state.painted_selection = painted_selection;
+            }
             state.scroll_size = prepaint.scroll_size;
             state.fold_placeholders = fold_placeholders;
             // the scroll the frame applied is told above, by `bounds`, whose
