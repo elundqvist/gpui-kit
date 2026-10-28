@@ -242,6 +242,27 @@ asks (section 4(b)); each says so at its top:
   background and its underline and strikethrough the same. A test of a
   line of 240 000 glyphs drawn at its end, its background and underline
   where its glyphs are laid out.
+- `src/window.rs` and `src/view.rs`: a cached view's element states are
+  kept apart from the rest of the frame's, with the view's own state
+  (`Frame::cached_views`, `CachedViewStates`), and a frame that takes the
+  view whole from the frame before takes them over as one map
+  (`Window::reuse_view_element_states`) (elundqvist/kvist#620). gpui kept
+  one map of every element state a frame used, and moved each state a
+  part of the frame taken whole had used into the new frame's map at the
+  frame's end (`Frame::finish`), a hash of its element's path each: an
+  open panel taken into each frame paid that for every element in it.
+  Now a state is taken from the frame before as it is used, as before,
+  into the map of the innermost cached view being drawn anew
+  (`Window::with_view_element_states`, a stack of them), or the frame's
+  own outside every one; a deferred draw keeps its states with the view
+  it was deferred in, so they go with it; and a frame's ranges index the
+  cached views it drew or took (`accessed_cached_views`) rather than
+  every state, so a view taken whole takes the views inside it, each
+  with its states, carrying their ranges as #611 did. `Frame::finish`
+  moves nothing. Tests of a state inside a cached view, in its tree and
+  deferred, kept through frames that take the view whole, its own and
+  its parent's, found once the view is drawn anew, and let go once the
+  view drawn anew no longer draws it.
 
 ## Tests
 

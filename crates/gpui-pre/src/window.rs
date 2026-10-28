@@ -1028,15 +1028,44 @@ pub(crate) struct DeferredDraw {
     rem_size: Pixels,
     element: Option<AnyElement>,
     absolute_offset: Point<Pixels>,
+    /// The cached view whose element states the draw's elements keep
+    /// theirs with: the innermost one being drawn where it was deferred.
+    element_states_of: Option<GlobalElementId>,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
+}
+
+type ElementStateMap = FxHashMap<(GlobalElementId, TypeId), ElementStateBox>;
+
+/// A cached view's part of a frame's element states: the view's own state
+/// and the states of the elements drawn inside it, the cached views among
+/// them having theirs apart. Taken whole into the next frame where the view
+/// is (elundqvist/kvist#620).
+#[derive(Default)]
+pub(crate) struct CachedViewStates {
+    view: Option<ViewElementState>,
+    element_states: ElementStateMap,
+}
+
+/// A cached view being drawn anew: the element states drawn inside it so
+/// far in this frame, and those of the frame drawn last not yet taken.
+struct ElementStateScope {
+    view: GlobalElementId,
+    next: ElementStateMap,
+    rendered: ElementStateMap,
 }
 
 pub(crate) struct Frame {
     pub(crate) focus: Option<FocusId>,
     pub(crate) window_active: bool,
-    pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
-    accessed_element_states: Vec<(GlobalElementId, TypeId)>,
+    /// The states of the elements drawn outside every cached view.
+    pub(crate) element_states: ElementStateMap,
+    /// Each cached view in the frame, by its id, with its states.
+    pub(crate) cached_views: FxHashMap<GlobalElementId, CachedViewStates>,
+    /// The cached views in the order they were drawn or taken into the
+    /// frame, which its ranges index: a range taken into the next frame
+    /// takes the views in it with it.
+    accessed_cached_views: Vec<GlobalElementId>,
     pub(crate) mouse_listeners: Vec<Option<AnyMouseListener>>,
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
@@ -1061,7 +1090,7 @@ pub(crate) struct PrepaintStateIndex {
     tooltips_index: usize,
     deferred_draws_index: usize,
     dispatch_tree_index: usize,
-    accessed_element_states_index: usize,
+    cached_views_index: usize,
     line_layout_index: LineLayoutIndex,
 }
 
@@ -1071,7 +1100,7 @@ pub(crate) struct PaintIndex {
     mouse_listeners_index: usize,
     input_handlers_index: usize,
     cursor_styles_index: usize,
-    accessed_element_states_index: usize,
+    cached_views_index: usize,
     tab_handle_index: usize,
     line_layout_index: LineLayoutIndex,
 }
@@ -1085,11 +1114,15 @@ impl PrepaintStateIndex {
         PrepaintStateIndex {
             hitboxes_index: self.hitboxes_index - from.hitboxes_index + to.hitboxes_index,
             tooltips_index: self.tooltips_index - from.tooltips_index + to.tooltips_index,
-            deferred_draws_index: self.deferred_draws_index - from.deferred_draws_index + to.deferred_draws_index,
-            dispatch_tree_index: self.dispatch_tree_index - from.dispatch_tree_index + to.dispatch_tree_index,
-            accessed_element_states_index: self.accessed_element_states_index - from.accessed_element_states_index
-                + to.accessed_element_states_index,
-            line_layout_index: self.line_layout_index.moved(&from.line_layout_index, &to.line_layout_index),
+            deferred_draws_index: self.deferred_draws_index - from.deferred_draws_index
+                + to.deferred_draws_index,
+            dispatch_tree_index: self.dispatch_tree_index - from.dispatch_tree_index
+                + to.dispatch_tree_index,
+            cached_views_index: self.cached_views_index - from.cached_views_index
+                + to.cached_views_index,
+            line_layout_index: self
+                .line_layout_index
+                .moved(&from.line_layout_index, &to.line_layout_index),
         }
     }
 }
@@ -1099,13 +1132,18 @@ impl PaintIndex {
     pub(crate) fn moved(&self, from: &Self, to: &Self) -> Self {
         PaintIndex {
             scene_index: self.scene_index - from.scene_index + to.scene_index,
-            mouse_listeners_index: self.mouse_listeners_index - from.mouse_listeners_index + to.mouse_listeners_index,
-            input_handlers_index: self.input_handlers_index - from.input_handlers_index + to.input_handlers_index,
-            cursor_styles_index: self.cursor_styles_index - from.cursor_styles_index + to.cursor_styles_index,
-            accessed_element_states_index: self.accessed_element_states_index - from.accessed_element_states_index
-                + to.accessed_element_states_index,
+            mouse_listeners_index: self.mouse_listeners_index - from.mouse_listeners_index
+                + to.mouse_listeners_index,
+            input_handlers_index: self.input_handlers_index - from.input_handlers_index
+                + to.input_handlers_index,
+            cursor_styles_index: self.cursor_styles_index - from.cursor_styles_index
+                + to.cursor_styles_index,
+            cached_views_index: self.cached_views_index - from.cached_views_index
+                + to.cached_views_index,
             tab_handle_index: self.tab_handle_index - from.tab_handle_index + to.tab_handle_index,
-            line_layout_index: self.line_layout_index.moved(&from.line_layout_index, &to.line_layout_index),
+            line_layout_index: self
+                .line_layout_index
+                .moved(&from.line_layout_index, &to.line_layout_index),
         }
     }
 }
@@ -1116,7 +1154,8 @@ impl Frame {
             focus: None,
             window_active: false,
             element_states: FxHashMap::default(),
-            accessed_element_states: Vec::new(),
+            cached_views: FxHashMap::default(),
+            accessed_cached_views: Vec::new(),
             mouse_listeners: Vec::new(),
             dispatch_tree,
             scene: Scene::default(),
@@ -1141,7 +1180,8 @@ impl Frame {
 
     pub(crate) fn clear(&mut self) {
         self.element_states.clear();
-        self.accessed_element_states.clear();
+        self.cached_views.clear();
+        self.accessed_cached_views.clear();
         self.mouse_listeners.clear();
         self.dispatch_tree.clear();
         self.scene.clear();
@@ -1211,15 +1251,11 @@ impl Frame {
             .unwrap_or_default()
     }
 
-    pub(crate) fn finish(&mut self, prev_frame: &mut Self) {
-        for element_state_key in &self.accessed_element_states {
-            if let Some((element_state_key, element_state)) =
-                prev_frame.element_states.remove_entry(element_state_key)
-            {
-                self.element_states.insert(element_state_key, element_state);
-            }
-        }
-
+    /// The element states are in place by now: each taken from the frame
+    /// drawn last as it was used, and a cached view's taken whole with the
+    /// view, where gpui moved every state a part of the frame taken whole
+    /// had used, one by one, a hash of its path each.
+    pub(crate) fn finish(&mut self) {
         self.scene.finish();
     }
 }
@@ -1267,6 +1303,8 @@ pub struct Window {
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
+    /// The cached views being drawn anew, the innermost last.
+    element_state_scopes: Vec<ElementStateScope>,
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
@@ -2111,6 +2149,7 @@ impl Window {
             focused_text_input_active: false,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+            element_state_scopes: Vec::new(),
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
@@ -3315,6 +3354,7 @@ impl Window {
             }
         }
         self.dirty_views.clear();
+        debug_assert!(self.element_state_scopes.is_empty());
         self.next_frame.window_active = self.active.get();
 
         // Register requested input handler with the platform window.
@@ -3348,7 +3388,7 @@ impl Window {
 
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
-        self.next_frame.finish(&mut self.rendered_frame);
+        self.next_frame.finish();
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
@@ -3735,7 +3775,15 @@ impl Window {
             traversal_order.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
 
             for deferred_draw_ix in traversal_order {
-                let (element, parent_node, current_view, rem_size, absolute_offset, prepaint_range) = {
+                let (
+                    element,
+                    parent_node,
+                    current_view,
+                    rem_size,
+                    absolute_offset,
+                    element_states_of,
+                    prepaint_range,
+                ) = {
                     let deferred_draw = &mut self.next_frame.deferred_draws[deferred_draw_ix];
                     self.element_id_stack
                         .clone_from(&deferred_draw.element_id_stack);
@@ -3747,6 +3795,7 @@ impl Window {
                         deferred_draw.current_view,
                         deferred_draw.rem_size,
                         deferred_draw.absolute_offset,
+                        deferred_draw.element_states_of.clone(),
                         deferred_draw.prepaint_range.clone(),
                     )
                 };
@@ -3754,12 +3803,14 @@ impl Window {
 
                 let prepaint_start = self.prepaint_index();
                 if let Some(mut element) = element {
-                    self.with_rendered_view(current_view, |window| {
-                        window.with_rem_size(Some(rem_size), |window| {
-                            window.with_absolute_element_offset(absolute_offset, |window| {
-                                element.prepaint(window, cx);
+                    self.with_view_element_states(element_states_of.as_ref(), |window| {
+                        window.with_rendered_view(current_view, |window| {
+                            window.with_rem_size(Some(rem_size), |window| {
+                                window.with_absolute_element_offset(absolute_offset, |window| {
+                                    element.prepaint(window, cx);
+                                });
                             });
-                        });
+                        })
                     });
                     self.next_frame.deferred_draws[deferred_draw_ix].element = Some(element);
                 } else {
@@ -3798,11 +3849,14 @@ impl Window {
             let paint_start = self.paint_index();
             let content_mask = deferred_draw.content_mask;
             if let Some(element) = deferred_draw.element.as_mut() {
-                self.with_rendered_view(deferred_draw.current_view, |window| {
-                    window.with_content_mask(content_mask, |window| {
-                        window.with_rem_size(Some(deferred_draw.rem_size), |window| {
-                            element.paint(window, cx);
-                        });
+                let (current_view, rem_size) = (deferred_draw.current_view, deferred_draw.rem_size);
+                self.with_view_element_states(deferred_draw.element_states_of.as_ref(), |window| {
+                    window.with_rendered_view(current_view, |window| {
+                        window.with_content_mask(content_mask, |window| {
+                            window.with_rem_size(Some(rem_size), |window| {
+                                element.paint(window, cx);
+                            });
+                        })
                     })
                 })
             } else {
@@ -3828,7 +3882,7 @@ impl Window {
             tooltips_index: self.next_frame.tooltip_requests.len(),
             deferred_draws_index: self.next_frame.deferred_draws.len(),
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
-            accessed_element_states_index: self.next_frame.accessed_element_states.len(),
+            cached_views_index: self.next_frame.accessed_cached_views.len(),
             line_layout_index: self.text_system.layout_index(),
         }
     }
@@ -3838,8 +3892,8 @@ impl Window {
         // in the next where the view around them is drawn anew
         let to = self.prepaint_index();
         let draws = self.draws;
-        self.carry_view_states(
-            range.start.accessed_element_states_index..range.end.accessed_element_states_index,
+        self.carry_cached_views(
+            range.start.cached_views_index..range.end.cached_views_index,
             |state| state.carry_prepaint(&range.start, &to, draws),
         );
         self.next_frame.hitboxes.extend(
@@ -3852,12 +3906,6 @@ impl Window {
                 [range.start.tooltips_index..range.end.tooltips_index]
                 .iter_mut()
                 .map(|request| request.take()),
-        );
-        self.next_frame.accessed_element_states.extend(
-            self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
-                ..range.end.accessed_element_states_index]
-                .iter()
-                .map(|(id, type_id)| (id.clone(), *type_id)),
         );
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
@@ -3886,6 +3934,7 @@ impl Window {
                     priority: deferred_draw.priority,
                     element: None,
                     absolute_offset: deferred_draw.absolute_offset,
+                    element_states_of: deferred_draw.element_states_of.clone(),
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
                 }),
@@ -3898,7 +3947,7 @@ impl Window {
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
-            accessed_element_states_index: self.next_frame.accessed_element_states.len(),
+            cached_views_index: self.next_frame.accessed_cached_views.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             line_layout_index: self.text_system.layout_index(),
         }
@@ -3907,8 +3956,8 @@ impl Window {
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
         let to = self.paint_index();
         let draws = self.draws;
-        self.carry_view_states(
-            range.start.accessed_element_states_index..range.end.accessed_element_states_index,
+        self.carry_cached_views(
+            range.start.cached_views_index..range.end.cached_views_index,
             |state| state.carry_paint(&range.start, &to, draws),
         );
         self.next_frame.cursor_styles.extend(
@@ -3929,12 +3978,6 @@ impl Window {
                 .iter_mut()
                 .map(|listener| listener.take()),
         );
-        self.next_frame.accessed_element_states.extend(
-            self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
-                ..range.end.accessed_element_states_index]
-                .iter()
-                .map(|(id, type_id)| (id.clone(), *type_id)),
-        );
         self.next_frame.tab_stops.replay(
             &self.rendered_frame.tab_stops.insertion_history
                 [range.start.tab_handle_index..range.end.tab_handle_index],
@@ -3948,24 +3991,162 @@ impl Window {
         );
     }
 
-    /// The states of the cached views among the element states the frame
-    /// drawn last accessed in `range`, which nothing in the frame being
-    /// drawn has taken yet.
-    fn carry_view_states(&mut self, range: Range<usize>, mut carry: impl FnMut(&mut ViewElementState)) {
+    /// The cached views in `range` of the frame drawn last, taken into the
+    /// frame being drawn with the part of it they are in: each with its
+    /// element states whole, and its state handed to `carry`. A view the
+    /// frame being drawn has already (the prepaint's, as its paint is
+    /// taken) keeps what it has.
+    fn carry_cached_views(
+        &mut self,
+        range: Range<usize>,
+        mut carry: impl FnMut(&mut ViewElementState),
+    ) {
         let Frame {
-            accessed_element_states,
-            element_states,
+            accessed_cached_views,
+            cached_views,
             ..
         } = &mut self.rendered_frame;
-        let view_state = TypeId::of::<ViewElementState>();
-        for key in &accessed_element_states[range] {
-            if key.1 == view_state
-                && let Some(state) = element_states.get_mut(key)
-                && let Some(Some(state)) = state.inner.downcast_mut::<Option<ViewElementState>>()
-            {
+        let views = &accessed_cached_views[range];
+        for view in views {
+            let states = match cached_views.remove(view) {
+                Some(states) => self
+                    .next_frame
+                    .cached_views
+                    .entry(view.clone())
+                    .or_insert(states),
+                None => match self.next_frame.cached_views.get_mut(view) {
+                    Some(states) => states,
+                    None => continue,
+                },
+            };
+            if let Some(state) = states.view.as_mut() {
                 carry(state);
             }
         }
+        self.next_frame
+            .accessed_cached_views
+            .extend(views.iter().cloned());
+    }
+
+    /// The element states `with_element_state` keeps a state in and takes
+    /// one from: the frame being drawn's and the frame drawn last's of the
+    /// innermost cached view being drawn anew, or of the frames themselves
+    /// outside every one.
+    fn element_state_maps(&mut self) -> (&mut ElementStateMap, &mut ElementStateMap) {
+        match self.element_state_scopes.last_mut() {
+            Some(scope) => (&mut scope.next, &mut scope.rendered),
+            None => (
+                &mut self.next_frame.element_states,
+                &mut self.rendered_frame.element_states,
+            ),
+        }
+    }
+
+    /// Run `f` with the element states of the cached view `view`, being
+    /// drawn anew, in place of those around it: the elements drawn inside
+    /// it keep theirs with the view's, which are taken whole into a frame
+    /// that takes the view whole (`reuse_view_element_states`).
+    pub(crate) fn with_view_element_states<R>(
+        &mut self,
+        view: Option<&GlobalElementId>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Some(view) = view else {
+            return f(self);
+        };
+        let next = mem::take(
+            &mut self
+                .next_frame
+                .cached_views
+                .entry(view.clone())
+                .or_default()
+                .element_states,
+        );
+        let rendered = self
+            .rendered_frame
+            .cached_views
+            .get_mut(view)
+            .map(|states| mem::take(&mut states.element_states))
+            .unwrap_or_default();
+        self.element_state_scopes.push(ElementStateScope {
+            view: view.clone(),
+            next,
+            rendered,
+        });
+        let result = f(self);
+        let scope = self
+            .element_state_scopes
+            .pop()
+            .expect("the scope pushed above");
+        // what the frame drawn last has left is there for the paint, and
+        // goes with that frame
+        if let Some(states) = self.rendered_frame.cached_views.get_mut(&scope.view) {
+            states.element_states = scope.rendered;
+        }
+        self.next_frame
+            .cached_views
+            .entry(scope.view)
+            .or_default()
+            .element_states = scope.next;
+        result
+    }
+
+    /// The element states of the cached view `view` in the frame drawn last,
+    /// taken whole into the frame being drawn, which takes the view's part
+    /// of that frame whole.
+    pub(crate) fn reuse_view_element_states(&mut self, view: &GlobalElementId) {
+        let Some(taken) = self
+            .rendered_frame
+            .cached_views
+            .get_mut(view)
+            .map(|states| mem::take(&mut states.element_states))
+        else {
+            return;
+        };
+        let states = &mut self
+            .next_frame
+            .cached_views
+            .entry(view.clone())
+            .or_default()
+            .element_states;
+        if states.is_empty() {
+            *states = taken;
+        } else {
+            for (key, state) in taken {
+                states.entry(key).or_insert(state);
+            }
+        }
+    }
+
+    /// `with_element_state` for a cached view's own state, which is kept
+    /// with the states of the elements drawn inside it.
+    pub(crate) fn with_view_state<R>(
+        &mut self,
+        view: &GlobalElementId,
+        f: impl FnOnce(Option<ViewElementState>, &mut Self) -> (R, ViewElementState),
+    ) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        self.next_frame.accessed_cached_views.push(view.clone());
+        let state = match self
+            .next_frame
+            .cached_views
+            .get_mut(view)
+            .and_then(|states| states.view.take())
+        {
+            Some(state) => Some(state),
+            None => self
+                .rendered_frame
+                .cached_views
+                .get_mut(view)
+                .and_then(|states| states.view.take()),
+        };
+        let (result, state) = f(state, self);
+        self.next_frame
+            .cached_views
+            .entry(view.clone())
+            .or_default()
+            .view = Some(state);
+        result
     }
 
     /// Push a text style onto the stack, and call a function with that style active.
@@ -4112,8 +4293,8 @@ impl Window {
                 .dispatch_tree
                 .truncate(index.dispatch_tree_index);
             self.next_frame
-                .accessed_element_states
-                .truncate(index.accessed_element_states_index);
+                .accessed_cached_views
+                .truncate(index.cached_views_index);
             self.text_system.truncate_layouts(index.line_layout_index);
         }
         result
@@ -4274,14 +4455,8 @@ impl Window {
         self.invalidator.debug_assert_paint_or_prepaint();
 
         let key = (global_id.clone(), TypeId::of::<S>());
-        self.next_frame.accessed_element_states.push(key.clone());
-
-        if let Some(any) = self
-            .next_frame
-            .element_states
-            .remove(&key)
-            .or_else(|| self.rendered_frame.element_states.remove(&key))
-        {
+        let (next, rendered) = self.element_state_maps();
+        if let Some(any) = next.remove(&key).or_else(|| rendered.remove(&key)) {
             let ElementStateBox {
                 inner,
                 #[cfg(debug_assertions)]
@@ -4315,7 +4490,7 @@ impl Window {
             );
             let (result, state) = f(Some(state), self);
             state_box.replace(state);
-            self.next_frame.element_states.insert(
+            self.element_state_maps().0.insert(
                 key,
                 ElementStateBox {
                     inner: state_box,
@@ -4326,7 +4501,7 @@ impl Window {
             result
         } else {
             let (result, state) = f(None, self);
-            self.next_frame.element_states.insert(
+            self.element_state_maps().0.insert(
                 key,
                 ElementStateBox {
                     inner: Box::new(Some(state)),
@@ -4411,6 +4586,10 @@ impl Window {
             priority,
             element: Some(element),
             absolute_offset,
+            element_states_of: self
+                .element_state_scopes
+                .last()
+                .map(|scope| scope.view.clone()),
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
         });

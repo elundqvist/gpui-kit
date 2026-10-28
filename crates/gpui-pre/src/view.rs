@@ -410,38 +410,39 @@ impl<V: View> Element for ViewElement<V> {
                     return Some(element);
                 }
 
-                window.with_element_state::<ViewElementState, _>(
-                    global_id.unwrap(),
-                    |element_state, window| {
-                        let content_mask = window.content_mask();
-                        let text_style = window.text_style();
+                let global_id = global_id.unwrap();
+                window.with_view_state(global_id, |element_state, window| {
+                    let content_mask = window.content_mask();
+                    let text_style = window.text_style();
 
-                        if let Some(mut element_state) = element_state
-                            && element_state.cache_key.bounds == bounds
-                            && element_state.cache_key.content_mask == content_mask
-                            && element_state.cache_key.text_style == text_style
-                            && !window.dirty_views.contains(&entity_id)
-                            && !window.refreshing
-                            && element_state.prepaint_drawn + 1 == window.draws
-                            && element_state.paint_drawn + 1 == window.draws
-                        {
-                            let prepaint_start = window.prepaint_index();
-                            window.reuse_prepaint(element_state.prepaint_range.clone());
-                            cx.entities
-                                .extend_accessed(&element_state.accessed_entities);
-                            let prepaint_end = window.prepaint_index();
-                            element_state.prepaint_range = prepaint_start..prepaint_end;
-                            element_state.prepaint_drawn = window.draws;
-
-                            return (None, element_state);
-                        }
-
-                        // drawn anew, it draws anew only those of the cached
-                        // views inside it that changed: the rest are taken
-                        // from the frame drawn last, where upstream had the
-                        // window refresh them all (elundqvist/kvist#611)
+                    if let Some(mut element_state) = element_state
+                        && element_state.cache_key.bounds == bounds
+                        && element_state.cache_key.content_mask == content_mask
+                        && element_state.cache_key.text_style == text_style
+                        && !window.dirty_views.contains(&entity_id)
+                        && !window.refreshing
+                        && element_state.prepaint_drawn + 1 == window.draws
+                        && element_state.paint_drawn + 1 == window.draws
+                    {
                         let prepaint_start = window.prepaint_index();
-                        let (mut element, accessed_entities) = cx.detect_accessed_entities(|cx| {
+                        window.reuse_view_element_states(global_id);
+                        window.reuse_prepaint(element_state.prepaint_range.clone());
+                        cx.entities
+                            .extend_accessed(&element_state.accessed_entities);
+                        let prepaint_end = window.prepaint_index();
+                        element_state.prepaint_range = prepaint_start..prepaint_end;
+                        element_state.prepaint_drawn = window.draws;
+
+                        return (None, element_state);
+                    }
+
+                    // drawn anew, it draws anew only those of the cached
+                    // views inside it that changed: the rest are taken
+                    // from the frame drawn last, where upstream had the
+                    // window refresh them all (elundqvist/kvist#611)
+                    let prepaint_start = window.prepaint_index();
+                    let (mut element, accessed_entities) = cx.detect_accessed_entities(|cx| {
+                        window.with_view_element_states(Some(global_id), |window| {
                             let mut element = self
                                 .view
                                 .take()
@@ -451,27 +452,27 @@ impl<V: View> Element for ViewElement<V> {
                             element.layout_as_root(bounds.size.into(), window, cx);
                             element.prepaint_at(bounds.origin, window, cx);
                             element
-                        });
+                        })
+                    });
 
-                        let prepaint_end = window.prepaint_index();
+                    let prepaint_end = window.prepaint_index();
 
-                        (
-                            Some(element),
-                            ViewElementState {
-                                accessed_entities,
-                                prepaint_range: prepaint_start..prepaint_end,
-                                paint_range: PaintIndex::default()..PaintIndex::default(),
-                                prepaint_drawn: window.draws,
-                                paint_drawn: 0,
-                                cache_key: ViewElementCacheKey {
-                                    bounds,
-                                    content_mask,
-                                    text_style,
-                                },
+                    (
+                        Some(element),
+                        ViewElementState {
+                            accessed_entities,
+                            prepaint_range: prepaint_start..prepaint_end,
+                            paint_range: PaintIndex::default()..PaintIndex::default(),
+                            prepaint_drawn: window.draws,
+                            paint_drawn: 0,
+                            cache_key: ViewElementCacheKey {
+                                bounds,
+                                content_mask,
+                                text_style,
                             },
-                        )
-                    },
-                )
+                        },
+                    )
+                })
             })
         } else {
             // Stateless path: just prepaint the element.
@@ -500,27 +501,27 @@ impl<V: View> Element for ViewElement<V> {
             window.with_rendered_view(entity_id, |window| {
                 let caching_disabled = window.is_inspector_picking(cx);
                 if self.cached_style.is_some() && !caching_disabled {
-                    window.with_element_state::<ViewElementState, _>(
-                        global_id.unwrap(),
-                        |element_state, window| {
-                            let mut element_state = element_state.unwrap();
+                    let global_id = global_id.unwrap();
+                    window.with_view_state(global_id, |element_state, window| {
+                        let mut element_state = element_state.unwrap();
 
-                            let paint_start = window.paint_index();
+                        let paint_start = window.paint_index();
 
-                            if let Some(element) = element {
-                                element.paint(window, cx);
-                            } else {
-                                debug_assert_eq!(element_state.paint_drawn + 1, window.draws);
-                                window.reuse_paint(element_state.paint_range.clone());
-                            }
+                        if let Some(element) = element {
+                            window.with_view_element_states(Some(global_id), |window| {
+                                element.paint(window, cx)
+                            });
+                        } else {
+                            debug_assert_eq!(element_state.paint_drawn + 1, window.draws);
+                            window.reuse_paint(element_state.paint_range.clone());
+                        }
 
-                            let paint_end = window.paint_index();
-                            element_state.paint_range = paint_start..paint_end;
-                            element_state.paint_drawn = window.draws;
+                        let paint_end = window.paint_index();
+                        element_state.paint_range = paint_start..paint_end;
+                        element_state.paint_drawn = window.draws;
 
-                            ((), element_state)
-                        },
-                    )
+                        ((), element_state)
+                    })
                 } else {
                     element.as_mut().unwrap().paint(window, cx);
                 }
@@ -549,11 +550,14 @@ impl Render for EmptyView {
 #[cfg(test)]
 mod tests {
     use crate::{
-        AnyElement, App, Background, Bounds, Context, Element, ElementId, Entity,
-        GlobalElementId, InspectorElementId, LayoutId, Modifiers, Pixels, Style,
-        StyleRefinement, TestAppContext, Window, div, point, prelude::*, px, relative, rgb,
+        AnyElement, App, Background, Bounds, Context, Element, ElementId, Entity, GlobalElementId,
+        InspectorElementId, LayoutId, Modifiers, Pixels, Style, StyleRefinement, TestAppContext,
+        Window, deferred, div, point, prelude::*, px, relative, rgb,
     };
-    use std::{cell::Cell, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::{Rc, Weak},
+    };
 
     const INNER: u32 = 0x123456;
 
@@ -943,5 +947,233 @@ mod tests {
             cx.simulate_click(point(px(50.), px(50.)), Modifiers::default());
             assert_eq!(clicks.get(), i + 1, "round {i}");
         }
+    }
+    /// An element that keeps a state of its own from its prepaint on, and
+    /// counts how often it had to make one.
+    struct Kept {
+        made: Rc<Cell<usize>>,
+        alive: Rc<RefCell<Weak<()>>>,
+    }
+
+    impl IntoElement for Kept {
+        type Element = Self;
+
+        fn into_element(self) -> Self {
+            self
+        }
+    }
+
+    impl Element for Kept {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<ElementId> {
+            Some("kept".into())
+        }
+
+        fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, ()) {
+            let mut style = Style::default();
+            style.size.width = px(10.).into();
+            style.size.height = px(10.).into();
+            (window.request_layout(style, None, cx), ())
+        }
+
+        fn prepaint(
+            &mut self,
+            id: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            _: Bounds<Pixels>,
+            _: &mut (),
+            window: &mut Window,
+            _: &mut App,
+        ) {
+            window.with_element_state(id.unwrap(), |state: Option<Rc<()>>, _| {
+                let state = state.unwrap_or_else(|| {
+                    self.made.set(self.made.get() + 1);
+                    let state = Rc::new(());
+                    *self.alive.borrow_mut() = Rc::downgrade(&state);
+                    state
+                });
+                ((), state)
+            })
+        }
+
+        fn paint(
+            &mut self,
+            _: Option<&GlobalElementId>,
+            _: Option<&InspectorElementId>,
+            _: Bounds<Pixels>,
+            _: &mut (),
+            _: &mut (),
+            _: &mut Window,
+            _: &mut App,
+        ) {
+        }
+    }
+
+    /// A cached view that draws a `Kept`, in its tree or deferred.
+    struct Keeper {
+        made: Rc<Cell<usize>>,
+        alive: Rc<RefCell<Weak<()>>>,
+        deferred: bool,
+        shown: bool,
+    }
+
+    impl Render for Keeper {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let kept = Kept {
+                made: self.made.clone(),
+                alive: self.alive.clone(),
+            };
+            div()
+                .size_full()
+                .when(self.shown && !self.deferred, |div| div.child(kept))
+                .when(self.shown && self.deferred, |div| {
+                    div.child(deferred(Kept {
+                        made: self.made.clone(),
+                        alive: self.alive.clone(),
+                    }))
+                })
+        }
+    }
+
+    /// A cached view around it.
+    struct AroundKeeper {
+        keeper: Entity<Keeper>,
+    }
+
+    impl Render for AroundKeeper {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                self.keeper
+                    .clone()
+                    .cached(StyleRefinement::default().size_full()),
+            )
+        }
+    }
+
+    struct KeeperRoot {
+        around: Entity<AroundKeeper>,
+        before: usize,
+    }
+
+    impl Render for KeeperRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .relative()
+                .size_full()
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(200.))
+                        .left_0()
+                        .w(px(100.))
+                        .children((0..self.before).map(|i| div().id(i).h(px(10.)).w_full())),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .w(px(100.))
+                        .h(px(100.))
+                        .child(
+                            self.around
+                                .clone()
+                                .cached(StyleRefinement::default().size_full()),
+                        ),
+                )
+        }
+    }
+
+    /// The element states of a cached view are taken whole into a frame
+    /// that takes the view whole, its own, or its parent's that holds it,
+    /// where gpui moved them one by one (elundqvist/kvist#620): an element
+    /// inside it, in its tree or deferred, keeps its state through frames
+    /// that take the view whole and finds it once the view is drawn anew,
+    /// and the state goes once the view drawn anew no longer draws it.
+    fn kept_across_reused_views(deferred: bool, cx: &mut TestAppContext) {
+        let made = Rc::new(Cell::new(0));
+        let alive = Rc::new(RefCell::new(Weak::new()));
+        let (keeper_made, keeper_alive) = (made.clone(), alive.clone());
+        let (root, cx) = cx.add_window_view(move |_, cx| {
+            let keeper = cx.new(|_| Keeper {
+                made: keeper_made,
+                alive: keeper_alive,
+                deferred,
+                shown: true,
+            });
+            KeeperRoot {
+                around: cx.new(|_| AroundKeeper { keeper }),
+                before: 0,
+            }
+        });
+        assert_eq!(made.get(), 1);
+        let around = root.read_with(cx, |root, _| root.around.clone());
+        let keeper = around.read_with(cx, |around, _| around.keeper.clone());
+        // the root drawn anew, both views taken whole, further on each time
+        for before in [3, 1, 6] {
+            root.update(cx, |root, cx| {
+                root.before = before;
+                cx.notify();
+            });
+            cx.run_until_parked();
+        }
+        // the view around it drawn anew, the keeper taken whole inside it
+        around.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        root.update(cx, |root, cx| {
+            root.before = 2;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // and the keeper drawn anew finds the state it had
+        keeper.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(made.get(), 1, "deferred: {deferred}");
+        assert!(alive.borrow().upgrade().is_some(), "deferred: {deferred}");
+
+        // the whole window drawn anew keeps it too
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert_eq!(made.get(), 1, "deferred: {deferred}");
+
+        // drawn anew without it, the keeper lets it go
+        keeper.update(cx, |keeper, cx| {
+            keeper.shown = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(alive.borrow().upgrade().is_none(), "deferred: {deferred}");
+        keeper.update(cx, |keeper, cx| {
+            keeper.shown = true;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(made.get(), 2, "deferred: {deferred}");
+    }
+
+    #[gpui::test]
+    fn an_element_inside_a_cached_view_keeps_its_state_while_the_view_is_taken_whole(
+        cx: &mut TestAppContext,
+    ) {
+        kept_across_reused_views(false, cx);
+    }
+
+    #[gpui::test]
+    fn a_deferred_element_inside_a_cached_view_keeps_its_state_while_the_view_is_taken_whole(
+        cx: &mut TestAppContext,
+    ) {
+        kept_across_reused_views(true, cx);
     }
 }
