@@ -28,6 +28,31 @@ pub(super) struct LastLayout {
 }
 
 impl LastLayout {
+    /// Whether `other` puts everything where this does: the same lines in
+    /// sight, each as long and wrapped and as wide, the caret in the same
+    /// place. What is drawn may differ (a colour, a glyph of the same
+    /// width) where nothing that reads the layout after a paint would.
+    pub(super) fn same_place(&self, other: &LastLayout) -> bool {
+        self.visible_range == other.visible_range
+            && self.visible_buffer_lines == other.visible_buffer_lines
+            && self.visible_line_byte_offsets == other.visible_line_byte_offsets
+            && self.visible_top == other.visible_top
+            && self.visible_range_offset == other.visible_range_offset
+            && self.line_height == other.line_height
+            && self.wrap_width == other.wrap_width
+            && self.wrapping_indent == other.wrapping_indent
+            && self.line_number_width == other.line_number_width
+            && self.cursor_bounds == other.cursor_bounds
+            && self.text_align == other.text_align
+            && self.content_width == other.content_width
+            && self.lines.len() == other.lines.len()
+            && self
+                .lines
+                .iter()
+                .zip(other.lines.iter())
+                .all(|(a, b)| a.same_place(b))
+    }
+
     pub(crate) fn line(&self, row: usize) -> Option<&LineLayout> {
         let pos = self.visible_buffer_lines.binary_search(&row).ok()?;
         self.lines.get(pos)

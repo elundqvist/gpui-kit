@@ -2600,22 +2600,47 @@ impl<M: InputModeKind> Element for TextElement<M> {
         );
 
         self.state.update(cx, |state, cx| {
+            let fold_placeholders: Vec<_> = prepaint
+                .fold_placeholders
+                .iter()
+                .map(|(line, bounds, _)| (*line, *bounds))
+                .collect();
+            // What reads the state after the paint (the popovers placed at
+            // the caret, the scrollbar, a view that follows what is in
+            // sight) is told only where the paint moved something. Told at
+            // every paint, every view the input is in was drawn again with
+            // each frame the window drew, a cached one too
+            // (elundqvist/kvist#602). A scroll is in `bounds`, whose origin
+            // carries the offset the frame was laid out at.
+            let moved = state
+                .last_layout
+                .as_ref()
+                .is_none_or(|last| !last.same_place(&prepaint.last_layout))
+                || state.last_bounds != Some(bounds)
+                || state.input_bounds != input_bounds
+                || state.last_cursor != Some(state.cursor())
+                || state.last_selected_range != Some(selected_range)
+                || state.scroll_size != prepaint.scroll_size
+                || state.fold_placeholders != fold_placeholders;
             state.last_layout = Some(prepaint.last_layout.clone());
             state.last_bounds = Some(bounds);
             state.last_cursor = Some(state.cursor());
             state.set_input_bounds(input_bounds, cx);
             state.last_selected_range = Some(selected_range);
             state.scroll_size = prepaint.scroll_size;
-            state.fold_placeholders = prepaint
-                .fold_placeholders
-                .iter()
-                .map(|(line, bounds, _)| (*line, *bounds))
-                .collect();
+            state.fold_placeholders = fold_placeholders;
+            // the scroll the frame applied is told above, by `bounds`, whose
+            // origin carries it (`layout_cursor`): the scrollbar's prepaint,
+            // which comes between this element's prepaint and its paint,
+            // has kept it in the handle already, so this notifies only for
+            // a clamp that moved it
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
             state.deferred_scroll_offset = None;
             state.deferred_scroll_follows_caret = false;
 
-            cx.notify();
+            if moved {
+                cx.notify();
+            }
         });
 
         if let Some(hitbox) = prepaint.hover_definition_hitbox.as_ref() {

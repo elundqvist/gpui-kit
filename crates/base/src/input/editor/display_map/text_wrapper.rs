@@ -767,6 +767,20 @@ impl LineLayout {
         self.len
     }
 
+    /// Whether `other` lays its line out as this does: as long, wrapped at
+    /// the same places, each piece as wide.
+    pub(crate) fn same_place(&self, other: &Self) -> bool {
+        self.len == other.len
+            && self.wrap_indent == other.wrap_indent
+            && self.longest_width == other.longest_width
+            && self.wrapped_lines.len() == other.wrapped_lines.len()
+            && self
+                .wrapped_lines
+                .iter()
+                .zip(other.wrapped_lines.iter())
+                .all(|(a, b)| a.len() == b.len() && a.width() == b.width())
+    }
+
     /// Get the position (x, y) for the given index in this line layout.
     ///
     /// - The `offset` is a local byte index in this line layout.

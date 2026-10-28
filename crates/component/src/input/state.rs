@@ -266,6 +266,10 @@ impl From<Entity<OtpState>> for AnyInputState {
 
 /// Registers `state` as the window's focused input while it holds focus, and
 /// unregisters it once focus moves elsewhere.
+///
+/// Every input calls this as it renders: the root is told only where the
+/// registration changed, not at every render of every input
+/// (elundqvist/kvist#602).
 pub(super) fn sync_focused_input_registry(
     state: impl Into<AnyInputState>,
     window: &mut Window,
@@ -274,11 +278,16 @@ pub(super) fn sync_focused_input_registry(
     let state = state.into();
     let focused = state.focus_handle(cx).is_focused(window);
     Root::try_update(window, cx, |root, _, cx| {
-        if focused {
-            root.focused_input = Some(state.clone());
+        let registered = if focused {
+            Some(state)
         } else if root.focused_input.as_ref() == Some(&state) {
-            root.focused_input = None;
+            None
+        } else {
+            return;
+        };
+        if root.focused_input != registered {
+            root.focused_input = registered;
+            cx.notify();
         }
-        cx.notify();
     });
 }

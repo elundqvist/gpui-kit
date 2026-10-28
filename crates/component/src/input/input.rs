@@ -1079,4 +1079,97 @@ mod tests {
         assert!(!cx.update(|window, cx| window.has_focused_input(cx)));
         assert_eq!(cx.update(|window, cx| window.focused_input(cx)), None);
     }
+
+    /// The root is told of the focused input only where the registration
+    /// changed: every input registers as it renders, and the root told at
+    /// each render was marked for the next frame at every frame an input
+    /// was drawn in (elundqvist/kvist#602).
+    #[gpui::test]
+    fn focused_input_registry_tells_the_root_only_of_a_change(cx: &mut gpui::TestAppContext) {
+        use crate::{Root, WindowExt as _};
+        use gpui::{AppContext as _, Render};
+        use std::cell::Cell;
+
+        struct Probe {
+            input: Entity<InputState>,
+            other: gpui::FocusHandle,
+        }
+        impl Render for Probe {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                div()
+                    .child(div().track_focus(&self.other))
+                    .child(Input::new(&self.input))
+            }
+        }
+
+        cx.update(crate::init);
+        let mut parts = None;
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let input = cx.new(|cx| InputState::new(window, cx));
+                let other = cx.focus_handle();
+                parts = Some((input.clone(), other.clone()));
+                let probe = cx.new(|_| Probe { input, other });
+                cx.new(|cx| Root::new(probe, window, cx))
+            })
+            .unwrap()
+        });
+        let (input, other) = parts.unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let root = cx.update(|window, _| window.root::<Root>().flatten().unwrap());
+        let told = Rc::new(Cell::new(0));
+        let _observing = cx.update(|_, cx| {
+            let told = told.clone();
+            cx.observe(&root, move |_, _| told.set(told.get() + 1))
+        });
+        let sync = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| sync_focused_input_registry(input.clone(), window, cx));
+            cx.run_until_parked();
+        };
+        let draw = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        };
+
+        sync(&mut cx);
+        sync(&mut cx);
+        assert_eq!(told.get(), 0, "not focused, and not registered");
+        cx.update(|window, cx| {
+            AnyInputState::from(input.clone())
+                .focus_handle(cx)
+                .focus(window, cx)
+        });
+        draw(&mut cx);
+        let registered = told.get();
+        sync(&mut cx);
+        sync(&mut cx);
+        assert_eq!(
+            told.get(),
+            registered,
+            "focused, and registered as it was drawn"
+        );
+        assert_eq!(
+            cx.update(|window, cx| window.focused_input(cx)),
+            Some(input.clone().into())
+        );
+        root.update(&mut cx, |root, _| root.focused_input = None);
+        sync(&mut cx);
+        assert_eq!(told.get(), registered + 1, "registered again");
+        cx.update(|window, cx| other.focus(window, cx));
+        draw(&mut cx);
+        let let_go = told.get();
+        sync(&mut cx);
+        sync(&mut cx);
+        assert_eq!(
+            told.get(),
+            let_go,
+            "focus gone elsewhere, and let go as it was drawn"
+        );
+        assert_eq!(cx.update(|window, cx| window.focused_input(cx)), None);
+    }
 }

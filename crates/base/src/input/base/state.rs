@@ -2320,9 +2320,15 @@ impl<M: InputModeKind> InputBaseState<M> {
             cx.stop_propagation();
         }
 
-        self.diagnostic_popover = None;
+        // put away by the wheel whether it scrolled or not
+        if self.diagnostic_popover.take().is_some() {
+            cx.notify();
+        }
     }
 
+    /// Scroll to `offset`, or stay, kept to the text's extent; told to
+    /// whatever observes the state only where the offset changed, as the
+    /// paint persists it in every frame (elundqvist/kvist#602).
     pub(super) fn update_scroll_offset(
         &mut self,
         offset: Option<Point<Pixels>>,
@@ -2347,6 +2353,9 @@ impl<M: InputModeKind> InputBaseState<M> {
             offset.y.clamp(safe_y_range.start, safe_y_range.end)
         };
         offset.x = offset.x.clamp(safe_x_range.start, safe_x_range.end);
+        if self.scroll_handle.offset() == offset {
+            return;
+        }
         self.scroll_handle.set_offset(offset);
         cx.notify();
     }
@@ -8895,6 +8904,212 @@ mod tests {
         editor
             .input
             .read_with(&mut editor_cx, |state, _| assert!(state.soft_wrap));
+    }
+
+    /// A view holding an input, docked as a cached view, as Kvist docks a
+    /// drawer: and how often it is drawn.
+    struct Holder<M: InputModeKind> {
+        input: Entity<InputBaseState<M>>,
+        drawn: Rc<Cell<usize>>,
+        width: Pixels,
+    }
+
+    impl<M: InputModeKind> Render for Holder<M> {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.drawn.set(self.drawn.get() + 1);
+            div().w(self.width).h(px(60.)).child(self.input.clone())
+        }
+    }
+
+    struct Dock<M: InputModeKind>(Entity<Holder<M>>);
+
+    impl<M: InputModeKind> Render for Dock<M> {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                self.0
+                    .clone()
+                    .cached(gpui::StyleRefinement::default().size_full()),
+            )
+        }
+    }
+
+    /// An input in a view of its own, docked as a cached view, and how
+    /// often that view is drawn.
+    struct Docked<M: InputModeKind> {
+        cx: VisualTestContext,
+        dock: Entity<Dock<M>>,
+        holder: Entity<Holder<M>>,
+        input: Entity<InputBaseState<M>>,
+        drawn: Rc<Cell<usize>>,
+    }
+
+    impl<M: InputModeKind> Docked<M> {
+        fn new(
+            cx: &mut TestAppContext,
+            make: impl FnOnce(&mut Window, &mut Context<InputBaseState<M>>) -> InputBaseState<M>
+                + 'static,
+        ) -> Self {
+            let drawn = Rc::new(Cell::new(0));
+            let mut parts = None;
+            let window = cx.update(|cx| {
+                let drawn = drawn.clone();
+                cx.open_window(Default::default(), |window, cx| {
+                    cx.set_global(Theme::default());
+                    super::super::init(cx);
+                    let input = cx.new(|cx| make(window, cx));
+                    let holder = cx.new(|_| Holder {
+                        input: input.clone(),
+                        drawn,
+                        width: px(300.),
+                    });
+                    let dock = cx.new(|_| Dock(holder.clone()));
+                    parts = Some((dock.clone(), holder, input));
+                    dock
+                })
+                .unwrap()
+            });
+            let (dock, holder, input) = parts.unwrap();
+            let cx = VisualTestContext::from_window(window.into(), cx);
+            Self { cx, dock, holder, input, drawn }
+        }
+
+        /// One frame of the window, the dock drawn in it as it is with each.
+        fn draw(&mut self) {
+            let dock = self.dock.clone();
+            self.cx.update(|window, cx| {
+                dock.update(cx, |_, cx| cx.notify());
+                window.draw(cx).clear(cx);
+            })
+        }
+
+        /// Frames until the view is left, and how often it was drawn by then.
+        fn settles(&mut self, what: &str) -> usize {
+            self.draw();
+            self.draw();
+            let settled = self.drawn.get();
+            for _ in 0..3 {
+                self.draw();
+            }
+            assert_eq!(self.drawn.get(), settled, "drawn again with frames {what}");
+            settled
+        }
+    }
+
+    /// The input `make` makes, in a view of its own docked as a cached
+    /// view: drawn again where it changed and not with each frame of the
+    /// window, a frame the dock above it is drawn in each time; after a
+    /// change it is left as soon as the frame after the change has drawn
+    /// it with what the change's paint laid out.
+    fn drawn_only_at_its_changes<M: InputModeKind>(
+        cx: &mut TestAppContext,
+        make: impl FnOnce(&mut Window, &mut Context<InputBaseState<M>>) -> InputBaseState<M> + 'static,
+    ) {
+        let mut docked = Docked::new(cx, make);
+        let first = docked.settles("after the first");
+        assert!(first > 0);
+        let input = docked.input.clone();
+        docked
+            .cx
+            .update(|window, cx| input.update(cx, |state, cx| state.insert("typed", window, cx)));
+        let typed = docked.settles("after a key");
+        assert!(typed > first, "a key draws it again");
+        let holder = docked.holder.clone();
+        holder.update(&mut docked.cx, |holder, cx| {
+            holder.width = px(40.);
+            cx.notify();
+        });
+        let narrow = docked.settles("after it was made narrower");
+        assert!(narrow > typed);
+    }
+
+    /// The text input's paint tells its state's observers only where it
+    /// moved something (the layout, the bounds, the caret, the scroll):
+    /// told at every paint, a drawer with a text box, docked as a cached
+    /// view, was drawn again with every frame the window drew
+    /// (elundqvist/kvist#602). A single-line box, a drawer's filter, and a
+    /// multi-line one, the assistant's prompt.
+    #[gpui::test]
+    fn a_paint_that_moves_nothing_draws_no_view_the_input_is_in_again(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        drawn_only_at_its_changes(cx, |window, cx| crate::input::InputState::new(window, cx));
+        drawn_only_at_its_changes(cx, |window, cx| {
+            crate::input::TextareaState::new(window, cx)
+        });
+        drawn_only_at_its_changes(cx, |window, cx| {
+            crate::input::EditorState::new(window, cx).language("sql")
+        });
+    }
+
+    /// The scroll offset kept is told to the state's observers where it
+    /// changed, and not where it is kept as it was, as the paint keeps it
+    /// in every frame (elundqvist/kvist#602).
+    #[gpui::test]
+    fn the_scroll_offset_is_told_only_where_it_changed(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let text: String = (0..200).map(|i| format!("line {i}\n")).collect();
+        cx.update(|window, cx| input.update(cx, |state, cx| state.set_value(text, window, cx)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let told = Rc::new(Cell::new(0));
+        let _observing = cx.update(|_, cx| {
+            let told = told.clone();
+            cx.observe(&input, move |_, _| told.set(told.get() + 1))
+        });
+        let scroll = |cx: &mut VisualTestContext, y: f32| {
+            input.update(cx, |state, cx| {
+                state.update_scroll_offset(Some(point(px(0.), px(y))), cx)
+            });
+            cx.run_until_parked();
+        };
+        scroll(&mut cx, -100.);
+        assert_eq!(told.get(), 1, "scrolled");
+        assert_eq!(
+            input.read_with(&mut cx, |state, _| state.scroll_handle.offset().y),
+            px(-100.)
+        );
+        scroll(&mut cx, -100.);
+        assert_eq!(told.get(), 1, "kept where it was");
+        scroll(&mut cx, -120.);
+        assert_eq!(told.get(), 2, "scrolled again");
+    }
+
+    /// A scroll the paint applies (a few pixels, with the same lines in
+    /// sight, the caret where it was) is told to the views the editor is in
+    /// like any other change, and by the bounds alone: the scrollbar's
+    /// prepaint has kept the offset in the handle by the time of the paint,
+    /// and `update_scroll_offset` finds nothing to tell
+    /// (elundqvist/kvist#602).
+    #[gpui::test]
+    fn a_scroll_the_paint_applied_draws_the_view_again(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let mut docked = Docked::new(cx, |window, cx| {
+            crate::input::EditorState::new(window, cx).language("sql")
+        });
+        let text: String = (0..60).map(|i| format!("select {i};\n")).collect();
+        let input = docked.input.clone();
+        docked
+            .cx
+            .update(|window, cx| input.update(cx, |state, cx| state.set_value(text, window, cx)));
+        docked.settles("after the text");
+        let before = docked.drawn.get();
+        docked.cx.update(|_, cx| {
+            input.update(cx, |state, cx| state.set_scroll_offset(point(px(0.), px(-3.)), cx))
+        });
+        // the frame that applies the scroll, and the one its paint asks for
+        docked.draw();
+        docked.draw();
+        assert_eq!(
+            input.read_with(&docked.cx, |state, _| state.scroll_offset().y),
+            px(-3.)
+        );
+        assert!(
+            docked.drawn.get() >= before + 2,
+            "drawn {} times since the scroll, once for it and once for what its paint moved",
+            docked.drawn.get() - before
+        );
+        docked.settles("after a scroll");
     }
 }
 
