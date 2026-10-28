@@ -16,7 +16,13 @@ use gpui::{
 use itertools::Itertools;
 use parking_lot::RwLock;
 use smallvec::SmallVec;
-use std::{borrow::Cow, ops::Range, sync::Arc};
+use std::{
+    borrow::Cow,
+    io::{Read as _, Seek as _, SeekFrom},
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use swash::{
     scale::{Render, ScaleContext, Source, StrikeWith},
     zeno::{Format, Vector},
@@ -171,8 +177,21 @@ impl PlatformTextSystem for CosmicTextSystem {
         Ok(candidates[ix])
     }
 
+    /// Matches each font as its text will be, so that the first line laid out in it does not.
+    /// cosmic-text matches a font against every face in the database the first time it is
+    /// asked for one, opening each face of another weight for its weight axis
+    /// (`FontMatchKey::new`): some 2.5 ms for each font with the files in the system's cache,
+    /// and as much as 170 ms read cold (elundqvist/kvist#607). What it opens is read here first
+    /// without the lock, into that cache, and the fonts are then matched one at a time, so that
+    /// a thread that lays text out meanwhile, the drawing thread, waits for one at most.
     fn prewarm_fonts(&self, font_ids: &[FontId]) {
-        self.0.write().prewarm_fonts(font_ids);
+        let files = self.0.read().face_files();
+        for (path, index) in &files {
+            read_face_tables(path, *index).ok();
+        }
+        for &font_id in font_ids {
+            self.0.write().prewarm_fonts(&[font_id]);
+        }
     }
 
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {
@@ -270,6 +289,19 @@ impl CosmicTextSystemState {
             features: loaded_font.features.clone(),
             fallback_chain: Arc::clone(&loaded_font.user_fallback_chain),
         })
+    }
+
+    /// The files of the database's faces that are read from disk, with each face's index in
+    /// its file: those that no line has been laid out in yet.
+    fn face_files(&self) -> Vec<(PathBuf, u32)> {
+        self.font_system
+            .db()
+            .faces()
+            .filter_map(|face| match &face.source {
+                cosmic_text::fontdb::Source::File(path) => Some((path.clone(), face.index)),
+                _ => None,
+            })
+            .collect()
     }
 
     fn prewarm_fonts(&mut self, font_ids: &[FontId]) {
@@ -875,6 +907,39 @@ impl CosmicTextSystemState {
             len: text.len(),
         }
     }
+}
+
+/// Reads what matching a font reads of the face at `index` in the font file at `path`: its
+/// table directory, after a collection's header, and its `fvar` table, where a weight axis is
+/// (`CosmicTextSystem::prewarm_fonts`). What is read is let go of, and stays in the system's
+/// file cache. Returns how many bytes were read.
+fn read_face_tables(path: &Path, index: u32) -> std::io::Result<u64> {
+    let mut file = std::fs::File::open(path)?;
+    let mut head = [0u8; 12];
+    file.read_exact(&mut head)?;
+    let mut read = 12;
+    if &head[..4] == b"ttcf" {
+        let mut offset = [0u8; 4];
+        file.seek(SeekFrom::Start(12 + 4 * u64::from(index)))?;
+        file.read_exact(&mut offset)?;
+        file.seek(SeekFrom::Start(u64::from(u32::from_be_bytes(offset))))?;
+        file.read_exact(&mut head)?;
+        read += 4 + 12;
+    }
+    let mut records = vec![0u8; usize::from(u16::from_be_bytes([head[4], head[5]])) * 16];
+    file.read_exact(&mut records)?;
+    read += records.len() as u64;
+    for record in records.chunks_exact(16) {
+        if &record[..4] == b"fvar" {
+            let field = |at: usize| u32::from_be_bytes([record[at], record[at + 1], record[at + 2], record[at + 3]]);
+            let mut table = vec![0u8; field(12).min(1 << 16) as usize];
+            file.seek(SeekFrom::Start(u64::from(field(8))))?;
+            file.read_exact(&mut table)?;
+            read += table.len() as u64;
+        }
+    }
+    // `Ok` here is anyhow's, which returns an `anyhow::Result`
+    std::io::Result::Ok(read)
 }
 
 #[inline(always)]
@@ -2257,5 +2322,72 @@ mod tests {
         ] {
             assert!(!may_ask_for_emoji(text), "{text:?}");
         }
+    }
+
+    /// A font file of `faces`, each the tables it names with as many bytes each, a collection
+    /// where there is more than one face.
+    fn font_file(faces: &[&[(&[u8; 4], usize)]]) -> Vec<u8> {
+        let collection = faces.len() > 1;
+        let mut at = if collection { 12 + 4 * faces.len() } else { 0 };
+        let mut directories = Vec::new();
+        let mut data = Vec::new();
+        let tables_at = at + faces.iter().map(|f| 12 + 16 * f.len()).sum::<usize>();
+        let mut table_at = tables_at;
+        let mut offsets = Vec::new();
+        for face in faces {
+            offsets.push(at as u32);
+            let mut directory = vec![0, 1, 0, 0];
+            directory.extend((face.len() as u16).to_be_bytes());
+            directory.extend([0; 6]);
+            for (tag, len) in face.iter() {
+                directory.extend(*tag);
+                directory.extend([0; 4]);
+                directory.extend((table_at as u32).to_be_bytes());
+                directory.extend((*len as u32).to_be_bytes());
+                data.extend(std::iter::repeat_n(7u8, *len));
+                table_at += len;
+            }
+            at += directory.len();
+            directories.extend(directory);
+        }
+        let mut file = Vec::new();
+        if collection {
+            file.extend(b"ttcf");
+            file.extend([0, 1, 0, 0]);
+            file.extend((faces.len() as u32).to_be_bytes());
+            for offset in offsets {
+                file.extend(offset.to_be_bytes());
+            }
+        }
+        file.extend(directories);
+        assert_eq!(file.len(), tables_at);
+        file.extend(data);
+        file
+    }
+
+    /// Prewarming reads of each face what matching it reads: the table directory, after a
+    /// collection's header, and the `fvar` table, and of a face with none the directory alone.
+    #[test]
+    fn prewarming_reads_a_faces_table_directory_and_its_weight_axes() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("gpui-wgpu-prewarm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let read = |name: &str, bytes: Vec<u8>, index: u32| -> Result<u64> {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes)?;
+            Ok(read_face_tables(&path, index)?)
+        };
+        let single = read("one.ttf", font_file(&[&[(b"cmap", 30), (b"fvar", 40), (b"glyf", 900)]]), 0);
+        let plain = read("plain.ttf", font_file(&[&[(b"cmap", 30), (b"glyf", 900)]]), 0);
+        let pair = font_file(&[&[(b"cmap", 30)], &[(b"cmap", 30), (b"fvar", 56), (b"glyf", 900)]]);
+        let second = read("two.ttc", pair.clone(), 1);
+        let first = read("two.ttc", pair, 0);
+        let missing = read_face_tables(&dir.join("gone.ttf"), 0).is_err();
+        std::fs::remove_dir_all(&dir)?;
+        assert_eq!(single?, 12 + 3 * 16 + 40);
+        assert_eq!(plain?, 12 + 2 * 16);
+        assert_eq!(second?, 12 + 4 + 12 + 3 * 16 + 56);
+        assert_eq!(first?, 12 + 4 + 12 + 16);
+        assert!(missing);
+        Ok(())
     }
 }

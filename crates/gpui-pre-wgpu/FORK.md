@@ -88,6 +88,23 @@ asks (section 4(b)); a source file says so at its top:
   `draw` does not count it as a failed frame.
 - `Cargo.toml` and `Cargo.lock`: `image`, at the version gpui-pre
   already brings, for the `RgbaImage` gpui's `render_to_image` returns.
+- `src/cosmic_text_system.rs`: `prewarm_fonts` reads what matching the
+  fonts will read before it takes the lock, and matches them one at a
+  time (elundqvist/kvist#607). cosmic-text matches a font against every
+  face in the database the first time a line is laid out in it
+  (`FontSystem::get_font_matches`, cached by the font's attributes), and
+  opens each face of another weight than the one asked for to see
+  whether a weight axis covers it (`FontMatchKey::new`): some 2.5 ms a
+  font with the files in the system's cache, 50 to 170 ms read cold, on
+  whatever thread laid the line out, the drawing thread's first line in
+  a bold or italic face among them. `prewarm_fonts`, which an app calls
+  on a thread of its own, held the text system's lock for all of that,
+  and every other thread's text with it. Now it reads, without the lock,
+  each file face's table directory, after a collection's header, and
+  its `fvar` (`read_face_tables`), into the system's cache, and then
+  takes the lock once for each font, so that the drawing thread waits
+  for one font's warm match at most. A test of what is read of a face,
+  a collection's and a file's with no `fvar` among them.
 
 ## Tests
 
