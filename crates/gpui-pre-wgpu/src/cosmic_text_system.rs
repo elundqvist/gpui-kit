@@ -824,8 +824,9 @@ impl CosmicTextSystemState {
             };
         };
 
+        let (pens, width) = pen_positions(&layout.glyphs, line.rtl);
         let mut runs: Vec<ShapedRun> = Vec::new();
-        for glyph in &layout.glyphs {
+        for (glyph, &pen) in layout.glyphs.iter().zip(&pens) {
             let mut font_id = FontId(glyph.metadata);
             let mut loaded_font = self.loaded_font(font_id);
             if loaded_font.font.id() != glyph.font_id {
@@ -852,7 +853,7 @@ impl CosmicTextSystemState {
 
             let shaped_glyph = ShapedGlyph {
                 id: GlyphId(glyph.glyph_id as u32),
-                position: point(glyph.x.into(), glyph.y.into()),
+                position: point(pen.into(), glyph.y.into()),
                 index: glyph.start,
                 is_emoji,
             };
@@ -900,13 +901,44 @@ impl CosmicTextSystemState {
 
         LineLayout {
             font_size,
-            width: layout.w.into(),
+            width: width.into(),
             ascent: ascent.into(),
             descent: descent.into(),
             runs,
             len: text.len(),
         }
     }
+}
+
+/// The pen's x at each of a line's glyphs, and the line's width, summed in `f64` from the
+/// glyphs' advances (elundqvist/kvist#617). cosmic-text sums both in `f32`, apart, each step
+/// rounding off up to half the spacing of the floats at the pen, a sixteenth of a pixel past
+/// half a million pixels, and the same way at each glyph of a run of like ones: the last glyph
+/// of a line of 240 KB stood a thousand pixels short of the line's width, where the caret at its
+/// end is, and one of 80 KB two hundred pixels past it. A line laid out right to left puts the
+/// pen at its width and takes each glyph's advance off before the glyph, as cosmic-text does.
+fn pen_positions(glyphs: &[cosmic_text::LayoutGlyph], rtl: bool) -> (Vec<f32>, f32) {
+    let width: f64 = glyphs.iter().map(|glyph| f64::from(glyph.w)).sum();
+    let mut pen = if rtl {
+        width
+    } else {
+        glyphs.first().map_or(0.0, |glyph| f64::from(glyph.x))
+    };
+    let pens = glyphs
+        .iter()
+        .map(|glyph| {
+            let advance = f64::from(glyph.w);
+            if rtl {
+                pen -= advance;
+                pen as f32
+            } else {
+                let at = pen as f32;
+                pen += advance;
+                at
+            }
+        })
+        .collect();
+    (pens, width as f32)
 }
 
 /// Reads what matching a font reads of the face at `index` in the font file at `path`: its
@@ -2388,6 +2420,46 @@ mod tests {
         assert_eq!(second?, 12 + 4 + 12 + 3 * 16 + 56);
         assert_eq!(first?, 12 + 4 + 12 + 16);
         assert!(missing);
+        Ok(())
+    }
+
+    /// A line of 240 000 like glyphs has each laid out at its index times the
+    /// glyph's advance, the last ending at the line's width, where the caret
+    /// at its end is: summed in `f32`, the glyphs near its end stood
+    /// hundreds of pixels from there and from the width, which cosmic-text
+    /// sums apart (elundqvist/kvist#617). One of 16 000 right to left the
+    /// same, from the width down (laid out right to left, a longer line
+    /// takes minutes in a test build).
+    #[test]
+    fn a_long_lines_glyphs_are_laid_out_at_their_advances() -> Result<()> {
+        let text_system = text_system()?;
+        for (unit, rtl, count) in [("a", false, 240_000), ("\u{05d0}", true, 16_000)] {
+            let advance = f64::from(layout_text(&text_system, unit)?.width);
+            assert!(advance > 1.0, "{unit:?}");
+            let text = unit.repeat(count);
+            let layout = layout_text(&text_system, &text)?;
+            let glyphs: Vec<_> = layout.runs.iter().flat_map(|run| &run.glyphs).collect();
+            assert_eq!(glyphs.len(), count, "{unit:?}");
+            let width = count as f64 * advance;
+            assert!(
+                (f64::from(layout.width) - width).abs() < 0.25,
+                "{unit:?}: width {:?}, {width} wanted",
+                layout.width
+            );
+            for (i, glyph) in glyphs.iter().enumerate().rev().take(1000) {
+                // right to left the first glyph is the rightmost
+                let at = if rtl {
+                    width - (i + 1) as f64 * advance
+                } else {
+                    i as f64 * advance
+                };
+                assert!(
+                    (f64::from(glyph.position.x) - at).abs() < 0.25,
+                    "{unit:?}: glyph {i} at {:?}, {at} wanted",
+                    glyph.position.x
+                );
+            }
+        }
         Ok(())
     }
 }

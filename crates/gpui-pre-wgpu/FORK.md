@@ -105,6 +105,18 @@ asks (section 4(b)); a source file says so at its top:
   takes the lock once for each font, so that the drawing thread waits
   for one font's warm match at most. A test of what is read of a face,
   a collection's and a file's with no `fvar` among them.
+- `src/cosmic_text_system.rs`: a line's glyphs are laid out at the pen's
+  x summed in `f64` from their advances, and the line's width is their
+  sum (`pen_positions`, elundqvist/kvist#617). cosmic-text sums both in
+  `f32`, apart, each step rounding off up to half the spacing of the
+  floats at the pen, a sixteenth of a pixel past half a million pixels,
+  and the same way at each glyph of a run of like ones: the last glyph
+  of a line of 240 KB stood a thousand pixels short of the line's
+  width, where the caret at its end is, and one of 80 KB two hundred
+  pixels past it. A line laid out right to left puts the pen at its
+  width and takes each glyph's advance off before the glyph, as
+  cosmic-text does. A test of a line of 240 000 glyphs and one of 16 000
+  right to left, which fails on the published crate.
 
 ## Tests
 

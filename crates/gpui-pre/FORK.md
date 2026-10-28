@@ -231,6 +231,17 @@ asks (section 4(b)); each says so at its top:
   was still handed it. `src/key_dispatch.rs`: a test of a held key an
   interceptor stops, which reaches neither its binding nor a listener,
   and of the interceptor told whether a key is held.
+- `src/text_system/line.rs`: a line's glyphs are drawn at their
+  positions' distance from their row's first glyph (`GlyphRow`), where
+  each was drawn at the one before it moved by the difference of their
+  positions, a sum that drifts in `f32` by as much as each step rounds
+  off (elundqvist/kvist#617): a line of 80 KB drawn scrolled to its end,
+  its origin half a million pixels to the left of the view, had its last
+  glyphs drawn hundreds of pixels from where they are laid out, out of
+  the view, and a line of 240 KB had them end short of the caret. Its
+  background and its underline and strikethrough the same. A test of a
+  line of 240 000 glyphs drawn at its end, its background and underline
+  where its glyphs are laid out.
 
 ## Tests
 

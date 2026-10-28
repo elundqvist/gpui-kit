@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre 0.3.3 as published to crates.io: FORK.md at the
+// crate's root lists the changes.
 use crate::{
     App, Bounds, DevicePixels, Half, Hsla, LineLayout, Pixels, Point, RenderGlyphParams, Result,
     SharedString, StrikethroughStyle, TextAlign, UnderlineStyle, Window, WrapBoundary,
@@ -341,6 +343,38 @@ impl WrappedLine {
     }
 }
 
+/// Where a row of a line's glyphs starts: the x its first glyph is drawn
+/// at and that glyph's position in the line. Changed in elundqvist/gpui-kit
+/// (elundqvist/kvist#617): a glyph is drawn at its position's distance from
+/// the row's first, where each glyph was drawn at the one before it moved by
+/// the difference of their positions, a sum that drifts in `f32` by as much
+/// as each step rounds off: a line of 80 KB drawn scrolled to its end, whose
+/// origin is half a million pixels to the left, had its last glyphs drawn
+/// hundreds of pixels from where they are laid out, out of the view.
+#[derive(Clone, Copy)]
+struct GlyphRow {
+    origin_x: Pixels,
+    start: Pixels,
+}
+
+impl GlyphRow {
+    fn new(origin_x: Pixels) -> Self {
+        Self {
+            origin_x,
+            start: px(0.),
+        }
+    }
+
+    fn wrapped_at(start: Pixels, origin_x: Pixels) -> Self {
+        Self { origin_x, start }
+    }
+
+    /// Where the glyph at `position` in the line is drawn.
+    fn x(&self, position: Pixels) -> Pixels {
+        self.origin_x + (position - self.start)
+    }
+}
+
 fn paint_line(
     origin: Point<Pixels>,
     layout: &LineLayout,
@@ -369,25 +403,22 @@ fn paint_line(
         let mut current_underline: Option<(Point<Pixels>, UnderlineStyle)> = None;
         let mut current_strikethrough: Option<(Point<Pixels>, StrikethroughStyle)> = None;
         let text_system = cx.text_system().clone();
-        let mut glyph_origin = point(
-            aligned_origin_x(
-                origin,
-                align_width.unwrap_or(layout.width),
-                px(0.0),
-                &align,
-                layout,
-                wraps.peek(),
-            ),
-            origin.y,
-        );
-        let mut prev_glyph_position = Point::default();
+        let mut row = GlyphRow::new(aligned_origin_x(
+            origin,
+            align_width.unwrap_or(layout.width),
+            px(0.0),
+            &align,
+            layout,
+            wraps.peek(),
+        ));
+        let mut glyph_origin = point(row.origin_x, origin.y);
         let mut max_glyph_size = size(px(0.), px(0.));
         let mut first_glyph_x = origin.x;
         for (run_ix, run) in layout.runs.iter().enumerate() {
             max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
 
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
-                glyph_origin.x += glyph.position.x - prev_glyph_position.x;
+                glyph_origin.x = row.x(glyph.position.x);
                 if glyph_ix == 0 && run_ix == 0 {
                     first_glyph_x = glyph_origin.x;
                 }
@@ -429,17 +460,20 @@ fn paint_line(
                         }
                     }
 
-                    glyph_origin.x = aligned_origin_x(
-                        origin,
-                        align_width.unwrap_or(layout.width),
+                    row = GlyphRow::wrapped_at(
                         glyph.position.x,
-                        &align,
-                        layout,
-                        wraps.peek(),
+                        aligned_origin_x(
+                            origin,
+                            align_width.unwrap_or(layout.width),
+                            glyph.position.x,
+                            &align,
+                            layout,
+                            wraps.peek(),
+                        ),
                     );
+                    glyph_origin.x = row.origin_x;
                     glyph_origin.y += line_height;
                 }
-                prev_glyph_position = glyph.position;
 
                 let mut finished_underline: Option<(Point<Pixels>, UnderlineStyle)> = None;
                 let mut finished_strikethrough: Option<(Point<Pixels>, StrikethroughStyle)> = None;
@@ -611,24 +645,21 @@ fn paint_line_background(
         let mut run_end = 0;
         let mut current_background: Option<(Point<Pixels>, Hsla)> = None;
         let text_system = cx.text_system().clone();
-        let mut glyph_origin = point(
-            aligned_origin_x(
-                origin,
-                align_width.unwrap_or(layout.width),
-                px(0.0),
-                &align,
-                layout,
-                wraps.peek(),
-            ),
-            origin.y,
-        );
-        let mut prev_glyph_position = Point::default();
+        let mut row = GlyphRow::new(aligned_origin_x(
+            origin,
+            align_width.unwrap_or(layout.width),
+            px(0.0),
+            &align,
+            layout,
+            wraps.peek(),
+        ));
+        let mut glyph_origin = point(row.origin_x, origin.y);
         let mut max_glyph_size = size(px(0.), px(0.));
         for (run_ix, run) in layout.runs.iter().enumerate() {
             max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
 
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
-                glyph_origin.x += glyph.position.x - prev_glyph_position.x;
+                glyph_origin.x = row.x(glyph.position.x);
 
                 if wraps.peek() == Some(&&WrapBoundary { run_ix, glyph_ix }) {
                     wraps.next();
@@ -652,17 +683,20 @@ fn paint_line_background(
                         }
                     }
 
-                    glyph_origin.x = aligned_origin_x(
-                        origin,
-                        align_width.unwrap_or(layout.width),
+                    row = GlyphRow::wrapped_at(
                         glyph.position.x,
-                        &align,
-                        layout,
-                        wraps.peek(),
+                        aligned_origin_x(
+                            origin,
+                            align_width.unwrap_or(layout.width),
+                            glyph.position.x,
+                            &align,
+                            layout,
+                            wraps.peek(),
+                        ),
                     );
+                    glyph_origin.x = row.origin_x;
                     glyph_origin.y += line_height;
                 }
-                prev_glyph_position = glyph.position;
 
                 let mut finished_background: Option<(Point<Pixels>, Hsla)> = None;
                 if glyph.index >= run_end {
@@ -1021,5 +1055,86 @@ mod tests {
         assert_eq!(right.decoration_runs[0].color, green);
         assert_eq!(right.decoration_runs[1].len, 1);
         assert_eq!(right.decoration_runs[1].color, blue);
+    }
+
+    /// A line of 240 000 glyphs drawn scrolled to its end, its origin far to
+    /// the left of the view: its last glyphs' background is drawn where they
+    /// are laid out, where each glyph drawn at the one before it moved by the
+    /// difference of their positions drifted by hundreds of pixels, out of
+    /// the view (elundqvist/kvist#617). And so is the start of an underline
+    /// there, which the glyph loop reckons the same way.
+    #[crate::test]
+    fn test_a_long_lines_end_is_drawn_where_it_is_laid_out(cx: &mut crate::TestAppContext) {
+        use crate::{Context, IntoElement, ParentElement as _, Render, Styled as _, Window, canvas, div};
+
+        const GLYPHS: usize = 240_000;
+        const MARKED: usize = 10;
+        const ADVANCE: f64 = 6.517;
+        let glyphs: Vec<(usize, f32)> = (0..GLYPHS)
+            .map(|i| (i, (i as f64 * ADVANCE) as f32))
+            .collect();
+        let run = |len: usize, marked: bool| DecorationRun {
+            len: len as u32,
+            color: crate::black(),
+            background_color: marked.then(crate::red),
+            underline: marked.then(|| UnderlineStyle {
+                thickness: px(1.),
+                color: None,
+                wavy: false,
+            }),
+            strikethrough: None,
+        };
+        let line = make_shaped_line(
+            &"a".repeat(GLYPHS),
+            &glyphs,
+            (GLYPHS as f64 * ADVANCE) as f32,
+            &[run(GLYPHS - MARKED, false), run(MARKED, true)],
+        );
+        // the first marked glyph 100 pixels into the view
+        let origin_x = px((100.0 - (GLYPHS - MARKED) as f64 * ADVANCE) as f32);
+
+        struct LongLine(ShapedLine, Pixels);
+
+        impl Render for LongLine {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let (line, origin_x) = (self.0.clone(), self.1);
+                div().size_full().child(
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, cx| {
+                            let origin = point(origin_x, bounds.origin.y);
+                            line.paint_background(origin, px(20.), TextAlign::Left, None, window, cx)
+                                .unwrap();
+                            line.paint(origin, px(20.), TextAlign::Left, None, window, cx)
+                                .unwrap();
+                        },
+                    )
+                    .size_full(),
+                )
+            }
+        }
+
+        let (_, cx) = cx.add_window_view(|_, _| LongLine(line, origin_x));
+        cx.run_until_parked();
+        let (background, underline, factor) = cx.update(|window, _| {
+            let scene = &window.rendered_frame.scene;
+            (
+                scene.quads.iter().map(|q| q.bounds.origin.x.0).collect::<Vec<_>>(),
+                scene.underlines.iter().map(|u| u.bounds.origin.x.0).collect::<Vec<_>>(),
+                window.scale_factor(),
+            )
+        });
+        assert_eq!(background.len(), 1, "the marked glyphs' background is drawn: {background:?}");
+        assert!(
+            (background[0] / factor - 100.).abs() < 0.25,
+            "at the first marked glyph: {}",
+            background[0] / factor
+        );
+        assert_eq!(underline.len(), 1, "and their underline: {underline:?}");
+        assert!(
+            (underline[0] / factor - 100.).abs() < 0.25,
+            "from the first marked glyph: {}",
+            underline[0] / factor
+        );
     }
 }
