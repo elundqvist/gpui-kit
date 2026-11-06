@@ -13,6 +13,11 @@ own.
 Name and version stay gpui-pre-wgpu 0.3.3, so gpui-pre-linux 0.3.3,
 which asks for `=0.3.3`, takes it when an application patches it in.
 
+cosmic-text, the shaper and layout the text system is built on, is
+taken by path from `crates/cosmic-text`, where the fork carries it with
+fixes of its own (its FORK.md says what they are), beside the version
+crates.io serves it at; `Cargo.lock` names it with no source.
+
 ## What is changed
 
 The files changed from the published crate, as the Apache License 2.0

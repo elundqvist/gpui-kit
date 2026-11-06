@@ -47,8 +47,11 @@ members = [
 # is carried the same way for fixes to that client; gpui-pre-linux takes it
 # by path, and crates/zed-xim/FORK.md says what they are. gpui-pre-macos,
 # gpui's macOS platform (its AppKit window), is carried the same way for the
-# zoom; crates/gpui-pre-macos/FORK.md says what is changed.
-exclude = ["crates/gpui-pre", "crates/gpui-pre-linux", "crates/gpui-pre-macos", "crates/gpui-pre-wgpu", "crates/zed-xim"]
+# zoom; crates/gpui-pre-macos/FORK.md says what is changed. cosmic-text, the
+# shaper and layout gpui-pre-wgpu's text system is built on, is carried the
+# same way for fixes to its shaping; gpui-pre-wgpu takes it by path, and
+# crates/cosmic-text/FORK.md says what they are.
+exclude = ["crates/gpui-pre", "crates/gpui-pre-linux", "crates/gpui-pre-macos", "crates/gpui-pre-wgpu", "crates/zed-xim", "crates/cosmic-text"]
 resolver = "2"
 
 [workspace.package]
