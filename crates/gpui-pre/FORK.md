@@ -263,6 +263,27 @@ asks (section 4(b)); each says so at its top:
   deferred, kept through frames that take the view whole, its own and
   its parent's, found once the view is drawn anew, and let go once the
   view drawn anew no longer draws it.
+- `src/window.rs`: a key typed while a mouse button is down leaves the
+  window in the mouse's input modality, and a release is the mouse's
+  input as a press is (`Window::mouse_buttons_down`, elundqvist/kvist#632).
+  gpui put the window in the keyboard's modality at any key, where no
+  hitbox is hovered, and a press on a drawer's tab, a key typed into the
+  editor, then the release on the tab was no click, the release finding
+  the tab not hovered, and the tab's hover went at the key. The buttons
+  down are the window's presses less its releases, none once the pointer
+  moves or leaves with no button down or the window stops being the
+  active one, so a release the window never heard, one made over another
+  client's grab, keeps no press. X11 reports only the left, middle and
+  right buttons as held in a move, so a move with another button held
+  ends its press too, which costs no click: its release still comes. A
+  key with no button down hides the hover as before. In
+  `src/elements/div.rs`, a click is the release of the button that
+  pressed: the release of any button took a left press as its click, and
+  the right button pressed and let go on a drawer's tab while the left
+  was held opened the drawer. Tests of a click and the hover through a
+  key, of a lost release, by a move, by the pointer's leaving and by the
+  window's no longer being the active one, and of another button's
+  release.
 
 ## Tests
 

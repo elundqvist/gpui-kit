@@ -3040,6 +3040,16 @@ impl Interactivity {
                         // propagation.
                         DispatchPhase::Capture => {
                             let mut pending_mouse_down = pending_mouse_down.borrow_mut();
+                            // the release of another button leaves the press
+                            // as it was: the right button let go while the
+                            // left was held clicked the element, the left
+                            // still down (elundqvist/kvist#632)
+                            if pending_mouse_down
+                                .as_ref()
+                                .is_some_and(|down| down.button != event.button)
+                            {
+                                return;
+                            }
                             if pending_mouse_down.is_some() && hitbox.is_hovered(window) {
                                 captured_mouse_down = pending_mouse_down.take();
                                 window.refresh();
@@ -4702,6 +4712,144 @@ mod tests {
         assert_eq!(*hover_transitions.borrow(), [true]);
     }
 
+    struct ClickThroughKeysView {
+        clicks: Rc<Cell<usize>>,
+        hovered: Rc<Cell<bool>>,
+    }
+
+    impl Render for ClickThroughKeysView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let clicks = self.clicks.clone();
+            let hovered = self.hovered.clone();
+            div().size_full().child(
+                div()
+                    .id("pressed")
+                    .size(px(20.))
+                    .on_click(move |_, _, _| clicks.set(clicks.get() + 1))
+                    .child(
+                        canvas(
+                            |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+                            move |_, hitbox, window, _| hovered.set(hitbox.is_hovered(window)),
+                        )
+                        .size_full(),
+                    ),
+            )
+        }
+    }
+
+    fn setup_click_through_keys() -> (TestAppContext, AnyWindowHandle, Rc<Cell<usize>>, Rc<Cell<bool>>)
+    {
+        let mut cx = TestAppContext::single();
+        let clicks = Rc::new(Cell::new(0));
+        let hovered = Rc::new(Cell::new(false));
+        let window = cx.add_window({
+            let clicks = clicks.clone();
+            let hovered = hovered.clone();
+            move |_, _| ClickThroughKeysView { clicks, hovered }
+        });
+        let window = AnyWindowHandle::from(window);
+        draw_window(&mut cx, window);
+        move_mouse(&mut cx, window, point(px(10.), px(10.)));
+        draw_window(&mut cx, window);
+        (cx, window, clicks, hovered)
+    }
+
+    /// A press and a release on the same element are a click whatever keys
+    /// are typed between them, and the element pressed stays hovered through
+    /// them (elundqvist/kvist#632).
+    #[test]
+    fn keys_typed_during_a_press_keep_its_click_and_its_hover() {
+        let (mut cx, window, clicks, hovered) = setup_click_through_keys();
+        let at = point(px(10.), px(10.));
+        assert!(hovered.get());
+
+        mouse_down(&mut cx, window, at, MouseButton::Left);
+        draw_window(&mut cx, window);
+        key_down(&mut cx, window, "a");
+        key_up(&mut cx, window, "a");
+        draw_window(&mut cx, window);
+        assert!(hovered.get(), "a key typed during the press cleared the hover");
+        assert!(!cx.update_window(window, |_, window, _| window.last_input_was_keyboard()).unwrap());
+
+        mouse_up(&mut cx, window, at, MouseButton::Left);
+        assert_eq!(clicks.get(), 1, "the release after a key was no click");
+
+        // released, a key is the keyboard's again and hides the hover
+        key_down(&mut cx, window, "b");
+        draw_window(&mut cx, window);
+        assert!(!hovered.get());
+        assert!(cx.update_window(window, |_, window, _| window.last_input_was_keyboard()).unwrap());
+    }
+
+    /// A release the window never heard, the pointer moving after it with no
+    /// button down, leaves no press behind to keep the keys from the keyboard.
+    #[test]
+    fn a_move_with_no_button_down_ends_a_press_whose_release_was_lost() {
+        let (mut cx, window, _clicks, hovered) = setup_click_through_keys();
+
+        mouse_down(&mut cx, window, point(px(10.), px(10.)), MouseButton::Left);
+        move_mouse(&mut cx, window, point(px(11.), px(10.)));
+        key_down(&mut cx, window, "a");
+        draw_window(&mut cx, window);
+        assert!(!hovered.get());
+        assert!(cx.update_window(window, |_, window, _| window.last_input_was_keyboard()).unwrap());
+    }
+
+    /// A press whose release went to another client, the pointer leaving the
+    /// window with no button down, or the window no longer the active one
+    /// with the pointer at rest, keeps no keys from the keyboard.
+    #[test]
+    fn a_press_whose_release_went_elsewhere_ends_as_the_window_is_left() {
+        for left in ["the pointer", "the focus"] {
+            let (mut cx, window, _clicks, hovered) = setup_click_through_keys();
+
+            mouse_down(&mut cx, window, point(px(10.), px(10.)), MouseButton::Left);
+            if left == "the pointer" {
+                cx.update_window(window, |_, window, cx| {
+                    window.dispatch_event(
+                        MouseExitEvent {
+                            position: point(px(300.), px(10.)),
+                            pressed_button: None,
+                            modifiers: Default::default(),
+                        }
+                        .to_platform_input(),
+                        cx,
+                    );
+                })
+                .unwrap();
+            } else {
+                cx.update_window(window, |_, window, _| window.platform_window.as_test().cloned())
+                    .unwrap()
+                    .expect("a test window")
+                    .simulate_active_status_change(false);
+            }
+            key_down(&mut cx, window, "a");
+            draw_window(&mut cx, window);
+            assert!(!hovered.get(), "{left}");
+            assert!(
+                cx.update_window(window, |_, window, _| window.last_input_was_keyboard()).unwrap(),
+                "{left}"
+            );
+        }
+    }
+
+    /// The release of another button during a press is no click: the click
+    /// is the release of the button that pressed. A right button pressed
+    /// and let go on a drawer's tab while the left was held opened it, the
+    /// left still down.
+    #[test]
+    fn the_release_of_another_button_is_no_click() {
+        let (mut cx, window, clicks, _hovered) = setup_click_through_keys();
+        let at = point(px(10.), px(10.));
+
+        mouse_down(&mut cx, window, at, MouseButton::Left);
+        mouse_down(&mut cx, window, at, MouseButton::Right);
+        mouse_up(&mut cx, window, at, MouseButton::Right);
+        assert_eq!(clicks.get(), 0, "the right button's release was a click");
+        mouse_up(&mut cx, window, at, MouseButton::Left);
+        assert_eq!(clicks.get(), 1, "the left button's release was no click");
+    }
+
     struct TestTooltipView;
 
     impl Render for TestTooltipView {
@@ -5266,12 +5414,22 @@ mod tests {
     }
 
     fn press(test_app: &mut TestAppContext, window: AnyWindowHandle, position: Point<Pixels>) {
+        mouse_down(test_app, window, position, MouseButton::Left);
+        mouse_up(test_app, window, position, MouseButton::Left);
+    }
+
+    fn mouse_down(
+        test_app: &mut TestAppContext,
+        window: AnyWindowHandle,
+        position: Point<Pixels>,
+        button: MouseButton,
+    ) {
         test_app
             .update_window(window, |_, window, cx| {
                 window.dispatch_event(
                     MouseDownEvent {
                         position,
-                        button: MouseButton::Left,
+                        button,
                         modifiers: Default::default(),
                         click_count: 1,
                         first_mouse: false,
@@ -5279,10 +5437,22 @@ mod tests {
                     .to_platform_input(),
                     cx,
                 );
+            })
+            .unwrap();
+    }
+
+    fn mouse_up(
+        test_app: &mut TestAppContext,
+        window: AnyWindowHandle,
+        position: Point<Pixels>,
+        button: MouseButton,
+    ) {
+        test_app
+            .update_window(window, |_, window, cx| {
                 window.dispatch_event(
                     MouseUpEvent {
                         position,
-                        button: MouseButton::Left,
+                        button,
                         modifiers: Default::default(),
                         click_count: 1,
                     }

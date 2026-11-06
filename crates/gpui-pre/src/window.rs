@@ -15,10 +15,10 @@ use crate::{
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    MouseButton, MouseEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
@@ -1366,6 +1366,13 @@ pub struct Window {
     /// The hitbox that has captured the pointer, if any.
     /// While captured, mouse events route to this hitbox regardless of hit testing.
     captured_hitbox: Option<HitboxId>,
+    /// The mouse buttons pressed in the window and not yet released, none
+    /// once the pointer moves or leaves with no button down, or the window
+    /// is no longer the active one. While one is
+    /// down the pointer is in use: a key typed meanwhile leaves the window
+    /// in the mouse's modality, so the element pressed stays hovered and its
+    /// release is still a click on it.
+    mouse_buttons_down: SmallVec<[MouseButton; 2]>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
     #[cfg(feature = "profiler")]
@@ -2008,6 +2015,12 @@ impl Window {
                 handle
                     .update(&mut cx, |_, window, cx| {
                         window.active.set(active);
+                        // a release made over another window's grab never
+                        // comes here: the press it ended keeps no keys from
+                        // the keyboard once the window is left
+                        if !active {
+                            window.mouse_buttons_down.clear();
+                        }
                         window.modifiers = window.platform_window.modifiers();
                         window.capslock = window.platform_window.capslock();
                         window
@@ -2201,6 +2214,7 @@ impl Window {
             client_inset: None,
             image_cache_stack: Vec::new(),
             captured_hitbox: None,
+            mouse_buttons_down: SmallVec::new(),
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector: None,
             #[cfg(feature = "profiler")]
@@ -5892,13 +5906,39 @@ impl Window {
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input(event.kind_name());
         let update_count_before = self.invalidator.update_count();
+        match &event {
+            PlatformInput::MouseDown(event) => {
+                if !self.mouse_buttons_down.contains(&event.button) {
+                    self.mouse_buttons_down.push(event.button);
+                }
+            }
+            PlatformInput::MouseUp(event) => {
+                self.mouse_buttons_down
+                    .retain(|button| *button != event.button);
+            }
+            PlatformInput::MouseMove(MouseMoveEvent {
+                pressed_button: None,
+                ..
+            })
+            | PlatformInput::MouseExited(MouseExitEvent {
+                pressed_button: None,
+                ..
+            }) => self.mouse_buttons_down.clear(),
+            _ => {}
+        }
         // Track input modality for focus-visible styling and hover suppression.
         // Hover is suppressed during keyboard modality so that keyboard navigation
-        // doesn't show hover highlights on the item under the mouse cursor.
+        // doesn't show hover highlights on the item under the mouse cursor, but
+        // not by a key typed while a mouse button is down: the press goes on,
+        // and its release is the mouse's input as the press was.
         let old_modality = self.last_input_modality;
         self.last_input_modality = match &event {
-            PlatformInput::KeyDown(_) => InputModality::Keyboard,
-            PlatformInput::MouseMove(_) | PlatformInput::MouseDown(_) => InputModality::Mouse,
+            PlatformInput::KeyDown(_) if self.mouse_buttons_down.is_empty() => {
+                InputModality::Keyboard
+            }
+            PlatformInput::MouseMove(_)
+            | PlatformInput::MouseDown(_)
+            | PlatformInput::MouseUp(_) => InputModality::Mouse,
             PlatformInput::Touch(_) => InputModality::Touch,
             _ => self.last_input_modality,
         };
