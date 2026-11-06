@@ -117,6 +117,24 @@ asks (section 4(b)); a source file says so at its top:
   width and takes each glyph's advance off before the glyph, as
   cosmic-text does. A test of a line of 240 000 glyphs and one of 16 000
   right to left, which fails on the published crate.
+- `src/cosmic_text_system.rs`: a line with a left-to-right letter in it
+  is laid out left to right whatever its first letter
+  (`starts_right_to_left`, elundqvist/kvist#587). cosmic-text gives a
+  line the direction of its first strong letter (Unicode's rules P2 and
+  P3), so a file's name, `ملف.rs`, was drawn `rs.ملف` in its tab, the
+  tree, the switcher and its tooltip; VS Code and IntelliJ, left to right
+  as Kvist's window is, lay a label or a line of code out left to right,
+  its right-to-left words right to left within it. Such a line is
+  shaped after a U+200E, in the face of its first run, whose glyph is
+  left out and the rest put back at their own indices, a glyph the
+  shaper merged the mark into the first letter's (`index_past_mark`).
+  A line of
+  right-to-left letters alone is left as it was: cosmic-text lays it out
+  in the order of its indices, the order gpui reads a line's glyphs in
+  to put a caret or a selection. A test of `ملف.rs`, its name right to
+  left and its extension after it, no glyph of the mark and its width
+  the two parts', of Hebrew alone right to left, and of the indices past
+  the mark.
 
 ## Tests
 

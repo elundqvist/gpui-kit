@@ -716,6 +716,16 @@ impl CosmicTextSystemState {
         font_size: Pixels,
         font_runs: &[FontRun],
     ) -> LineLayout {
+        // a line is laid out left to right whatever its first letter: one that begins in a
+        // right-to-left script is shaped after a U+200E, which says so, and the mark's glyph
+        // is left out and the rest put back at their own indices
+        let marked = starts_right_to_left(text);
+        let shift = if marked { LTR_MARK.len_utf8() } else { 0 };
+        let shaped: Cow<'_, str> = if marked {
+            Cow::Owned(format!("{LTR_MARK}{text}"))
+        } else {
+            Cow::Borrowed(text)
+        };
         let mut attrs_list = AttrsList::new(&Attrs::new());
         // an emoji the run's font and its fallbacks lack is drawn from the colour emoji font,
         // matched at its own weight and style, so that cosmic-text takes it as asked; a line
@@ -783,19 +793,23 @@ impl CosmicTextSystemState {
                 )
             };
 
+            // the mark in the face of the line's first run, which has it or draws it as nothing
+            if marked && offs == 0 {
+                attrs_list.add_span(0..shift, &primary_attrs);
+            }
             for span in spans {
                 let attrs = match span.slot {
                     None => &primary_attrs,
                     Some(ix) => &fallback_attrs[ix],
                 };
-                attrs_list.add_span(span.start..span.end, attrs);
+                attrs_list.add_span(span.start + shift..span.end + shift, attrs);
             }
             offs = run_end;
         }
 
         let line = ShapeLine::new(
             &mut self.font_system,
-            text,
+            &shaped,
             &attrs_list,
             cosmic_text::Shaping::Advanced,
             4,
@@ -827,6 +841,9 @@ impl CosmicTextSystemState {
         let (pens, width) = pen_positions(&layout.glyphs, line.rtl);
         let mut runs: Vec<ShapedRun> = Vec::new();
         for (glyph, &pen) in layout.glyphs.iter().zip(&pens) {
+            let Some(index) = index_past_mark(glyph.start, glyph.end, shift) else {
+                continue;
+            };
             let mut font_id = FontId(glyph.metadata);
             let mut loaded_font = self.loaded_font(font_id);
             if loaded_font.font.id() != glyph.font_id {
@@ -854,7 +871,7 @@ impl CosmicTextSystemState {
             let shaped_glyph = ShapedGlyph {
                 id: GlyphId(glyph.glyph_id as u32),
                 position: point(pen.into(), glyph.y.into()),
-                index: glyph.start,
+                index,
                 is_emoji,
             };
 
@@ -908,6 +925,34 @@ impl CosmicTextSystemState {
             len: text.len(),
         }
     }
+}
+
+/// The mark that asks for a line to be laid out left to right (`starts_right_to_left`).
+const LTR_MARK: char = '\u{200E}';
+
+/// The index in the line's own text of a glyph of the cluster `start..end` of a line shaped
+/// after a mark of `shift` bytes, none for the mark's own glyph. A glyph the shaper merged the
+/// mark into, as it may where it hides the mark and the font has no space to show it as, is the
+/// first letter's, where leaving out every glyph from before the mark's end dropped that letter.
+fn index_past_mark(start: usize, end: usize, shift: usize) -> Option<usize> {
+    (shift == 0 || end > shift).then(|| start.saturating_sub(shift))
+}
+
+/// Whether `text` is to be laid out left to right after a U+200E: a line with a left-to-right
+/// letter in it that cosmic-text would lay out right to left, its first strong letter being of a
+/// right-to-left script (Unicode's rules P2 and P3). A file's name, `ملف.rs`, was drawn
+/// `rs.ملف` in its tab, the tree and the switcher (elundqvist/kvist#587), where VS Code and
+/// IntelliJ, left to right as Kvist's window is, lay a label or a line of code out left to
+/// right whatever its first letter, its right-to-left words right to left within it. A line of
+/// right-to-left letters alone is left to cosmic-text, which lays it out in the order of its
+/// indices, the order gpui reads a line's glyphs in to put a caret or a selection; laid out
+/// left to right, its glyphs go in the order they are drawn.
+fn starts_right_to_left(text: &str) -> bool {
+    !text.is_ascii()
+        && unicode_bidi::get_base_direction(text) == unicode_bidi::Direction::Rtl
+        && text
+            .chars()
+            .any(|c| unicode_bidi::bidi_class(c) == unicode_bidi::BidiClass::L)
 }
 
 /// The pen's x at each of a line's glyphs, and the line's width, summed in `f64` from the
@@ -1445,6 +1490,60 @@ mod tests {
             font_id,
         }];
         Ok(text_system.layout_line(text, gpui::px(14.0), &runs))
+    }
+
+    /// The x of the glyph of each of `indices` in `layout`.
+    fn x_of(layout: &LineLayout, indices: &[usize]) -> Vec<f32> {
+        let glyphs: Vec<_> = layout.runs.iter().flat_map(|run| &run.glyphs).collect();
+        indices
+            .iter()
+            .map(|&i| {
+                let glyph = glyphs.iter().find(|g| g.index == i).expect("a glyph at the index");
+                f32::from(glyph.position.x)
+            })
+            .collect()
+    }
+
+    /// A line with a left-to-right letter in it is laid out left to right whatever its first
+    /// letter: `ملف.rs` was drawn `rs.ملف`, its extension left of its name, in a tab, the tree
+    /// and the switcher (elundqvist/kvist#587). Its Arabic is drawn right to left within it,
+    /// the mark it is shaped after leaves no glyph and no width, and each glyph keeps its own
+    /// index. A line of right-to-left letters alone is laid out right to left, as before.
+    #[test]
+    fn a_line_with_a_left_to_right_letter_is_laid_out_left_to_right() -> Result<()> {
+        let text_system = text_system()?;
+        let name = "\u{645}\u{644}\u{641}.rs";
+        let layout = layout_text(&text_system, name)?;
+        let [meem, lam, feh, dot, r, s] = x_of(&layout, &[0, 2, 4, 6, 7, 8])[..] else {
+            unreachable!()
+        };
+        assert!(feh < lam && lam < meem, "the name right to left: {feh} {lam} {meem}");
+        assert!(meem < dot && dot < r && r < s, "the extension after it: {meem} {dot} {r} {s}");
+        assert_eq!(layout.len, name.len());
+        let glyphs: Vec<_> = layout.runs.iter().flat_map(|run| &run.glyphs).collect();
+        assert_eq!(glyphs.len(), 6, "no glyph of the mark");
+        assert!(glyphs.iter().all(|g| g.index < name.len()));
+        let alone = |t: &str| layout_text(&text_system, t).map(|l| f32::from(l.width));
+        let width = alone("\u{645}\u{644}\u{641}")? + alone(".rs")?;
+        assert!((f32::from(layout.width) - width).abs() < 0.01, "{:?} against {width}", layout.width);
+        // Hebrew alone, right to left from its first letter
+        let hebrew = layout_text(&text_system, "\u{5e9}\u{5dc}\u{5d5}\u{5dd}!")?;
+        let [shin, mem, bang] = x_of(&hebrew, &[0, 6, 8])[..] else {
+            unreachable!()
+        };
+        assert!(mem < shin && bang < mem, "{shin} {mem} {bang}");
+        Ok(())
+    }
+
+    /// The mark's own glyph is left out and every other keeps its index in the line's text,
+    /// one the mark was merged into the first letter's (elundqvist/kvist#587).
+    #[test]
+    fn a_glyph_past_the_mark_keeps_its_index() {
+        assert_eq!(index_past_mark(0, 3, 3), None, "the mark");
+        assert_eq!(index_past_mark(0, 5, 3), Some(0), "the mark and the first letter");
+        assert_eq!(index_past_mark(3, 5, 3), Some(0));
+        assert_eq!(index_past_mark(7, 9, 3), Some(4));
+        assert_eq!(index_past_mark(0, 2, 0), Some(0), "no mark");
     }
 
     /// Mirrors the original crash: mixed-direction text reaching the shaper
