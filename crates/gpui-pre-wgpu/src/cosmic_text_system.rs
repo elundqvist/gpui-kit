@@ -616,6 +616,15 @@ impl CosmicTextSystemState {
 
     #[profiling::function]
     fn layout_line(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
+        // Changed in elundqvist/gpui-kit (elundqvist/kvist#629): an empty line has no glyph and
+        // no width, as shaped, and is not shaped: cosmic-text matched its defaults, the generic
+        // sans-serif family where it has no run, against every face on the machine
+        if text.is_empty() {
+            return LineLayout {
+                font_size,
+                ..Default::default()
+            };
+        }
         if contains_paragraph_separator(text) {
             self.layout_line_with_separators(text, font_size, font_runs)
         } else {
@@ -710,23 +719,17 @@ impl CosmicTextSystemState {
         layout.descent = layout.descent.max(segment.descent);
     }
 
-    fn layout_line_no_separators(
-        &mut self,
-        text: &str,
-        font_size: Pixels,
-        font_runs: &[FontRun],
-    ) -> LineLayout {
-        // a line is laid out left to right whatever its first letter: one that begins in a
-        // right-to-left script is shaped after a U+200E, which says so, and the mark's glyph
-        // is left out and the rest put back at their own indices
-        let marked = starts_right_to_left(text);
-        let shift = if marked { LTR_MARK.len_utf8() } else { 0 };
-        let shaped: Cow<'_, str> = if marked {
-            Cow::Owned(format!("{LTR_MARK}{text}"))
-        } else {
-            Cow::Borrowed(text)
-        };
-        let mut attrs_list = AttrsList::new(&Attrs::new());
+    /// The faces `text` is shaped in, each run's and its fallbacks' and the colour emoji
+    /// font's where they draw, its indices moved on by `shift` where a mark is put before it
+    /// (`starts_right_to_left`). The list's defaults, which cosmic-text shapes a line with no
+    /// span in, an empty one, are the face of the line's first run: cosmic-text's own, its
+    /// generic sans-serif family, matched against every face on the machine on the drawing
+    /// thread, 1.8 to 3.2 ms at every start of Kvist, a family no font `prewarm_fonts` is
+    /// handed names (elundqvist/kvist#629).
+    fn attrs_list(&mut self, text: &str, font_runs: &[FontRun], shift: usize) -> AttrsList {
+        // Changed in elundqvist/gpui-kit (elundqvist/kvist#629): the list's defaults are the
+        // face of its first run, not cosmic-text's generic sans-serif family
+        let mut attrs_list: Option<AttrsList> = None;
         // an emoji the run's font and its fallbacks lack is drawn from the colour emoji font,
         // matched at its own weight and style, so that cosmic-text takes it as asked; a line
         // with no emoji in it neither looks for the font nor has its spans split for it
@@ -748,6 +751,7 @@ impl CosmicTextSystemState {
             };
 
             let primary_attrs = properties.attributes(run.font_id, &properties.primary_family_name);
+            let attrs_list = attrs_list.get_or_insert_with(|| AttrsList::new(&primary_attrs));
             let mut fallback_attrs: SmallVec<[Attrs<'_>; 4]> = properties
                 .fallback_chain
                 .iter()
@@ -794,7 +798,7 @@ impl CosmicTextSystemState {
             };
 
             // the mark in the face of the line's first run, which has it or draws it as nothing
-            if marked && offs == 0 {
+            if shift > 0 && offs == 0 {
                 attrs_list.add_span(0..shift, &primary_attrs);
             }
             for span in spans {
@@ -807,6 +811,26 @@ impl CosmicTextSystemState {
             offs = run_end;
         }
 
+        attrs_list.unwrap_or_else(|| AttrsList::new(&Attrs::new()))
+    }
+
+    fn layout_line_no_separators(
+        &mut self,
+        text: &str,
+        font_size: Pixels,
+        font_runs: &[FontRun],
+    ) -> LineLayout {
+        // a line is laid out left to right whatever its first letter: one that begins in a
+        // right-to-left script is shaped after a U+200E, which says so, and the mark's glyph
+        // is left out and the rest put back at their own indices
+        let marked = starts_right_to_left(text);
+        let shift = if marked { LTR_MARK.len_utf8() } else { 0 };
+        let shaped: Cow<'_, str> = if marked {
+            Cow::Owned(format!("{LTR_MARK}{text}"))
+        } else {
+            Cow::Borrowed(text)
+        };
+        let attrs_list = self.attrs_list(text, font_runs, shift);
         let line = ShapeLine::new(
             &mut self.font_system,
             &shaped,
@@ -2519,6 +2543,37 @@ mod tests {
         assert_eq!(second?, 12 + 4 + 12 + 3 * 16 + 56);
         assert_eq!(first?, 12 + 4 + 12 + 16);
         assert!(missing);
+        Ok(())
+    }
+
+    /// An empty line is not shaped, and the faces a line is shaped in default to its first
+    /// run's: an empty line, which has no span, was shaped in cosmic-text's defaults, its
+    /// generic sans-serif family, matched against every face on the machine on the drawing
+    /// thread, 1.8 to 3.2 ms at every start of Kvist, a family no font handed to
+    /// `prewarm_fonts` names (elundqvist/kvist#629). A line with no run keeps cosmic-text's.
+    #[test]
+    fn a_lines_faces_default_to_its_first_runs() -> Result<()> {
+        let text_system = text_system()?;
+        let font_id = text_system.font_id(&gpui::font("IBM Plex Sans"))?;
+        // an empty line, with a run or none, has no glyph and no width, and is not shaped: here
+        // there is no font to shape it in, where cosmic-text found none and panicked
+        let empty = CosmicTextSystem::new_without_system_fonts("IBM Plex Sans");
+        for (system, runs) in [(&empty, vec![]), (&text_system, vec![FontRun { len: 0, font_id }])] {
+            let layout = system.layout_line("", gpui::px(14.0), &runs);
+            assert_eq!((layout.width, layout.ascent, layout.descent), (Pixels::ZERO, Pixels::ZERO, Pixels::ZERO));
+            assert!(layout.runs.is_empty() && layout.len == 0 && layout.font_size == gpui::px(14.0));
+        }
+        let mut state = text_system.0.write();
+        for text in ["", "abc"] {
+            let runs = [FontRun {
+                len: text.len(),
+                font_id,
+            }];
+            let list = state.attrs_list(text, &runs, 0);
+            assert_eq!(list.defaults().family, Family::Name("IBM Plex Sans"), "{text:?}");
+            assert_eq!(list.defaults().metadata, font_id.0, "{text:?}");
+        }
+        assert_eq!(state.attrs_list("", &[], 0).defaults().family, Family::SansSerif);
         Ok(())
     }
 

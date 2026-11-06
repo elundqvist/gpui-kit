@@ -127,6 +127,20 @@ asks (section 4(b)); a source file says so at its top:
   width and takes each glyph's advance off before the glyph, as
   cosmic-text does. A test of a line of 240 000 glyphs and one of 80 000
   right to left, which fails on the published crate.
+- `src/cosmic_text_system.rs`: an empty line is not shaped, and the
+  faces a line is shaped in default to its first run's
+  (`CosmicTextSystemState::attrs_list`, elundqvist/kvist#629), where
+  they defaulted to cosmic-text's own, its generic sans-serif family. An
+  empty line has no span, and cosmic-text shapes it in the defaults, so
+  the first empty line of a start matched that family against every face
+  on the machine on the drawing thread, 1.8 to 3.2 ms at every start of
+  Kvist, 1.1 to 1.4 ms on a quieter machine, a family no font handed to
+  `prewarm_fonts` names. Laid out, an empty line has no glyph and no
+  width, as shaped; one with no run, which Kvist lays out too, had no
+  face to default to. A test of an empty line with no font to shape it
+  in, which panicked on cosmic-text's "no default font found", and of
+  the defaults of a line with a run, empty and not, and of one with
+  none.
 - `src/cosmic_text_system.rs`: a line with a left-to-right letter in it
   is laid out left to right whatever its first letter
   (`starts_right_to_left`, elundqvist/kvist#587). cosmic-text gives a
