@@ -243,8 +243,11 @@ impl LineLayout {
             // but there are some differences, so we have to duplicate the code here.
             if LineWrapper::is_word_char(ch) {
                 // Changed in elundqvist/gpui-kit (elundqvist/kvist#497): a word may
-                // begin a row after a `，` as after a space, as in `LineWrapper::wrap_line`
-                if (prev_ch == ' ' || LineWrapper::is_closing_mark(prev_ch))
+                // begin a row after a `，` as after a space, and (elundqvist/kvist#522)
+                // after a slash, as in `LineWrapper::wrap_line`
+                if (prev_ch == ' '
+                    || LineWrapper::is_closing_mark(prev_ch)
+                    || LineWrapper::breaks_after_slash(prev_ch, ch))
                     && ch != ' '
                     && first_non_whitespace_ix.is_some()
                 {
@@ -253,8 +256,10 @@ impl LineLayout {
                 }
             } else {
                 // Changed in elundqvist/gpui-kit (elundqvist/kvist#497): no row
-                // starts with a `，` or ends with a `「`, as in `LineWrapper::wrap_line`
+                // starts with a `，` or ends with a `「`, nor (elundqvist/kvist#522)
+                // with a slash but after a space, as in `LineWrapper::wrap_line`
                 if ch != ' '
+                    && !LineWrapper::holds_slash(prev_ch, ch)
                     && first_non_whitespace_ix.is_some()
                     && LineWrapper::may_break_between(prev_ch, ch)
                 {
@@ -1093,6 +1098,23 @@ mod tests {
             .iter()
             .map(|g| f32::from(g.position.x))
             .collect()
+    }
+
+    /// The rows a shaped line is drawn in break after a slash in a word,
+    /// as `LineWrapper::wrap_line` does, where they broke before it and left
+    /// `Merge feature` alone on a row (elundqvist/kvist#522).
+    #[test]
+    fn test_drawn_rows_break_after_a_slash() {
+        let text = "Merge feature/topic-name";
+        let mut layout = make_layout((0..text.len()).map(|i| glyph_at(i as f32 * 10., i)).collect());
+        layout.width = px(text.len() as f32 * 10.);
+        layout.len = text.len();
+        let rows: Vec<usize> = layout
+            .compute_wrap_boundaries(text, px(100.), None)
+            .iter()
+            .map(|b| b.glyph_ix)
+            .collect();
+        assert_eq!(rows, [6, 14]);
     }
 
     #[test]

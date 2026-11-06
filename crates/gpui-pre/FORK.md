@@ -299,6 +299,17 @@ asks (section 4(b)); each says so at its top:
   whose fifth fails to rasterize: its other emoji and letters are
   drawn, the .notdef asked for once in two frames, and the failure
   returned.
+- `src/text_system/line_wrapper.rs` and `src/text_system/line_layout.rs`:
+  a slash in a word is a place to break after it, not before it, in
+  `LineWrapper::wrap_line` and in the rows a shaped line is drawn in
+  (`LineLayout::compute_wrap_boundaries`), as UAX #14 has a slash (SY)
+  and VS Code's `editor.wordWrapBreakAfterCharacters` do
+  (`breaks_after_slash`, `holds_slash`, elundqvist/kvist#522): a
+  branch's name in a tooltip wrapped as `Merge feature` and
+  `/topic-name`, a lone word on the row before. A digit after the slash
+  stays with it, `1/2` (SY × NU), and a slash after a space may still
+  begin a row. Tests of both wrappers with `Merge feature/topic-name`,
+  a date, two slashes and a slash after a space.
 
 ## Tests
 

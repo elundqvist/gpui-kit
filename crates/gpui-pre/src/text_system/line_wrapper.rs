@@ -86,8 +86,11 @@ impl LineWrapper {
 
                         if Self::is_word_char(c) {
                             // Changed in elundqvist/gpui-kit (elundqvist/kvist#497): a
-                            // word may begin a row after a `，` as after a space.
-                            if (prev_c == ' ' || Self::is_closing_mark(rule_prev))
+                            // word may begin a row after a `，` as after a space, and
+                            // (elundqvist/kvist#522) after a slash.
+                            if (prev_c == ' '
+                                || Self::is_closing_mark(rule_prev)
+                                || Self::breaks_after_slash(rule_prev, c))
                                 && c != ' '
                                 && first_non_whitespace_ix.is_some()
                             {
@@ -97,8 +100,10 @@ impl LineWrapper {
                         } else {
                             // CJK may not be space separated, e.g.: `Hello world你好世界`
                             // Changed in elundqvist/gpui-kit (elundqvist/kvist#497):
-                            // but no row starts with a `，` or ends with a `「`.
+                            // but no row starts with a `，` or ends with a `「`, nor
+                            // (elundqvist/kvist#522) with a slash but after a space.
                             if c != ' '
+                                && !Self::holds_slash(rule_prev, c)
                                 && first_non_whitespace_ix.is_some()
                                 && Self::may_break_between(rule_prev, c)
                             {
@@ -627,13 +632,36 @@ impl LineWrapper {
         // before `!`, `)`, `]`, `}`, closing quotes or an ellipsis) — `plz!`,
         // `see)`, `quoted”` wrap as one word instead of orphaning the mark on
         // the next line. `/` and `?` stay break opportunities so long paths
-        // and URLs (`a/b`, `foo?b=2`) can wrap.
+        // and URLs (`a/b`, `foo?b=2`) can wrap, a path after its slash
+        // (`breaks_after_slash`).
         matches!(c, '!' | ')' | ']' | '}' | '"' | '”' | '»' | '…') ||
         // `⋯` character is special used in Zed, to keep this at the end of the line.
         matches!(c, '⋯') ||
 
         // Non-breaking glue characters
         matches!(c, '\u{202F}' | '\u{00A0}' | '\u{2011}')
+    }
+
+    /// Whether a row may begin with the word character `c` after a slash,
+    /// `prev`: a slash in a word is a place to break after it, as UAX #14 has
+    /// it (SY ÷ AL) and VS Code's `editor.wordWrapBreakAfterCharacters` do,
+    /// but not before a digit (SY × NU), so a date or a fraction, `1/2`, is
+    /// kept whole.
+    ///
+    /// Added in elundqvist/gpui-kit (elundqvist/kvist#522): a slash was a
+    /// place to break before it, so a branch's name wrapped as `feature` and
+    /// `/topic-name`, a lone first word on the row before.
+    pub(crate) fn breaks_after_slash(prev: char, c: char) -> bool {
+        prev == '/' && !c.is_ascii_digit()
+    }
+
+    /// Whether `c` is a slash that no row starts with, after `prev`: none but
+    /// after a space, so a path written after a word, `see /usr/bin`, may
+    /// still begin a row (UAX #14's × SY, which VS Code does not keep there).
+    ///
+    /// Added in elundqvist/gpui-kit (elundqvist/kvist#522).
+    pub(crate) fn holds_slash(prev: char, c: char) -> bool {
+        c == '/' && !prev.is_whitespace()
     }
 
     /// Whether a row may begin with `next` where `prev` ends the row before.
@@ -1245,6 +1273,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             &[Boundary::new(7, 0)],
         );
+    }
+
+    /// A slash in a word is a place to break after it, not before it: a
+    /// branch's name in a tooltip wrapped as `Merge feature` and
+    /// `/topic-name`, a lone word on the row before (elundqvist/kvist#522).
+    /// A digit after it stays with it, `1/2`, and a slash after a space may
+    /// still begin a row.
+    #[test]
+    fn test_wrap_line_breaks_after_a_slash() {
+        let mut wrapper = build_wrapper();
+        let mut wrap = |text: &str, width: f32| {
+            wrapper
+                .wrap_line(&[LineFragment::text(text)], px(width))
+                .map(|b| b.ix)
+                .collect::<Vec<_>>()
+        };
+        // ten characters a row: `Merge ` / `feature/` / `topic-name`
+        assert_eq!(wrap("Merge feature/topic-name", 96.), [6, 14]);
+        assert_eq!(wrap("feature/topic-name", 96.), [8]);
+        // no row of `/2`, nor of a slash after a word
+        assert_eq!(wrap("aaaaaa 11/22/2026", 96.), [7]);
+        assert_eq!(wrap("aaaaaaaa//bb", 96.), [10]);
+        // a slash after a space may still start a row
+        assert_eq!(wrap("aaaa /123456789", 96.), [5]);
     }
 
     #[test]
