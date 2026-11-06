@@ -143,6 +143,11 @@ pub(super) fn host_compiled(config: &LanguageConfig) -> bool {
 /// the future. Ready at once where the queries are compiled, and also where
 /// the task is gone without them, which `host` then compiles in place.
 ///
+/// The task is a thread of its own (`spawn_dedicated`), not one of gpui's
+/// background pool, every thread of which a task that blocks may hold: a
+/// file of a language not yet compiled stayed plain until one came free,
+/// as typed text did (elundqvist/kvist#423).
+///
 /// A task is shared by the highlighters of the thread that sent it, which
 /// is the drawing thread's, and its end wakes only that thread's futures:
 /// the executors of two threads, as those of two tests running side by
@@ -153,7 +158,7 @@ pub(super) fn compiling_host(config: &LanguageConfig, executor: &BackgroundExecu
     if let Some(task) = claim(&entry, owner) {
         let config = config.clone();
         executor
-            .spawn(async move {
+            .spawn_dedicated(move |_| async move {
                 let task = task;
                 let _ = host_of(&task.entry, &config);
             })
@@ -479,5 +484,27 @@ mod tests {
         host_of(&entry, &config).unwrap();
         drop((again, other));
         assert!(claim(&entry, here).is_none() && claim(&entry, there).is_none(), "compiled");
+    }
+
+    /// The task that compiles a language's queries takes no thread of
+    /// gpui's background pool: with every thread of it held by a task that
+    /// blocks, the first file of a language stayed plain until one came
+    /// free, as typed text did (elundqvist/kvist#423).
+    #[test]
+    fn test_the_queries_are_compiled_with_every_thread_of_the_pool_held() {
+        use super::super::input_adapter::a_held_pool::HeldPool;
+
+        let config = config("kvist-test-queries-held-pool", &[]);
+        let executor = BackgroundExecutor::new(Arc::new(HeldPool::default()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            smol::block_on(compiling_host(&config, &executor));
+            let _ = tx.send(host_compiled(&config));
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(60)),
+            Ok(true),
+            "the queries waited for a thread of the held pool"
+        );
     }
 }

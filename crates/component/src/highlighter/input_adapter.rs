@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gpui::{HighlightStyle, SharedString, Task};
+use gpui::{BackgroundExecutor, HighlightStyle, SharedString, Task};
 use gpui_base::input::{
     EditorState, FoldRange, HighlightStyleResolver, InputEdit as BaseInputEdit, InputHighlighter,
     InputHighlighterFactory,
@@ -149,6 +149,29 @@ fn parsed_at_the_key(language: &str, len: usize, slow: bool) -> bool {
         return len <= MARKDOWN_SYNC_PARSE_MAX_BYTES;
     }
     len <= SYNC_PARSE_MAX_BYTES && !slow
+}
+
+/// How late the parse after the pause may begin before it says so in the
+/// log (elundqvist/kvist#423): it begins within a few milliseconds of
+/// the pause's end.
+const PAUSE_PARSE_LATE: Duration = Duration::from_millis(300);
+
+/// A wait of `duration` on the platform's timer alone. The executor's
+/// `timer` is a task of gpui's background pool, which ends only once a
+/// thread of the pool is free to run it: with every thread held by a
+/// task that blocks, it ended seconds late.
+fn pause(executor: &BackgroundExecutor, duration: Duration) -> impl Future<Output = ()> + use<> {
+    executor.scheduler_executor().timer(duration)
+}
+
+/// `work` on a thread of its own rather than gpui's background pool, so
+/// that tasks blocking every thread of the pool do not hold it back; in
+/// tests, on the test scheduler's loop as any task.
+fn off_the_pool<R: Send + Sync + 'static>(
+    executor: &BackgroundExecutor,
+    work: impl FnOnce() -> R + Send + 'static,
+) -> Task<R> {
+    executor.spawn_dedicated(move |_| async move { work() })
 }
 
 /// A text above this size has its trees freed on a thread of their own
@@ -363,7 +386,12 @@ impl Shared {
                 }
             }
             let _cancel_guard = CancelOnDrop(cancel.clone());
-            cx.background_executor().timer(PARSE_DEBOUNCE).await;
+            let keyed = Instant::now();
+            // neither the pause nor the parse takes a thread of gpui's
+            // background pool, whose every thread a task that blocks may
+            // hold: there, what was typed stayed plain for seconds, until
+            // a thread came free to end the pause (elundqvist/kvist#423)
+            pause(cx.background_executor(), PARSE_DEBOUNCE).await;
             // the tree and the layers, taken once the typing has paused,
             // shared and made the parse's own on its thread
             // (`InjectionParseSource`): taken at the key, they were held
@@ -382,86 +410,94 @@ impl Shared {
             };
 
             let parse_cancel = cancel.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    // the parse after the pause, as the one at the key, and
-                    // marked as cut short where a key typed meanwhile
-                    // cancelled it
-                    let _parse =
-                        super::highlighter::PauseParse::enter(&language, text.len(), &parse_cancel);
-                    // the layers made the parse's own first, so that a key
-                    // typed during the host's parse finds them held by its
-                    // highlighter alone, and moves them in place
-                    let injection_data = injection_source.map(InjectionParseSource::into_data);
-                    let config = LanguageRegistry::singleton().language(&language)?;
-                    let grammar = config.language.as_ref()?;
-                    let mut parser = Parser::new();
-                    parser.set_language(grammar).ok()?;
-                    let mut progress = |_: &tree_sitter::ParseState| {
-                        if parse_cancel.load(Ordering::Relaxed) {
-                            std::ops::ControlFlow::Break(())
-                        } else {
-                            std::ops::ControlFlow::Continue(())
-                        }
-                    };
-                    let mut read = |offset: usize, _| {
-                        if offset >= text.len() {
-                            ""
-                        } else {
-                            let (chunk, chunk_byte_ix) = text.chunk(offset);
-                            &chunk[offset - chunk_byte_ix..]
-                        }
-                    };
-                    let options = ParseOptions::new().progress_callback(&mut progress);
-                    // a tree made from nothing that the next parse would
-                    // not reuse, which the key's parse left to this one,
-                    // is parsed from itself, edited at its start, so the
-                    // first key after a README opens does not build all of
-                    // it again on the drawing thread, nor does this parse
-                    // build it twice (elundqvist/kvist#376, #593)
-                    let again_from = old_tree
-                        .as_ref()
-                        .filter(|_| again)
-                        .map(super::highlighter::edited_at_its_start);
-                    let mut tree = parser.parse_with_options(
-                        &mut read,
-                        again_from.as_ref().or(old_tree.as_ref()),
-                        Some(options),
-                    )?;
-                    // and where there was none, the parse of the text from
-                    // nothing is parsed again so
-                    if old_tree.is_none() && super::highlighter::parsed_again_from_itself(grammar) {
-                        let options = ParseOptions::new().progress_callback(&mut progress);
-                        let again = super::highlighter::edited_at_its_start(&tree);
-                        tree = parser.parse_with_options(&mut read, Some(&again), Some(options))?;
-                    }
+            let result = off_the_pool(cx.background_executor(), move || {
+                // a parse that began late says so: what was typed
+                // stays plain until it lands
+                let late = keyed.elapsed().saturating_sub(PARSE_DEBOUNCE);
+                if late > PAUSE_PARSE_LATE {
+                    log::warn!(
+                        "highlighter: the parse after the pause of {language} ({} bytes) began {} ms late; what was typed stays plain until it lands",
+                        text.len(),
+                        late.as_millis()
+                    );
+                }
+                // the parse after the pause, as the one at the key, and
+                // marked as cut short where a key typed meanwhile
+                // cancelled it
+                let _parse =
+                    super::highlighter::PauseParse::enter(&language, text.len(), &parse_cancel);
+                // the layers made the parse's own first, so that a key
+                // typed during the host's parse finds them held by its
+                // highlighter alone, and moves them in place
+                let injection_data = injection_source.map(InjectionParseSource::into_data);
+                let config = LanguageRegistry::singleton().language(&language)?;
+                let grammar = config.language.as_ref()?;
+                let mut parser = Parser::new();
+                parser.set_language(grammar).ok()?;
+                let mut progress = |_: &tree_sitter::ParseState| {
                     if parse_cancel.load(Ordering::Relaxed) {
-                        return None;
-                    }
-                    // Off the UI thread an injected span may take as long as
-                    // it needs, until the next edit cancels it: a span too
-                    // large to parse in the time a keystroke gives it is
-                    // finished here.
-                    let injections = injection_data.map_or_else(Default::default, |data| {
-                        let data = InjectionParseData {
-                            parse_timeout: None,
-                            cancel: Some(parse_cancel.clone()),
-                            ..data
-                        };
-                        SyntaxHighlighter::compute_injection_layers(data, &tree, &text).0
-                    });
-                    if parse_cancel.load(Ordering::Relaxed) {
-                        return None;
-                    }
-                    let folds = if folding {
-                        extract_fold_ranges(&tree)
+                        std::ops::ControlFlow::Break(())
                     } else {
-                        Vec::new()
+                        std::ops::ControlFlow::Continue(())
+                    }
+                };
+                let mut read = |offset: usize, _| {
+                    if offset >= text.len() {
+                        ""
+                    } else {
+                        let (chunk, chunk_byte_ix) = text.chunk(offset);
+                        &chunk[offset - chunk_byte_ix..]
+                    }
+                };
+                let options = ParseOptions::new().progress_callback(&mut progress);
+                // a tree made from nothing that the next parse would
+                // not reuse, which the key's parse left to this one,
+                // is parsed from itself, edited at its start, so the
+                // first key after a README opens does not build all of
+                // it again on the drawing thread, nor does this parse
+                // build it twice (elundqvist/kvist#376, #593)
+                let again_from = old_tree
+                    .as_ref()
+                    .filter(|_| again)
+                    .map(super::highlighter::edited_at_its_start);
+                let mut tree = parser.parse_with_options(
+                    &mut read,
+                    again_from.as_ref().or(old_tree.as_ref()),
+                    Some(options),
+                )?;
+                // and where there was none, the parse of the text from
+                // nothing is parsed again so
+                if old_tree.is_none() && super::highlighter::parsed_again_from_itself(grammar) {
+                    let options = ParseOptions::new().progress_callback(&mut progress);
+                    let again = super::highlighter::edited_at_its_start(&tree);
+                    tree = parser.parse_with_options(&mut read, Some(&again), Some(options))?;
+                }
+                if parse_cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                // Off the UI thread an injected span may take as long as
+                // it needs, until the next edit cancels it: a span too
+                // large to parse in the time a keystroke gives it is
+                // finished here.
+                let injections = injection_data.map_or_else(Default::default, |data| {
+                    let data = InjectionParseData {
+                        parse_timeout: None,
+                        cancel: Some(parse_cancel.clone()),
+                        ..data
                     };
-                    Some((tree, injections, folds))
-                })
-                .await;
+                    SyntaxHighlighter::compute_injection_layers(data, &tree, &text).0
+                });
+                if parse_cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let folds = if folding {
+                    extract_fold_ranges(&tree)
+                } else {
+                    Vec::new()
+                };
+                Some((tree, injections, folds))
+            })
+            .await;
 
             if let Some((tree, injections, folds)) = result {
                 let replaced = highlighter
@@ -1602,6 +1638,63 @@ mod typing_at_any_pace {
         assert_eq!(
             *closed.lock().unwrap(),
             [moved, format!("parse language=rust bytes={}", text.len())]
+        );
+    }
+}
+
+/// The pause before the parse after the pause, and that parse, against a
+/// background pool every thread of which is held (elundqvist/kvist#423).
+#[cfg(test)]
+pub(super) mod a_held_pool {
+    use super::*;
+
+    /// A background pool every thread of which is held: it takes the work
+    /// it is given and never runs it. Its timer is a thread that sleeps.
+    #[derive(Default)]
+    pub(in crate::highlighter) struct HeldPool(std::sync::Mutex<Vec<gpui::RunnableVariant>>);
+
+    impl gpui::PlatformDispatcher for HeldPool {
+        fn is_main_thread(&self) -> bool {
+            false
+        }
+        fn dispatch(&self, runnable: gpui::RunnableVariant, _: gpui::Priority) {
+            self.0.lock().unwrap().push(runnable);
+        }
+        fn dispatch_on_main_thread(&self, runnable: gpui::RunnableVariant, _: gpui::Priority) {
+            self.0.lock().unwrap().push(runnable);
+        }
+        fn dispatch_after(&self, duration: Duration, runnable: gpui::RunnableVariant) {
+            std::thread::spawn(move || {
+                std::thread::sleep(duration);
+                runnable.run();
+            });
+        }
+        fn spawn_realtime(&self, f: Box<dyn FnOnce() + Send>) {
+            std::thread::spawn(f);
+        }
+    }
+
+    /// The pause before the parse after the pause, and that parse, take no
+    /// thread of gpui's background pool. With every thread of it held by a
+    /// task that blocks, Kvist's lookups of a definition each awaiting a
+    /// language server's answer as Ctrl moved over the text, the pause, a
+    /// task of the pool, did not end, and what was typed stayed plain
+    /// until the server answered (elundqvist/kvist#423).
+    #[test]
+    fn the_pause_and_its_parse_take_no_thread_of_a_held_pool() {
+        let executor = BackgroundExecutor::new(Arc::new(HeldPool::default()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let parsed = smol::block_on(async {
+                pause(&executor, Duration::from_millis(20)).await;
+                off_the_pool(&executor, || "parsed").await
+            });
+            let _ = tx.send(parsed);
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)),
+            Ok("parsed"),
+            "the pause or the parse waited for a thread of the held pool"
         );
     }
 }
