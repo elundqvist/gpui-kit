@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+// Changed in elundqvist/gpui-kit (elundqvist/kvist#626): the glyphs a fallback font has for
+// clusters the run's font lacks are put in their place in one pass (`take_fallback`).
 
 #![allow(clippy::too_many_arguments)]
 
@@ -11,7 +13,7 @@ use crate::{
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeSet, VecDeque};
 use core::cmp::{max, min};
 use core::fmt;
 use core::mem;
@@ -316,14 +318,14 @@ fn shape_run(
     let font = font_iter.next().expect("no default font found");
 
     let glyph_start = glyphs.len();
-    let mut missing = {
+    let missing = {
         let scratch = font_iter.shape_caches();
         shape_fallback(
             scratch, glyphs, &font, line, attrs_list, start_run, end_run, span_rtl,
         )
     };
 
-    //TODO: improve performance!
+    let mut missing: BTreeSet<usize> = missing.into_iter().collect();
     while !missing.is_empty() {
         let Some(font) = font_iter.next() else {
             break;
@@ -345,59 +347,14 @@ fn shape_run(
             end_run,
             span_rtl,
         );
-
-        // Insert all matching glyphs
-        let mut fb_i = 0;
-        while fb_i < fb_glyphs.len() {
-            let start = fb_glyphs[fb_i].start;
-            let end = fb_glyphs[fb_i].end;
-
-            // Skip clusters that are not missing, or where the fallback font is missing
-            if !missing.contains(&start) || fb_missing.contains(&start) {
-                fb_i += 1;
-                continue;
-            }
-
-            let mut missing_i = 0;
-            while missing_i < missing.len() {
-                if missing[missing_i] >= start && missing[missing_i] < end {
-                    // println!("No longer missing {}", missing[missing_i]);
-                    missing.remove(missing_i);
-                } else {
-                    missing_i += 1;
-                }
-            }
-
-            // Find prior glyphs
-            let mut i = glyph_start;
-            while i < glyphs.len() {
-                if glyphs[i].start >= start && glyphs[i].end <= end {
-                    break;
-                }
-                i += 1;
-            }
-
-            // Remove prior glyphs
-            while i < glyphs.len() {
-                if glyphs[i].start >= start && glyphs[i].end <= end {
-                    let _glyph = glyphs.remove(i);
-                    // log::trace!("Removed {},{} from {}", _glyph.start, _glyph.end, i);
-                } else {
-                    break;
-                }
-            }
-
-            while fb_i < fb_glyphs.len() {
-                if fb_glyphs[fb_i].start >= start && fb_glyphs[fb_i].end <= end {
-                    let fb_glyph = fb_glyphs.remove(fb_i);
-                    // log::trace!("Insert {},{} from font {} at {}", fb_glyph.start, fb_glyph.end, font_i, i);
-                    glyphs.insert(i, fb_glyph);
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-        }
+        take_fallback(
+            glyphs,
+            glyph_start,
+            &mut missing,
+            fb_glyphs,
+            &fb_missing,
+            span_rtl,
+        );
     }
 
     // Debug missing font fallbacks
@@ -411,6 +368,102 @@ fn shape_run(
 
     // Restore the scripts buffer.
     font_system.shape_buffer.scripts = scripts;
+}
+
+/// Puts the glyphs a fallback font has for the clusters of a run its font lacks in their place.
+///
+/// `glyphs[glyph_start..]` is the run as shaped so far, in the order it is drawn in, and
+/// `missing` the starts of its clusters still drawn as nothing; `fb_glyphs` is the run as the
+/// fallback font shapes it, and `fb_missing` the starts of the clusters that font lacks too. Each
+/// cluster of the fallback's that starts where one is missing and that the fallback has takes
+/// the place of the run's clusters within its range, or goes after the run where none is, and
+/// is missing no longer.
+///
+/// Added in elundqvist/gpui-kit (elundqvist/kvist#626): this was done a cluster at a time, each
+/// looked for from the run's start, its glyphs removed and inserted one by one and `missing`
+/// searched as a list, so a word of a script the asked font lacks took time in the square of its
+/// length: 16 000 Hebrew letters in Noto Sans, drawn from Noto Sans Hebrew, took 0.38 s in a
+/// release build and 32 000 took 1.6 s. The clusters taken, where they go and the order of the
+/// glyphs are as they were.
+fn take_fallback(
+    glyphs: &mut Vec<ShapeGlyph>,
+    glyph_start: usize,
+    missing: &mut BTreeSet<usize>,
+    fb_glyphs: Vec<ShapeGlyph>,
+    fb_missing: &[usize],
+    rtl: bool,
+) {
+    let fb_missing: BTreeSet<usize> = fb_missing.iter().copied().collect();
+
+    // The fallback's clusters that are taken, in its order: each one's range and its glyphs'
+    let mut taken = Vec::new();
+    let mut fb_i = 0;
+    while fb_i < fb_glyphs.len() {
+        let (start, end) = (fb_glyphs[fb_i].start, fb_glyphs[fb_i].end);
+        if !missing.contains(&start) || fb_missing.contains(&start) {
+            fb_i += 1;
+            continue;
+        }
+        if start < end {
+            let found: Vec<usize> = missing.range(start..end).copied().collect();
+            for at in found {
+                missing.remove(&at);
+            }
+        }
+        let first = fb_i;
+        while fb_i < fb_glyphs.len()
+            && fb_glyphs[fb_i].start >= start
+            && fb_glyphs[fb_i].end <= end
+        {
+            fb_i += 1;
+        }
+        taken.push((start, end, first..fb_i));
+    }
+    if taken.is_empty() {
+        return;
+    }
+
+    // The run again, in one pass: each taken cluster in place of the run's glyphs within its
+    // range, where the first of them was, and after the run where none is
+    let run = glyphs.split_off(glyph_start);
+    let mut run = run.into_iter().peekable();
+    let mut fb_glyphs = fb_glyphs.into_iter();
+    let mut fb_at = 0;
+    let mut after = Vec::new();
+    for (start, end, range) in taken {
+        let mut cluster = fb_glyphs.by_ref().skip(range.start - fb_at).take(range.len());
+        fb_at = range.end;
+        let within = |glyph: &ShapeGlyph| glyph.start >= start && glyph.end <= end;
+        // the run's glyphs drawn before the cluster's range, which none of the clusters after
+        // it can take either
+        let before = |glyph: &ShapeGlyph| {
+            if rtl {
+                glyph.start >= end
+            } else {
+                glyph.end <= start
+            }
+        };
+        // and those drawn across one of its ends, which stay where they are
+        let across = |glyph: &ShapeGlyph| {
+            !within(glyph)
+                && if rtl {
+                    glyph.end > start
+                } else {
+                    glyph.start < end
+                }
+        };
+        while let Some(glyph) = run.next_if(|glyph| before(glyph) || across(glyph)) {
+            glyphs.push(glyph);
+        }
+        if run.peek().is_some_and(within) {
+            while run.next_if(within).is_some() {}
+            glyphs.extend(cluster.by_ref());
+        } else {
+            after.extend(cluster.by_ref());
+        }
+    }
+    glyphs.extend(run);
+    glyphs.extend(after);
 }
 
 #[cfg(feature = "shape-run-cache")]
@@ -3055,5 +3108,201 @@ impl ShapeLine {
         scratch.visual_lines.append(&mut cached_visual_lines);
         scratch.cached_visual_lines = cached_visual_lines;
         scratch.glyph_sets = cached_glyph_sets;
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod take_fallback_tests {
+    // Added in elundqvist/gpui-kit (elundqvist/kvist#626).
+    use super::*;
+    use alloc::sync::Arc;
+
+    /// The merge as cosmic-text 0.19.0 published it, a cluster at a time, which
+    /// `take_fallback` must agree with.
+    fn take_fallback_as_published(
+        glyphs: &mut Vec<ShapeGlyph>,
+        glyph_start: usize,
+        missing: &mut Vec<usize>,
+        mut fb_glyphs: Vec<ShapeGlyph>,
+        fb_missing: &[usize],
+    ) {
+        let mut fb_i = 0;
+        while fb_i < fb_glyphs.len() {
+            let start = fb_glyphs[fb_i].start;
+            let end = fb_glyphs[fb_i].end;
+            if !missing.contains(&start) || fb_missing.contains(&start) {
+                fb_i += 1;
+                continue;
+            }
+            let mut missing_i = 0;
+            while missing_i < missing.len() {
+                if missing[missing_i] >= start && missing[missing_i] < end {
+                    missing.remove(missing_i);
+                } else {
+                    missing_i += 1;
+                }
+            }
+            let mut i = glyph_start;
+            while i < glyphs.len() {
+                if glyphs[i].start >= start && glyphs[i].end <= end {
+                    break;
+                }
+                i += 1;
+            }
+            while i < glyphs.len() {
+                if glyphs[i].start >= start && glyphs[i].end <= end {
+                    glyphs.remove(i);
+                } else {
+                    break;
+                }
+            }
+            while fb_i < fb_glyphs.len() {
+                if fb_glyphs[fb_i].start >= start && fb_glyphs[fb_i].end <= end {
+                    glyphs.insert(i, fb_glyphs.remove(fb_i));
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn font_system() -> FontSystem {
+        let mut db = fontdb::Database::new();
+        db.load_fonts_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/fonts"));
+        FontSystem::new_with_locale_and_db("en-US".into(), db)
+    }
+
+    fn font(font_system: &mut FontSystem, family: &str) -> Arc<Font> {
+        let query = fontdb::Query {
+            families: &[fontdb::Family::Name(family)],
+            ..Default::default()
+        };
+        let id = font_system.db().query(&query).expect(family);
+        font_system.get_font(id, fontdb::Weight::NORMAL).expect(family)
+    }
+
+    /// What tells two runs of glyphs apart: each one's cluster, glyph and font, in order.
+    fn seen(glyphs: &[ShapeGlyph]) -> Vec<(usize, usize, u16, fontdb::ID)> {
+        glyphs.iter().map(|g| (g.start, g.end, g.glyph_id, g.font_id)).collect()
+    }
+
+    /// `text` shaped in the first of `families` and then in each of the others for the clusters
+    /// still missing, merged both ways, with a glyph of the line before the run in front of it.
+    fn both_ways(text: &str, rtl: bool, families: &[&str]) -> (Vec<ShapeGlyph>, Vec<ShapeGlyph>) {
+        let mut font_system = font_system();
+        let fonts: Vec<_> = families.iter().map(|f| font(&mut font_system, f)).collect();
+        let line = format!("x{text}");
+        let attrs_list = AttrsList::new(&Attrs::new());
+        let mut scratch = ShapeBuffer::default();
+        let mut head = Vec::new();
+        shape_fallback(&mut scratch, &mut head, &fonts[0], &line, &attrs_list, 0, 1, false);
+        let mut ours = head.clone();
+        let missing = shape_fallback(&mut scratch, &mut ours, &fonts[0], &line, &attrs_list, 1, line.len(), rtl);
+        let mut theirs = ours.clone();
+        let mut ours_missing: BTreeSet<usize> = missing.iter().copied().collect();
+        let mut theirs_missing = missing;
+        for font in &fonts[1..] {
+            let mut fb_glyphs = Vec::new();
+            let fb_missing = shape_fallback(&mut scratch, &mut fb_glyphs, font, &line, &attrs_list, 1, line.len(), rtl);
+            take_fallback(&mut ours, head.len(), &mut ours_missing, fb_glyphs.clone(), &fb_missing, rtl);
+            take_fallback_as_published(&mut theirs, head.len(), &mut theirs_missing, fb_glyphs, &fb_missing);
+            assert_eq!(ours_missing, theirs_missing.iter().copied().collect(), "{text}: what is missing");
+        }
+        (ours, theirs)
+    }
+
+    /// Hebrew, Arabic with its marks and the two in one run, in fonts that lack them and then in
+    /// fonts that have them, one or the other, are merged as cosmic-text merged them.
+    #[test]
+    fn a_fallbacks_clusters_are_taken_as_before() {
+        let cases: &[(&str, bool, &[&str])] = &[
+            ("\u{5e9}\u{5dc}\u{5d5}\u{5dd} \u{5e2}\u{5d5}\u{5dc}\u{5dd}", true, &["Noto Sans", "Noto Sans Hebrew"]),
+            ("\u{5e9}\u{5b8}\u{5c1}\u{5dc}\u{5d5}\u{5b9}\u{5dd}", true, &["Inter", "Noto Sans Hebrew"]),
+            ("\u{628}\u{650}\u{633}\u{652}\u{645}\u{650} \u{671}\u{644}\u{644}\u{651}\u{670}\u{647}\u{650}", true, &["Noto Sans", "Noto Sans Arabic"]),
+            ("\u{5e9}\u{5dc}\u{5d5}\u{5dd}\u{633}\u{644}\u{627}\u{645}", true, &["Inter", "Noto Sans Hebrew", "Noto Sans Arabic"]),
+            ("\u{633}\u{644}\u{627}\u{645}\u{5e9}\u{5dc}\u{5d5}\u{5dd}", true, &["Fira Mono", "Noto Sans Arabic", "Noto Sans Hebrew"]),
+            ("ab\u{5e9}cd\u{644}\u{627}ef", false, &["Noto Sans", "Noto Sans Hebrew", "Noto Sans Arabic"]),
+            ("\u{5d0}\u{301}\u{5d1}a\u{5b8}", false, &["Inter", "Noto Sans Hebrew"]),
+        ];
+        for (text, rtl, families) in cases {
+            let (ours, theirs) = both_ways(text, *rtl, families);
+            assert_eq!(seen(&ours), seen(&theirs), "{text}");
+            assert!(ours.iter().skip(1).any(|g| g.font_id != ours[0].font_id), "{text}: a fallback font drew some of it");
+        }
+    }
+
+    /// Where the fonts cut a run into clusters at other places, a cluster with nothing of the
+    /// run's within its range goes after the run, and one that takes some of the run's clusters
+    /// leaves those it only covers part of, both as cosmic-text had them.
+    #[test]
+    fn clusters_cut_at_other_places_are_taken_as_before() {
+        let mut font_system = font_system();
+        let noto = font(&mut font_system, "Noto Sans");
+        let mut scratch = ShapeBuffer::default();
+        let mut template = Vec::new();
+        shape_fallback(&mut scratch, &mut template, &noto, "a", &AttrsList::new(&Attrs::new()), 0, 1, false);
+        let glyph = |start: usize, end: usize, id: u16| ShapeGlyph {
+            start,
+            end,
+            glyph_id: id,
+            ..template[0].clone()
+        };
+        // each glyph's cluster and id, 0 where it is missing
+        type Glyphs = &'static [(usize, usize, u16)];
+        let runs: &[(Glyphs, Glyphs, bool)] = &[
+            // left to right: [0, 4) missing, the fallback's [0, 2) and [2, 4)
+            (&[(0, 4, 0), (4, 5, 1)], &[(0, 2, 7), (2, 4, 8), (4, 5, 9)], false),
+            // [0, 2) and [2, 4) missing, the fallback's [0, 4)
+            (&[(0, 2, 0), (2, 4, 0), (4, 5, 1)], &[(0, 4, 7), (4, 5, 9)], false),
+            // a cluster missing across the fallback's
+            (&[(0, 1, 1), (1, 3, 0), (3, 5, 0), (5, 6, 1)], &[(0, 2, 7), (2, 4, 8), (4, 6, 9)], false),
+            // right to left, the same
+            (&[(4, 5, 1), (0, 4, 0)], &[(4, 5, 9), (2, 4, 8), (0, 2, 7)], true),
+            (&[(4, 5, 1), (2, 4, 0), (0, 2, 0)], &[(4, 5, 9), (0, 4, 7)], true),
+            (&[(5, 6, 1), (3, 5, 0), (1, 3, 0), (0, 1, 1)], &[(4, 6, 9), (2, 4, 8), (0, 2, 7)], true),
+            // two glyphs to a cluster on either side
+            (&[(0, 2, 0), (0, 2, 0), (2, 3, 1)], &[(0, 2, 7), (0, 2, 8), (2, 3, 9)], false),
+            (&[(2, 3, 1), (0, 2, 0), (0, 2, 0)], &[(2, 3, 9), (0, 2, 8), (0, 2, 7)], true),
+        ];
+        for (run, fb, rtl) in runs {
+            let mut ours: Vec<ShapeGlyph> = run.iter().map(|&(s, e, id)| glyph(s, e, id)).collect();
+            let fb_glyphs: Vec<ShapeGlyph> = fb.iter().map(|&(s, e, id)| glyph(s, e, id)).collect();
+            let missing: Vec<usize> = run.iter().filter(|g| g.2 == 0).map(|g| g.0).collect();
+            let mut theirs = ours.clone();
+            let mut ours_missing: BTreeSet<usize> = missing.iter().copied().collect();
+            let mut theirs_missing = missing;
+            take_fallback(&mut ours, 0, &mut ours_missing, fb_glyphs.clone(), &[], *rtl);
+            take_fallback_as_published(&mut theirs, 0, &mut theirs_missing, fb_glyphs, &[]);
+            assert_eq!(seen(&ours), seen(&theirs), "{run:?} and {fb:?}");
+            assert_eq!(ours_missing, theirs_missing.iter().copied().collect(), "{run:?} and {fb:?}");
+        }
+    }
+
+    /// A word of 80 000 Hebrew letters in a font without Hebrew is drawn from one with it in
+    /// time that grows with its length, where it grew with its square: 16 000 took 0.38 s and
+    /// 32 000 1.6 s in a release build. Four times as long, it takes about four times as long,
+    /// not sixteen.
+    #[test]
+    fn a_long_word_from_a_fallback_font_takes_time_in_its_length() {
+        let mut font_system = font_system();
+        let attrs = Attrs::new().family(Family::Name("Noto Sans"));
+        let attrs_list = AttrsList::new(&attrs);
+        let hebrew = font(&mut font_system, "Noto Sans Hebrew").id();
+        let mut time = |count: usize| {
+            let text = "\u{5d0}".repeat(count);
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let now = std::time::Instant::now();
+                let line = ShapeLine::new(&mut font_system, &text, &attrs_list, Shaping::Advanced, 4);
+                best = best.min(now.elapsed().as_secs_f64());
+                let glyphs: Vec<_> = line.spans.iter().flat_map(|s| &s.words).flat_map(|w| &w.glyphs).collect();
+                assert_eq!(glyphs.len(), count);
+                assert!(glyphs.iter().all(|g| g.font_id == hebrew && g.glyph_id != 0));
+            }
+            best
+        };
+        let (short, long) = (time(20_000), time(80_000));
+        assert!(long < 8.0 * short, "20 000 letters in {short:.3} s, 80 000 in {long:.3} s");
     }
 }

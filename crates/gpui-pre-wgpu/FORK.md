@@ -16,7 +16,12 @@ which asks for `=0.3.3`, takes it when an application patches it in.
 cosmic-text, the shaper and layout the text system is built on, is
 taken by path from `crates/cosmic-text`, where the fork carries it with
 fixes of its own (its FORK.md says what they are), beside the version
-crates.io serves it at; `Cargo.lock` names it with no source.
+crates.io serves it at; `Cargo.lock` names it with no source. A test
+here of a word of 80 000 Hebrew, Arabic or Devanagari letters drawn
+from a fallback font, laid out in a few times the time of 80 000 Latin
+letters (elundqvist/kvist#626): 35 s against 0.18 s in a test build on
+the published cosmic-text, whose fallback merge took time in the square
+of the word's length.
 
 ## What is changed
 
@@ -120,7 +125,7 @@ asks (section 4(b)); a source file says so at its top:
   width, where the caret at its end is, and one of 80 KB two hundred
   pixels past it. A line laid out right to left puts the pen at its
   width and takes each glyph's advance off before the glyph, as
-  cosmic-text does. A test of a line of 240 000 glyphs and one of 16 000
+  cosmic-text does. A test of a line of 240 000 glyphs and one of 80 000
   right to left, which fails on the published crate.
 - `src/cosmic_text_system.rs`: a line with a left-to-right letter in it
   is laid out left to right whatever its first letter

@@ -2522,17 +2522,54 @@ mod tests {
         Ok(())
     }
 
+    /// A word of 80 000 letters the line's font lacks, Hebrew from right to left, Arabic and
+    /// Devanagari, is laid out in a few times the time of one of 80 000 Latin letters the font
+    /// has, each drawn from the font that has it: cosmic-text put a fallback font's clusters in
+    /// place one at a time, each looked for from the run's start, and 16 000 Hebrew letters
+    /// took 0.38 s in a release build, 80 000 ten seconds (elundqvist/kvist#626).
+    #[test]
+    fn a_long_word_from_a_fallback_font_is_laid_out_in_time_with_its_length() -> Result<()> {
+        const NOTO: [&[u8]; 3] = [
+            include_bytes!("../../cosmic-text/fonts/NotoSansHebrew.ttf"),
+            include_bytes!("../../cosmic-text/fonts/NotoSansArabic.ttf"),
+            include_bytes!("../../cosmic-text/fonts/NotoSans-Regular.ttf"),
+        ];
+        let text_system = text_system()?;
+        text_system.add_fonts(NOTO.iter().map(|font| Cow::Borrowed(*font)).collect())?;
+        let plex = text_system.font_id(&gpui::font("IBM Plex Sans"))?;
+        let time = |unit: &str| -> Result<f64> {
+            let text = unit.repeat(80_000);
+            let mut best = f64::MAX;
+            for _ in 0..2 {
+                let now = std::time::Instant::now();
+                let layout = layout_text(&text_system, &text)?;
+                best = best.min(now.elapsed().as_secs_f64());
+                let glyphs: Vec<_> = layout.runs.iter().flat_map(|run| &run.glyphs).collect();
+                assert_eq!(glyphs.len(), 80_000, "{unit:?}");
+                let drawn_in_plex = layout.runs.iter().all(|run| run.font_id == plex);
+                assert_eq!(drawn_in_plex, unit == "a", "{unit:?}");
+                assert!(glyphs.iter().all(|glyph| glyph.id.0 != 0), "{unit:?}: none missing");
+            }
+            Ok(best)
+        };
+        let latin = time("a")?;
+        for unit in ["\u{05d0}", "\u{0628}", "\u{0915}"] {
+            let other = time(unit)?;
+            assert!(other < 10.0 * latin, "{unit:?}: {other:.3} s against {latin:.3} s for Latin");
+        }
+        Ok(())
+    }
+
     /// A line of 240 000 like glyphs has each laid out at its index times the
     /// glyph's advance, the last ending at the line's width, where the caret
     /// at its end is: summed in `f32`, the glyphs near its end stood
     /// hundreds of pixels from there and from the width, which cosmic-text
-    /// sums apart (elundqvist/kvist#617). One of 16 000 right to left the
-    /// same, from the width down (laid out right to left, a longer line
-    /// takes minutes in a test build).
+    /// sums apart (elundqvist/kvist#617). One of 80 000 right to left the
+    /// same, from the width down.
     #[test]
     fn a_long_lines_glyphs_are_laid_out_at_their_advances() -> Result<()> {
         let text_system = text_system()?;
-        for (unit, rtl, count) in [("a", false, 240_000), ("\u{05d0}", true, 16_000)] {
+        for (unit, rtl, count) in [("a", false, 240_000), ("\u{05d0}", true, 80_000)] {
             let advance = f64::from(layout_text(&text_system, unit)?.width);
             assert!(advance > 1.0, "{unit:?}");
             let text = unit.repeat(count);
