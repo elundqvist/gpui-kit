@@ -284,6 +284,21 @@ asks (section 4(b)); each says so at its top:
   key, of a lost release, by a move, by the pointer's leaving and by the
   window's no longer being the active one, and of another button's
   release.
+- `src/text_system.rs` and `src/text_system/line.rs`: a glyph the
+  platform cannot render is drawn as nothing, and the line's paint goes
+  on to the glyphs after it (elundqvist/kvist#540). The colour emoji
+  font's .notdef, which swash cannot render and which cosmic-text shapes
+  an enclosing circle after an emoji as, ended the paint of a row of
+  200 😀⃝ at its first emoji, every glyph after it, ` END` among them,
+  never drawn. `TextSystem::raster_bounds` keeps the failure as bounds of
+  no size, said once in the log, so it is not asked for again at each of
+  its glyphs in each frame, and `paint_line` leaves out a glyph whose
+  paint fails for any other reason, an atlas with no room, draws the
+  rest and returns the first such failure to its caller, which logs it
+  as before. A test of a row whose second glyph cannot be rendered and
+  whose fifth fails to rasterize: its other emoji and letters are
+  drawn, the .notdef asked for once in two frames, and the failure
+  returned.
 
 ## Tests
 

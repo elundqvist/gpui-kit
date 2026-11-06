@@ -345,7 +345,17 @@ impl TextSystem {
             Ok(*bounds)
         } else {
             let mut raster_bounds = RwLockUpgradableReadGuard::upgrade(raster_bounds);
-            let bounds = self.platform_text_system.glyph_raster_bounds(params)?;
+            // Changed in elundqvist/gpui-kit (elundqvist/kvist#540): a glyph the platform
+            // cannot render, as swash cannot the colour emoji font's .notdef, is kept as one of
+            // no size, which is drawn as nothing, and its failure is said once, not again at
+            // each glyph of it in each frame
+            let bounds = self
+                .platform_text_system
+                .glyph_raster_bounds(params)
+                .unwrap_or_else(|error| {
+                    log::warn!("a glyph is drawn as nothing: {error:#}");
+                    Bounds::default()
+                });
             raster_bounds.insert(params.clone(), bounds);
             Ok(bounds)
         }

@@ -414,6 +414,7 @@ fn paint_line(
         let mut glyph_origin = point(row.origin_x, origin.y);
         let mut max_glyph_size = size(px(0.), px(0.));
         let mut first_glyph_x = origin.x;
+        let mut failed = None;
         for (run_ix, run) in layout.runs.iter().enumerate() {
             max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
 
@@ -568,13 +569,13 @@ fn paint_line(
                 let content_mask = window.content_mask();
                 if max_glyph_bounds.intersects(&content_mask.bounds) {
                     let vertical_offset = point(px(0.0), glyph.position.y);
-                    if glyph.is_emoji {
+                    let painted = if glyph.is_emoji {
                         window.paint_emoji(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
                             layout.font_size,
-                        )?;
+                        )
                     } else {
                         window.paint_glyph(
                             glyph_origin + baseline_offset + vertical_offset,
@@ -582,7 +583,13 @@ fn paint_line(
                             glyph.id,
                             layout.font_size,
                             color,
-                        )?;
+                        )
+                    };
+                    // Changed in elundqvist/gpui-kit (elundqvist/kvist#540): a glyph that
+                    // fails to be drawn is left out and the line goes on to the glyphs after
+                    // it, where a row ended at the first; the first failure is the line's
+                    if let Err(error) = painted {
+                        failed.get_or_insert(error);
                     }
                 }
             }
@@ -617,7 +624,7 @@ fn paint_line(
             );
         }
 
-        Ok(())
+        failed.map_or(Ok(()), Err)
     })
 }
 
@@ -1136,5 +1143,150 @@ mod tests {
             "from the first marked glyph: {}",
             underline[0] / factor
         );
+    }
+
+    /// A row of emoji whose second glyph the platform cannot render, as swash cannot the colour
+    /// emoji font's .notdef for the U+20DD after 😀, draws the glyphs after it: the line's paint
+    /// stopped at it, and a row of 200 😀⃝ showed its first emoji alone (elundqvist/kvist#540).
+    /// The glyph is asked for once, not again in the next frame. A glyph that fails to be drawn
+    /// otherwise, as one the atlas has no room for, is left out as well, and the line's paint
+    /// says the failure to its caller once it has drawn the rest.
+    #[test]
+    fn test_a_glyph_that_cannot_be_rendered_leaves_the_rest_of_the_line_drawn() {
+        use crate::{
+            Context, IntoElement, NoopTextSystem, ParentElement as _, PlatformTextSystem,
+            RenderGlyphParams, Render, Styled as _, TestApp, Window, canvas, div,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Draws every glyph but the .notdef, glyph 0, a 10 px square, and fails to rasterize
+        /// glyph 6; counts the asks for the .notdef.
+        #[derive(Default)]
+        struct NoNotdef(AtomicUsize);
+
+        impl PlatformTextSystem for NoNotdef {
+            fn add_fonts(&self, fonts: Vec<std::borrow::Cow<'static, [u8]>>) -> Result<()> {
+                NoopTextSystem.add_fonts(fonts)
+            }
+            fn all_font_names(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn font_id(&self, descriptor: &crate::Font) -> Result<FontId> {
+                NoopTextSystem.font_id(descriptor)
+            }
+            fn font_metrics(&self, font_id: FontId) -> crate::FontMetrics {
+                NoopTextSystem.font_metrics(font_id)
+            }
+            fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
+                NoopTextSystem.typographic_bounds(font_id, glyph_id)
+            }
+            fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<crate::Size<f32>> {
+                NoopTextSystem.advance(font_id, glyph_id)
+            }
+            fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
+                NoopTextSystem.glyph_for_char(font_id, ch)
+            }
+            fn glyph_raster_bounds(
+                &self,
+                params: &RenderGlyphParams,
+            ) -> Result<Bounds<crate::DevicePixels>> {
+                if params.glyph_id == GlyphId(0) {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                    anyhow::bail!("unable to render glyph via swash for {params:?}");
+                }
+                Ok(Bounds::new(point(0.into(), (-10).into()), size(10.into(), 10.into())))
+            }
+            fn rasterize_glyph(
+                &self,
+                params: &RenderGlyphParams,
+                raster_bounds: Bounds<crate::DevicePixels>,
+            ) -> Result<(crate::Size<crate::DevicePixels>, Vec<u8>)> {
+                if params.glyph_id == GlyphId(6) {
+                    anyhow::bail!("no room for glyph 6");
+                }
+                let pixels = (raster_bounds.size.width.0 * raster_bounds.size.height.0) as usize;
+                Ok((raster_bounds.size, vec![0; pixels * 4]))
+            }
+            fn layout_line(&self, text: &str, font_size: Pixels, runs: &[crate::FontRun]) -> LineLayout {
+                NoopTextSystem.layout_line(text, font_size, runs)
+            }
+            fn recommended_rendering_mode(
+                &self,
+                font_id: FontId,
+                font_size: Pixels,
+            ) -> crate::TextRenderingMode {
+                NoopTextSystem.recommended_rendering_mode(font_id, font_size)
+            }
+        }
+
+        // 😀, the .notdef the enclosing circle is shaped as, two more 😀, a letter, one that
+        // fails to be rasterized and one more
+        let glyph = |id: u32, x: f32, index: usize, is_emoji: bool| ShapedGlyph {
+            id: GlyphId(id),
+            position: point(px(x), px(0.)),
+            index,
+            is_emoji,
+        };
+        let line = ShapedLine {
+            layout: Arc::new(LineLayout {
+                font_size: px(16.),
+                width: px(100.),
+                ascent: px(12.),
+                descent: px(4.),
+                runs: vec![ShapedRun {
+                    font_id: FontId(0),
+                    glyphs: vec![
+                        glyph(5, 0., 0, true),
+                        glyph(0, 20., 4, true),
+                        glyph(5, 20., 7, true),
+                        glyph(5, 40., 11, true),
+                        glyph(7, 60., 15, false),
+                        glyph(6, 70., 16, false),
+                        glyph(7, 80., 17, false),
+                    ],
+                }],
+                len: 18,
+            }),
+            text: "😀\u{20dd}😀😀EFE".into(),
+            decoration_runs: SmallVec::new(),
+        };
+
+        struct Row(ShapedLine, Arc<AtomicUsize>);
+
+        impl Render for Row {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let (line, failed) = (self.0.clone(), self.1.clone());
+                div().size_full().child(
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, cx| {
+                            let painted =
+                                line.paint(bounds.origin, px(20.), TextAlign::Left, None, window, cx);
+                            if painted.is_err_and(|e| e.to_string().contains("glyph 6")) {
+                                failed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        },
+                    )
+                    .size_full(),
+                )
+            }
+        }
+
+        let text_system = Arc::new(NoNotdef::default());
+        let mut app = TestApp::with_text_system(text_system.clone());
+        let failed = Arc::new(AtomicUsize::new(0));
+        let mut window = app.open_window({
+            let failed = failed.clone();
+            move |_, _| Row(line, failed)
+        });
+        window.draw();
+        window.draw();
+        let (emoji, letters) = window.update(|_, window, _| {
+            let scene = &window.rendered_frame.scene;
+            (scene.polychrome_sprites.len(), scene.monochrome_sprites.len())
+        });
+        assert_eq!((emoji, letters), (3, 2), "every glyph but the two is drawn");
+        assert_eq!(text_system.0.load(Ordering::Relaxed), 1, "the .notdef asked for once");
+        assert!(failed.load(Ordering::Relaxed) >= 1, "the other said to the caller");
     }
 }
