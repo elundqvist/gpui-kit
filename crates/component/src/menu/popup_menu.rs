@@ -3,19 +3,23 @@ use crate::actions::{Cancel, Confirm, SelectDown, SelectUp};
 use crate::actions::{SelectLeft, SelectRight};
 use crate::menu::menu_item::MenuItemElement;
 use crate::scroll::ScrollableElement;
-use crate::{ActiveTheme, ElementExt, Icon, IconName, Sizable as _, h_flex, v_flex};
+use crate::{ActiveTheme, Icon, IconName, Sizable as _, h_flex, v_flex};
 use crate::{Side, Size, kbd::Kbd};
 use gpui::{
     Action, Anchor, AnyElement, App, AppContext, Bounds, Context, DismissEvent, Edges, Entity,
     EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding,
     ParentElement, Pixels, Render, Role, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, WeakEntity, Window, anchored, deferred, div, prelude::FluentBuilder, px, rems,
+    Styled, WeakEntity, Window, anchored, canvas, deferred, div, prelude::FluentBuilder, px, rems,
 };
 use gpui::{ClickEvent, Half, MouseDownEvent, OwnedMenuItem, Point, Subscription};
 
 use std::rc::Rc;
 
 const CONTEXT: &str = "PopupMenu";
+
+/// The room a menu leaves between itself and the window's edges, as the
+/// context menu is kept that far inside them.
+const WINDOW_MARGIN: Pixels = px(8.);
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
@@ -55,8 +59,6 @@ pub enum PopupMenuItem {
         handler: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>>,
     },
     /// A submenu item that opens another popup menu.
-    ///
-    /// NOTE: This is only supported when the parent menu is not `scrollable`.
     Submenu {
         icon: Option<Icon>,
         label: SharedString,
@@ -408,21 +410,24 @@ impl PopupMenu {
         self
     }
 
-    /// Set max width of the popup menu, default is 500px
+    /// Set max width of the popup menu, default is 500px, and never wider
+    /// than the window has room for.
     pub fn max_w(mut self, width: impl Into<Pixels>) -> Self {
         self.max_width = Some(width.into());
         self
     }
 
-    /// Set max height of the popup menu, default is half of the window height
+    /// Set max height of the popup menu, the rest scrolled; never taller
+    /// than the window has room for, which is the default.
     pub fn max_h(mut self, height: impl Into<Pixels>) -> Self {
         self.max_height = Some(height.into());
         self
     }
 
-    /// Set the menu to be scrollable to show vertical scrollbar.
-    ///
-    /// NOTE: If this is true, the sub-menus will cannot be support.
+    /// Keep the menu, where it sets no height of its own, to half the
+    /// window's height and 450 px, the rest scrolled. Any menu scrolls
+    /// where it is taller than the window has room for, its submenus drawn
+    /// outside its scroll.
     pub fn scrollable(mut self, scrollable: bool) -> Self {
         self.scrollable = scrollable;
         self
@@ -1195,9 +1200,52 @@ impl PopupMenu {
         Some(icon.xsmall())
     }
 
+    /// An item's label on one line, cut with an ellipsis where the menu is
+    /// narrower than it: wrapped, it ran onto a second line its row has no
+    /// height for (elundqvist/kvist#634).
+    fn render_label(label: &SharedString) -> impl IntoElement {
+        div()
+            .debug_selector(|| format!("popup-menu-label:{label}"))
+            .min_w_0()
+            .overflow_hidden()
+            .text_ellipsis()
+            .whitespace_nowrap()
+            .child(label.clone())
+    }
+
     #[inline]
     fn max_width(&self) -> Pixels {
         self.max_width.unwrap_or(px(500.))
+    }
+
+    /// How tall and how wide the menu may be in a window whose viewport is
+    /// `viewport` and whose drawn edge stands `inset` inside it (the shadow
+    /// a window that draws its own decorations keeps, `Window::client_inset`):
+    /// no more than the window has room for inside the margin a menu keeps
+    /// from its edges (`WINDOW_MARGIN`), whatever the menu asks, so a menu
+    /// taller than a small window scrolls and a menu wider than a narrow one
+    /// cuts its labels short, where its last rows ran past the window's
+    /// bottom and could not be reached (elundqvist/kvist#634). The inset is
+    /// taken off each side as the menu's `anchored` takes it, which keeps
+    /// the margin and the inset from the edges: without it, on Wayland, a
+    /// menu as tall as its room stood the inset lower than its room, its
+    /// last row past the window's foot. A scrollable menu with no height of
+    /// its own keeps to half the window, and 450 px, as it did.
+    fn room(&self, viewport: gpui::Size<Pixels>, inset: Pixels) -> gpui::Size<Pixels> {
+        let margin = WINDOW_MARGIN + inset;
+        let room = gpui::Size {
+            width: (viewport.width - margin * 2.).max(px(0.)),
+            height: (viewport.height - margin * 2.).max(px(0.)),
+        };
+        let height = match self.max_height {
+            Some(height) => height,
+            None if self.scrollable => (viewport.height * 0.5).min(px(450.)),
+            None => room.height,
+        };
+        gpui::Size {
+            width: self.max_width().min(room.width),
+            height: height.min(room.height),
+        }
     }
 
     /// Calculate the anchor corner and left offset for child submenu.
@@ -1245,14 +1293,16 @@ impl PopupMenu {
         const INNER_PADDING: Pixels = px(8.);
 
         let is_submenu = matches!(item, PopupMenuItem::Submenu { .. });
-        let group_name = format!("{}:item-{}", cx.entity().entity_id(), ix);
 
         let (item_height, radius) = match self.size {
             Size::Small => (px(20.), options.radius.half()),
             _ => (px(26.), options.radius),
         };
 
-        let this = MenuItemElement::new(ix, &group_name)
+        // each row its own height in a menu taller than the room, which
+        // scrolls it rather than squeeze its rows
+        let this = MenuItemElement::new(ix)
+            .flex_shrink_0()
             .relative()
             .text_sm()
             .py_0()
@@ -1338,20 +1388,24 @@ impl PopupMenu {
                     cx,
                 ))
                 .child(
+                    // no wider than the row, however long its label: as wide
+                    // as its label, it pushed the key past the menu's edge
                     h_flex()
                         .w_full()
+                        .min_w_0()
                         .gap_3()
                         .items_center()
                         .justify_between()
-                        .when(!show_link_icon, |this| this.child(label.clone()))
+                        .when(!show_link_icon, |this| this.child(Self::render_label(label)))
                         .children(right_check_icon)
                         .when(show_link_icon, |this| {
                             this.child(
                                 h_flex()
                                     .w_full()
+                                    .min_w_0()
                                     .justify_between()
                                     .gap_1p5()
-                                    .child(label.clone())
+                                    .child(Self::render_label(label))
                                     .child(
                                         Icon::new(IconName::ExternalLink)
                                             .xsmall()
@@ -1375,6 +1429,7 @@ impl PopupMenu {
                     h_flex()
                         .min_h(item_height)
                         .size_full()
+                        .min_w_0()
                         .items_center()
                         .gap_x_1()
                         .children(Self::render_icon(
@@ -1385,12 +1440,15 @@ impl PopupMenu {
                             cx,
                         ))
                         .child(
+                            // as the item's: its chevron stays in the row
                             h_flex()
+                                .debug_selector(|| "popup-menu-submenu-row".into())
                                 .flex_1()
+                                .min_w_0()
                                 .gap_2()
                                 .items_center()
                                 .justify_between()
-                                .child(label.clone())
+                                .child(Self::render_label(label))
                                 .child(
                                     Icon::new(IconName::ChevronRight)
                                         .xsmall()
@@ -1464,17 +1522,17 @@ impl Render for PopupMenu {
         let view = cx.entity().clone();
         let items_count = self.menu_items.len();
 
-        let max_height = self.max_height.unwrap_or_else(|| {
-            let window_half_height = window.viewport_size().height * 0.5;
-            window_half_height.min(px(450.))
-        });
+        // the items' room, inside the menu's own padding
+        let pad = rems(0.25).to_pixels(window.rem_size());
+        let room = self
+            .room(window.viewport_size(), window.client_inset().unwrap_or(px(0.)))
+            .map(|v| (v - pad * 2.).max(px(0.)));
 
         let has_left_icon = self
             .menu_items
             .iter()
             .any(|item| item.has_left_icon(self.check_side));
 
-        let max_width = self.max_width();
         let options = RenderOptions {
             has_left_icon,
             check_side: self.check_side,
@@ -1497,19 +1555,26 @@ impl Render for PopupMenu {
             .text_color(cx.theme().popover_foreground)
             .relative()
             .occlude()
+            // the room around the items is the menu's, not the scroll's:
+            // a scroll's own padding made a menu that fits a few pixels
+            // short of its rows, and scrollable by them
+            .p_1()
             .child(
                 v_flex()
                     .id("items")
-                    .p_1()
+                    .debug_selector(|| "popup-menu-items".into())
                     .gap_y_0p5()
                     .min_w(rems(8.))
                     .when_some(self.min_width, |this, min_width| this.min_w(min_width))
-                    .max_w(max_width)
-                    .when(self.scrollable, |this| {
-                        this.max_h(max_height)
-                            .overflow_y_scroll()
-                            .track_scroll(&self.scroll_handle)
-                    })
+                    .max_w(room.width)
+                    .max_h(room.height)
+                    // as tall as its rows up to the room, whatever the box
+                    // it is drawn in offers: a scroll is no floor, and a
+                    // submenu hung from a row near the window's foot was
+                    // a few pixels short of its rows and scrolled them
+                    .flex_shrink_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll_handle)
                     .children(
                         self.menu_items
                             .iter()
@@ -1517,13 +1582,25 @@ impl Render for PopupMenu {
                             // Ignore last separator
                             .filter(|(ix, item)| !(*ix + 1 == items_count && item.is_separator()))
                             .map(|(ix, item)| self.render_item(ix, item, options, window, cx)),
-                    )
-                    .on_prepaint(move |bounds, _, cx| view.update(cx, |r, _| r.bounds = bounds)),
+                    ),
             )
-            .when(self.scrollable, |this| {
-                // TODO: When the menu is limited by `overflow_y_scroll`, the sub-menu will cannot be displayed.
-                this.vertical_scrollbar(&self.scroll_handle)
-            })
+            // the menu's whole box, its padding in it: a press there is in
+            // the menu, and a submenu hangs from its edge. At the box's
+            // corner: `on_prepaint`'s canvas, with no inset, stands where
+            // the padding ends, and gave the box 4 px down and right
+            .child(
+                canvas(
+                    move |bounds, _, cx| view.update(cx, |r, _| r.bounds = bounds),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
+            // shown only where the items are more than the room; a submenu
+            // is drawn deferred, outside the items' clip
+            .vertical_scrollbar(&self.scroll_handle)
     }
 }
 
@@ -1591,6 +1668,140 @@ mod tests {
         assert_eq!(rebuild(cx, &["Alpha", "Beta"]), None);
         // and with nothing highlighted, nothing is
         assert_eq!(rebuild(cx, &["Alpha", "Beta", "Gamma"]), None);
+    }
+
+    fn draw(cx: &mut gpui::VisualTestContext) {
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            _ = window.draw(cx);
+        });
+    }
+
+    /// A window that shows a menu as a context menu does: at a point,
+    /// 400 px down, kept inside the window's edges by its `anchored`, and
+    /// as large as it is rather than as the window.
+    struct Shown(Entity<PopupMenu>);
+
+    impl Render for Shown {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                anchored()
+                    .position(gpui::point(px(0.), px(400.)))
+                    .snap_to_window_with_margin(px(8.))
+                    .child(self.0.clone()),
+            )
+        }
+    }
+
+    /// `build`'s menu shown in a window of `size`.
+    fn shown(
+        cx: &mut gpui::TestAppContext,
+        size: gpui::Size<Pixels>,
+        build: impl FnOnce(&mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
+    ) -> (Entity<PopupMenu>, &mut gpui::VisualTestContext) {
+        cx.update(crate::init);
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            Shown(cx.new(|cx| build(window, cx)))
+        });
+        cx.simulate_resize(size);
+        draw(cx);
+        let menu = host.update(cx, |host, _| host.0.clone());
+        (menu, cx)
+    }
+
+    /// A menu taller than its window keeps to the window, inside the margin
+    /// a menu keeps from its edges, and scrolls: its last item, chosen with
+    /// the keys, is scrolled into view. One wider than the window keeps to
+    /// its width. A file's context menu of some 680 px ran past the bottom
+    /// of a window 480 px high, its last rows out of reach
+    /// (elundqvist/kvist#634). In a window that draws its own shadow the
+    /// menu keeps that much further in, as its `anchored` does: on
+    /// Wayland it stood the shadow lower than its room, its last row past
+    /// the window's foot. Its bounds are its whole box, the padding in it.
+    #[gpui::test]
+    fn a_menu_keeps_to_a_small_window_and_scrolls(cx: &mut gpui::TestAppContext) {
+        let (menu, cx) = shown(cx, gpui::size(px(240.), px(480.)), |_, cx| {
+            let menu = PopupMenu::new(cx);
+            (0..40).fold(menu, |menu, i| {
+                menu.item(PopupMenuItem::new(format!("Item {i} of a menu with a long name")))
+            })
+        });
+        let bounds = menu.update(cx, |menu, _| menu.bounds);
+        assert!(bounds.size.height <= px(464.), "{bounds:?}");
+        assert!(bounds.size.height > px(400.), "{bounds:?}");
+        assert!(bounds.size.width <= px(224.), "{bounds:?}");
+        assert!(bounds.top() >= px(8.) && bounds.bottom() <= px(472.), "{bounds:?}");
+        // the menu's whole box, the items 4 px inside it on every side
+        let items = cx.debug_bounds("popup-menu-items").expect("the items' box");
+        assert_eq!(items.origin, bounds.origin + gpui::point(px(4.), px(4.)), "{items:?} in {bounds:?}");
+        assert_eq!(items.size + gpui::size(px(8.), px(8.)), bounds.size, "{items:?} in {bounds:?}");
+
+        // a window that draws its own shadow 20 px inside its edges
+        cx.update(|window, _| window.set_client_inset(px(20.)));
+        draw(cx);
+        let inset = menu.update(cx, |menu, _| menu.bounds);
+        assert!(inset.size.height <= px(424.), "{inset:?}");
+        assert!(inset.size.height > px(360.), "{inset:?}");
+        assert!(inset.size.width <= px(184.), "{inset:?}");
+        assert!(inset.top() >= px(28.) && inset.bottom() <= px(452.), "past the window's foot: {inset:?}");
+
+        // each of the 40 rows its own 26 px and the gaps between them, not
+        // squeezed into the room: the last is 600 px and more down
+        menu.update(cx, |menu, cx| menu.set_selected_index(39, cx));
+        draw(cx);
+        let offset = menu.update(cx, |menu, _| menu.scroll_handle.offset());
+        assert!(offset.y < px(-600.), "{offset:?}");
+    }
+
+    /// A menu that fits keeps its own height and does not scroll, and a
+    /// scrollable one with no height of its own keeps to half the window.
+    /// With the menu's padding on its scroll, a menu that fits was 8 px
+    /// short of its rows and scrolled by them.
+    #[gpui::test]
+    fn a_menu_that_fits_is_as_tall_as_its_items(cx: &mut gpui::TestAppContext) {
+        let (menu, cx) = shown(cx, gpui::size(px(640.), px(480.)), |_, cx| {
+            items(PopupMenu::new(cx), &["Alpha", "Beta", "Gamma"])
+        });
+        let few = menu.update(cx, |menu, _| menu.bounds.size.height);
+        assert!(few < px(150.), "{few:?}");
+        let scrolls = menu.update(cx, |menu, _| menu.scroll_handle.max_offset());
+        assert_eq!(scrolls.y, px(0.), "{scrolls:?}");
+        let room = |menu: &PopupMenu, inset: f32| menu.room(gpui::size(px(640.), px(480.)), px(inset)).height;
+        assert_eq!(menu.update(cx, |menu, _| room(menu, 0.)), px(464.));
+        assert_eq!(menu.update(cx, |menu, _| room(menu, 20.)), px(424.));
+        menu.update(cx, |menu, _| menu.scrollable = true);
+        assert_eq!(menu.update(cx, |menu, _| room(menu, 0.)), px(240.));
+        menu.update(cx, |menu, _| menu.max_height = Some(px(900.)));
+        assert_eq!(menu.update(cx, |menu, _| room(menu, 0.)), px(464.));
+    }
+
+    /// A label longer than a narrow window has room for ends in an
+    /// ellipsis on its one line, its row as high as any, and a submenu's
+    /// chevron stays in its row: the boxes around the label were as wide as
+    /// it, and pushed the chevron past the menu's edge.
+    #[gpui::test]
+    fn a_long_label_is_cut_short_in_its_row(cx: &mut gpui::TestAppContext) {
+        const LONG: &str = "A label much longer than the room that a narrow window gives it";
+        const SUB: &str = "A submenu label much longer than the room a narrow window gives it";
+        let (menu, cx) = shown(cx, gpui::size(px(240.), px(480.)), |window, cx| {
+            let sub = PopupMenu::build(window, cx, |menu, _, _| menu.item(PopupMenuItem::new("Inner")));
+            PopupMenu::new(cx)
+                .item(PopupMenuItem::new(LONG))
+                .item(PopupMenuItem::submenu(SUB, sub))
+        });
+        let bounds = menu.update(cx, |menu, _| menu.bounds);
+        assert!(bounds.size.width <= px(224.), "{bounds:?}");
+        // two rows of 26 px, the gap between them and the padding round them
+        assert!(bounds.size.height <= px(64.), "{bounds:?}");
+        let inside = bounds.right() - px(4.) + px(0.5);
+        let row = cx.debug_bounds("popup-menu-submenu-row").expect("the submenu's row");
+        assert!(row.right() <= inside, "{row:?} past {bounds:?}");
+        for label in [LONG, SUB] {
+            let at = cx.debug_bounds(format!("popup-menu-label:{label}").leak()).expect(label);
+            assert!(at.right() <= inside, "{at:?} past {bounds:?}");
+        }
+        let sub = cx.debug_bounds(format!("popup-menu-label:{SUB}").leak()).unwrap();
+        assert!(sub.right() < row.right() - px(8.), "no room left for the chevron: {sub:?} in {row:?}");
     }
 
     /// The item the pointer rests on is the one a click takes, so where the
