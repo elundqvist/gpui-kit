@@ -390,7 +390,9 @@ impl Shared {
             // neither the pause nor the parse takes a thread of gpui's
             // background pool, whose every thread a task that blocks may
             // hold: there, what was typed stayed plain for seconds, until
-            // a thread came free to end the pause (elundqvist/kvist#423)
+            // a thread came free to end the pause (elundqvist/kvist#423).
+            // Through `pause` and `off_the_pool`, which a test holds to
+            // it, never the executor's `timer` or `spawn`.
             pause(cx.background_executor(), PARSE_DEBOUNCE).await;
             // the tree and the layers, taken once the typing has paused,
             // shared and made the parse's own on its thread
@@ -1679,7 +1681,10 @@ pub(super) mod a_held_pool {
     /// task that blocks, Kvist's lookups of a definition each awaiting a
     /// language server's answer as Ctrl moved over the text, the pause, a
     /// task of the pool, did not end, and what was typed stayed plain
-    /// until the server answered (elundqvist/kvist#423).
+    /// until the server answered (elundqvist/kvist#423). This holds the
+    /// helpers, `pause` and `off_the_pool`, to it, not the parse task that
+    /// calls them: that task runs on a window's executors, which a test
+    /// cannot hold, and under the test scheduler every task is the pool's.
     #[test]
     fn the_pause_and_its_parse_take_no_thread_of_a_held_pool() {
         let executor = BackgroundExecutor::new(Arc::new(HeldPool::default()));
