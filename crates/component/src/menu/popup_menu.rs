@@ -1753,6 +1753,41 @@ mod tests {
         assert!(offset.y < px(-600.), "{offset:?}");
     }
 
+    /// A submenu at the foot of a menu that scrolls, scrolled to and opened,
+    /// hangs outside the items' scroll, whose clip would cut it off, and
+    /// takes a click: the submenus of a scrolling menu are drawn deferred,
+    /// with no clip of the scroll's (elundqvist/kvist#634).
+    #[gpui::test]
+    fn a_submenu_of_a_menu_that_scrolls_hangs_outside_its_scroll(cx: &mut gpui::TestAppContext) {
+        let clicked = Rc::new(std::cell::Cell::new(false));
+        let (menu, cx) = shown(cx, gpui::size(px(640.), px(480.)), {
+            let clicked = clicked.clone();
+            move |window, cx| {
+                let inner = PopupMenu::build(window, cx, move |menu, _, _| {
+                    let clicked = clicked.clone();
+                    menu.item(PopupMenuItem::new("Inner").on_click(move |_, _, _| clicked.set(true)))
+                });
+                (0..39)
+                    .fold(PopupMenu::new(cx), |menu, i| menu.item(PopupMenuItem::new(format!("Item {i}"))))
+                    .item(PopupMenuItem::submenu("More", inner))
+            }
+        });
+        menu.update(cx, |menu, cx| menu.set_selected_index(39, cx));
+        draw(cx);
+        draw(cx);
+        let offset = menu.update(cx, |menu, _| menu.scroll_handle.offset());
+        assert!(offset.y < px(-600.), "the submenu's row was not scrolled to: {offset:?}");
+        // the menu's items 4 px inside its box, and their scroll's clip
+        let bounds = menu.update(cx, |menu, _| menu.bounds);
+        let clip = bounds.right() - px(4.);
+        let inner = cx.debug_bounds("popup-menu-label:Inner").expect("the submenu, drawn");
+        assert!(inner.left() > clip, "{inner:?} inside the scroll of {bounds:?}");
+        assert!(inner.top() >= px(8.) && inner.bottom() <= px(472.), "{inner:?}");
+
+        cx.simulate_click(inner.center(), gpui::Modifiers::none());
+        assert!(clicked.get(), "the submenu's item took no click");
+    }
+
     /// A menu that fits keeps its own height and does not scroll, and a
     /// scrollable one with no height of its own keeps to half the window.
     /// With the menu's padding on its scroll, a menu that fits was 8 px
