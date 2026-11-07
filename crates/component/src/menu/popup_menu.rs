@@ -3,13 +3,13 @@ use crate::actions::{Cancel, Confirm, SelectDown, SelectUp};
 use crate::actions::{SelectLeft, SelectRight};
 use crate::menu::menu_item::MenuItemElement;
 use crate::scroll::ScrollableElement;
-use crate::{ActiveTheme, Icon, IconName, Sizable as _, h_flex, v_flex};
+use crate::{ActiveTheme, ElementExt as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use crate::{Side, Size, kbd::Kbd};
 use gpui::{
     Action, Anchor, AnyElement, App, AppContext, Bounds, Context, DismissEvent, Edges, Entity,
     EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding,
     ParentElement, Pixels, Render, Role, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, WeakEntity, Window, anchored, canvas, deferred, div, prelude::FluentBuilder, px, rems,
+    Styled, WeakEntity, Window, anchored, deferred, div, prelude::FluentBuilder, px, rems,
 };
 use gpui::{ClickEvent, Half, MouseDownEvent, OwnedMenuItem, Point, Subscription};
 
@@ -1590,19 +1590,8 @@ impl Render for PopupMenu {
                     ),
             )
             // the menu's whole box, its padding in it: a press there is in
-            // the menu, and a submenu hangs from its edge. At the box's
-            // corner: `on_prepaint`'s canvas, with no inset, stands where
-            // the padding ends, and gave the box 4 px down and right
-            .child(
-                canvas(
-                    move |bounds, _, cx| view.update(cx, |r, _| r.bounds = bounds),
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full(),
-            )
+            // the menu, and a submenu hangs from its edge
+            .on_prepaint(move |bounds, _, cx| view.update(cx, |r, _| r.bounds = bounds))
             // shown only where the items are more than the room; a submenu
             // is drawn deferred, outside the items' clip
             .vertical_scrollbar(&self.scroll_handle)

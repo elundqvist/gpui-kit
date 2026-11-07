@@ -12,7 +12,8 @@ pub trait ElementExt: ParentElement + Sized {
         crate::text_selection::text_selection_scope(scope, self)
     }
 
-    /// Invokes `callback` during prepaint with this element's resolved bounds.
+    /// Invokes `callback` during prepaint with this element's resolved bounds
+    /// (its padding box: inside its border, its padding in them).
     fn on_prepaint<F>(self, callback: F) -> Self
     where
         F: FnOnce(Bounds<Pixels>, &mut Window, &mut App) + 'static,
@@ -22,7 +23,11 @@ pub trait ElementExt: ParentElement + Sized {
                 move |bounds, window, cx| callback(bounds, window, cx),
                 |_, _, _, _| {},
             )
+            // at the corner: an absolute child with no inset stands where
+            // the padding ends
             .absolute()
+            .top_0()
+            .left_0()
             .size_full(),
         )
     }
