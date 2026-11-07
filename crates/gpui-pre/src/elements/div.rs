@@ -4741,7 +4741,9 @@ mod tests {
                     .on_click(move |_, _, _| clicks.set(clicks.get() + 1))
                     .child(
                         canvas(
-                            |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+                            |bounds, window, _| {
+                                window.insert_hitbox(bounds, HitboxBehavior::Normal)
+                            },
                             move |_, hitbox, window, _| hovered.set(hitbox.is_hovered(window)),
                         )
                         .size_full(),
@@ -4750,8 +4752,12 @@ mod tests {
         }
     }
 
-    fn setup_click_through_keys() -> (TestAppContext, AnyWindowHandle, Rc<Cell<usize>>, Rc<Cell<bool>>)
-    {
+    fn setup_click_through_keys() -> (
+        TestAppContext,
+        AnyWindowHandle,
+        Rc<Cell<usize>>,
+        Rc<Cell<bool>>,
+    ) {
         let mut cx = TestAppContext::single();
         let clicks = Rc::new(Cell::new(0));
         let hovered = Rc::new(Cell::new(false));
@@ -4781,8 +4787,14 @@ mod tests {
         key_down(&mut cx, window, "a");
         key_up(&mut cx, window, "a");
         draw_window(&mut cx, window);
-        assert!(hovered.get(), "a key typed during the press cleared the hover");
-        assert!(!cx.update_window(window, |_, window, _| window.last_input_was_keyboard()).unwrap());
+        assert!(
+            hovered.get(),
+            "a key typed during the press cleared the hover"
+        );
+        assert!(
+            !cx.update_window(window, |_, window, _| window.last_input_was_keyboard())
+                .unwrap()
+        );
 
         mouse_up(&mut cx, window, at, MouseButton::Left);
         assert_eq!(clicks.get(), 1, "the release after a key was no click");
@@ -4791,7 +4803,10 @@ mod tests {
         key_down(&mut cx, window, "b");
         draw_window(&mut cx, window);
         assert!(!hovered.get());
-        assert!(cx.update_window(window, |_, window, _| window.last_input_was_keyboard()).unwrap());
+        assert!(
+            cx.update_window(window, |_, window, _| window.last_input_was_keyboard())
+                .unwrap()
+        );
     }
 
     /// An input that keeps what is typed into it, a field, a list's filter,
@@ -4821,7 +4836,11 @@ mod tests {
         ) -> Option<crate::UTF16Selection> {
             None
         }
-        fn marked_text_range(&mut self, _: &mut Window, _: &mut App) -> Option<std::ops::Range<usize>> {
+        fn marked_text_range(
+            &mut self,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<std::ops::Range<usize>> {
             None
         }
         fn text_for_range(
@@ -4938,14 +4957,18 @@ mod tests {
         });
         let view = window;
         let window = AnyWindowHandle::from(window);
-        let focus = view.update(&mut cx, |view, _, _| view.focus.clone()).unwrap();
-        cx.update_window(window, |_, window, cx| window.focus(&focus, cx)).unwrap();
+        let focus = view
+            .update(&mut cx, |view, _, _| view.focus.clone())
+            .unwrap();
+        cx.update_window(window, |_, window, cx| window.focus(&focus, cx))
+            .unwrap();
         draw_window(&mut cx, window);
         move_mouse(&mut cx, window, point(px(10.), px(10.)));
         draw_window(&mut cx, window);
         assert!(hovered.get());
         let keyboard = |cx: &mut TestAppContext| {
-            cx.update_window(window, |_, window, _| window.last_input_was_keyboard()).unwrap()
+            cx.update_window(window, |_, window, _| window.last_input_was_keyboard())
+                .unwrap()
         };
 
         for key in ["a", "shift-b", "space"] {
@@ -4996,7 +5019,10 @@ mod tests {
         assert!(hovered.get());
         cx.dispatch_keystroke(window, Keystroke::parse("d").unwrap());
         draw_window(&mut cx, window);
-        assert!(!hovered.get(), "a letter typed into a filter left the hover");
+        assert!(
+            !hovered.get(),
+            "a letter typed into a filter left the hover"
+        );
         assert!(keyboard(&mut cx));
         assert_eq!(*typed.borrow(), "aB d");
     }
@@ -5012,7 +5038,10 @@ mod tests {
         key_down(&mut cx, window, "a");
         draw_window(&mut cx, window);
         assert!(!hovered.get());
-        assert!(cx.update_window(window, |_, window, _| window.last_input_was_keyboard()).unwrap());
+        assert!(
+            cx.update_window(window, |_, window, _| window.last_input_was_keyboard())
+                .unwrap()
+        );
     }
 
     /// A press whose release went to another client, the pointer leaving the
@@ -5038,16 +5067,19 @@ mod tests {
                 })
                 .unwrap();
             } else {
-                cx.update_window(window, |_, window, _| window.platform_window.as_test().cloned())
-                    .unwrap()
-                    .expect("a test window")
-                    .simulate_active_status_change(false);
+                cx.update_window(window, |_, window, _| {
+                    window.platform_window.as_test().cloned()
+                })
+                .unwrap()
+                .expect("a test window")
+                .simulate_active_status_change(false);
             }
             key_down(&mut cx, window, "a");
             draw_window(&mut cx, window);
             assert!(!hovered.get(), "{left}");
             assert!(
-                cx.update_window(window, |_, window, _| window.last_input_was_keyboard()).unwrap(),
+                cx.update_window(window, |_, window, _| window.last_input_was_keyboard())
+                    .unwrap(),
                 "{left}"
             );
         }
@@ -5087,7 +5119,11 @@ mod tests {
         mouse_down(&mut cx, window, off, MouseButton::Left);
         move_mouse(&mut cx, window, on);
         mouse_up(&mut cx, window, on, MouseButton::Left);
-        assert_eq!(clicks.get(), 0, "a press elsewhere, let go over the element, was its click");
+        assert_eq!(
+            clicks.get(),
+            0,
+            "a press elsewhere, let go over the element, was its click"
+        );
 
         // and a press and a release on it are a click still
         mouse_down(&mut cx, window, on, MouseButton::Left);

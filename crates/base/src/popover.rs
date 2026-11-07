@@ -111,13 +111,14 @@ impl PopoverState {
             // held, the state kept itself, and one collected while open
             // stayed, a popup open for the rest of the session in
             // `GlobalState` (elundqvist/kvist#354)
-            self.dismiss_subscription =
-                Some(
-                    window.subscribe(&cx.entity(), cx, move |state, _: &DismissEvent, window, cx| {
-                        state.update(cx, |state, cx| state.dismiss(window, cx));
-                        window.refresh();
-                    }),
-                );
+            self.dismiss_subscription = Some(window.subscribe(
+                &cx.entity(),
+                cx,
+                move |state, _: &DismissEvent, window, cx| {
+                    state.update(cx, |state, cx| state.dismiss(window, cx));
+                    window.refresh();
+                },
+            ));
         } else {
             self.dismiss_subscription = None;
             if let Some(previous) = self.previous_focus_handle.take() {

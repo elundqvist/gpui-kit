@@ -1396,7 +1396,9 @@ impl PopupMenu {
                         .gap_3()
                         .items_center()
                         .justify_between()
-                        .when(!show_link_icon, |this| this.child(Self::render_label(label)))
+                        .when(!show_link_icon, |this| {
+                            this.child(Self::render_label(label))
+                        })
                         .children(right_check_icon)
                         .when(show_link_icon, |this| {
                             this.child(
@@ -1525,7 +1527,10 @@ impl Render for PopupMenu {
         // the items' room, inside the menu's own padding
         let pad = rems(0.25).to_pixels(window.rem_size());
         let room = self
-            .room(window.viewport_size(), window.client_inset().unwrap_or(px(0.)))
+            .room(
+                window.viewport_size(),
+                window.client_inset().unwrap_or(px(0.)),
+            )
             .map(|v| (v - pad * 2.).max(px(0.)));
 
         let has_left_icon = self
@@ -1700,9 +1705,7 @@ mod tests {
         build: impl FnOnce(&mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
     ) -> (Entity<PopupMenu>, &mut gpui::VisualTestContext) {
         cx.update(crate::init);
-        let (host, cx) = cx.add_window_view(|window, cx| {
-            Shown(cx.new(|cx| build(window, cx)))
-        });
+        let (host, cx) = cx.add_window_view(|window, cx| Shown(cx.new(|cx| build(window, cx))));
         cx.simulate_resize(size);
         draw(cx);
         let menu = host.update(cx, |host, _| host.0.clone());
@@ -1723,18 +1726,31 @@ mod tests {
         let (menu, cx) = shown(cx, gpui::size(px(240.), px(480.)), |_, cx| {
             let menu = PopupMenu::new(cx);
             (0..40).fold(menu, |menu, i| {
-                menu.item(PopupMenuItem::new(format!("Item {i} of a menu with a long name")))
+                menu.item(PopupMenuItem::new(format!(
+                    "Item {i} of a menu with a long name"
+                )))
             })
         });
         let bounds = menu.update(cx, |menu, _| menu.bounds);
         assert!(bounds.size.height <= px(464.), "{bounds:?}");
         assert!(bounds.size.height > px(400.), "{bounds:?}");
         assert!(bounds.size.width <= px(224.), "{bounds:?}");
-        assert!(bounds.top() >= px(8.) && bounds.bottom() <= px(472.), "{bounds:?}");
+        assert!(
+            bounds.top() >= px(8.) && bounds.bottom() <= px(472.),
+            "{bounds:?}"
+        );
         // the menu's whole box, the items 4 px inside it on every side
         let items = cx.debug_bounds("popup-menu-items").expect("the items' box");
-        assert_eq!(items.origin, bounds.origin + gpui::point(px(4.), px(4.)), "{items:?} in {bounds:?}");
-        assert_eq!(items.size + gpui::size(px(8.), px(8.)), bounds.size, "{items:?} in {bounds:?}");
+        assert_eq!(
+            items.origin,
+            bounds.origin + gpui::point(px(4.), px(4.)),
+            "{items:?} in {bounds:?}"
+        );
+        assert_eq!(
+            items.size + gpui::size(px(8.), px(8.)),
+            bounds.size,
+            "{items:?} in {bounds:?}"
+        );
 
         // a window that draws its own shadow 20 px inside its edges
         cx.update(|window, _| window.set_client_inset(px(20.)));
@@ -1743,7 +1759,10 @@ mod tests {
         assert!(inset.size.height <= px(424.), "{inset:?}");
         assert!(inset.size.height > px(360.), "{inset:?}");
         assert!(inset.size.width <= px(184.), "{inset:?}");
-        assert!(inset.top() >= px(28.) && inset.bottom() <= px(452.), "past the window's foot: {inset:?}");
+        assert!(
+            inset.top() >= px(28.) && inset.bottom() <= px(452.),
+            "past the window's foot: {inset:?}"
+        );
 
         // each of the 40 rows its own 26 px and the gaps between them, not
         // squeezed into the room: the last is 600 px and more down
@@ -1765,10 +1784,14 @@ mod tests {
             move |window, cx| {
                 let inner = PopupMenu::build(window, cx, move |menu, _, _| {
                     let clicked = clicked.clone();
-                    menu.item(PopupMenuItem::new("Inner").on_click(move |_, _, _| clicked.set(true)))
+                    menu.item(
+                        PopupMenuItem::new("Inner").on_click(move |_, _, _| clicked.set(true)),
+                    )
                 });
                 (0..39)
-                    .fold(PopupMenu::new(cx), |menu, i| menu.item(PopupMenuItem::new(format!("Item {i}"))))
+                    .fold(PopupMenu::new(cx), |menu, i| {
+                        menu.item(PopupMenuItem::new(format!("Item {i}")))
+                    })
                     .item(PopupMenuItem::submenu("More", inner))
             }
         });
@@ -1776,13 +1799,24 @@ mod tests {
         draw(cx);
         draw(cx);
         let offset = menu.update(cx, |menu, _| menu.scroll_handle.offset());
-        assert!(offset.y < px(-600.), "the submenu's row was not scrolled to: {offset:?}");
+        assert!(
+            offset.y < px(-600.),
+            "the submenu's row was not scrolled to: {offset:?}"
+        );
         // the menu's items 4 px inside its box, and their scroll's clip
         let bounds = menu.update(cx, |menu, _| menu.bounds);
         let clip = bounds.right() - px(4.);
-        let inner = cx.debug_bounds("popup-menu-label:Inner").expect("the submenu, drawn");
-        assert!(inner.left() > clip, "{inner:?} inside the scroll of {bounds:?}");
-        assert!(inner.top() >= px(8.) && inner.bottom() <= px(472.), "{inner:?}");
+        let inner = cx
+            .debug_bounds("popup-menu-label:Inner")
+            .expect("the submenu, drawn");
+        assert!(
+            inner.left() > clip,
+            "{inner:?} inside the scroll of {bounds:?}"
+        );
+        assert!(
+            inner.top() >= px(8.) && inner.bottom() <= px(472.),
+            "{inner:?}"
+        );
 
         cx.simulate_click(inner.center(), gpui::Modifiers::none());
         assert!(clicked.get(), "the submenu's item took no click");
@@ -1801,7 +1835,9 @@ mod tests {
         assert!(few < px(150.), "{few:?}");
         let scrolls = menu.update(cx, |menu, _| menu.scroll_handle.max_offset());
         assert_eq!(scrolls.y, px(0.), "{scrolls:?}");
-        let room = |menu: &PopupMenu, inset: f32| menu.room(gpui::size(px(640.), px(480.)), px(inset)).height;
+        let room = |menu: &PopupMenu, inset: f32| {
+            menu.room(gpui::size(px(640.), px(480.)), px(inset)).height
+        };
         assert_eq!(menu.update(cx, |menu, _| room(menu, 0.)), px(464.));
         assert_eq!(menu.update(cx, |menu, _| room(menu, 20.)), px(424.));
         menu.update(cx, |menu, _| menu.scrollable = true);
@@ -1819,7 +1855,9 @@ mod tests {
         const LONG: &str = "A label much longer than the room that a narrow window gives it";
         const SUB: &str = "A submenu label much longer than the room a narrow window gives it";
         let (menu, cx) = shown(cx, gpui::size(px(240.), px(480.)), |window, cx| {
-            let sub = PopupMenu::build(window, cx, |menu, _, _| menu.item(PopupMenuItem::new("Inner")));
+            let sub = PopupMenu::build(window, cx, |menu, _, _| {
+                menu.item(PopupMenuItem::new("Inner"))
+            });
             PopupMenu::new(cx)
                 .item(PopupMenuItem::new(LONG))
                 .item(PopupMenuItem::submenu(SUB, sub))
@@ -1829,14 +1867,23 @@ mod tests {
         // two rows of 26 px, the gap between them and the padding round them
         assert!(bounds.size.height <= px(64.), "{bounds:?}");
         let inside = bounds.right() - px(4.) + px(0.5);
-        let row = cx.debug_bounds("popup-menu-submenu-row").expect("the submenu's row");
+        let row = cx
+            .debug_bounds("popup-menu-submenu-row")
+            .expect("the submenu's row");
         assert!(row.right() <= inside, "{row:?} past {bounds:?}");
         for label in [LONG, SUB] {
-            let at = cx.debug_bounds(format!("popup-menu-label:{label}").leak()).expect(label);
+            let at = cx
+                .debug_bounds(format!("popup-menu-label:{label}").leak())
+                .expect(label);
             assert!(at.right() <= inside, "{at:?} past {bounds:?}");
         }
-        let sub = cx.debug_bounds(format!("popup-menu-label:{SUB}").leak()).unwrap();
-        assert!(sub.right() < row.right() - px(8.), "no room left for the chevron: {sub:?} in {row:?}");
+        let sub = cx
+            .debug_bounds(format!("popup-menu-label:{SUB}").leak())
+            .unwrap();
+        assert!(
+            sub.right() < row.right() - px(8.),
+            "no room left for the chevron: {sub:?} in {row:?}"
+        );
     }
 
     /// The item the pointer rests on is the one a click takes, so where the

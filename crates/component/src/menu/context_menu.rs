@@ -404,10 +404,15 @@ mod tests {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let menu = self.menu.clone();
             div().size_full().when(self.shown, |this| {
-                this.child(div().id("row").size_full().context_menu(move |popup, _, cx| {
-                    *menu.borrow_mut() = Some(cx.entity().downgrade());
-                    popup.menu("Close", Box::new(RemoveTab))
-                }))
+                this.child(
+                    div()
+                        .id("row")
+                        .size_full()
+                        .context_menu(move |popup, _, cx| {
+                            *menu.borrow_mut() = Some(cx.entity().downgrade());
+                            popup.menu("Close", Box::new(RemoveTab))
+                        }),
+                )
             })
         }
     }
