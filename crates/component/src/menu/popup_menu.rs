@@ -967,22 +967,15 @@ impl PopupMenu {
 
     fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
-        let Some(ix) = self.selected_index else {
-            self.set_selected_index(0, cx);
-            return;
-        };
-
-        if let Some((next_ix, _)) = self
-            .menu_items
-            .iter()
-            .enumerate()
-            .find(|(i, item)| *i > ix && item.is_clickable())
-        {
-            self.set_selected_index(next_ix, cx);
-            return;
-        }
-
-        self.set_selected_index(0, cx);
+        // the first item that can be chosen, past the one highlighted: a
+        // label or a disabled item at the top took the first Down unseen
+        let after = self.selected_index;
+        let next = self
+            .clickable_menu_items()
+            .find(|(i, _)| after.is_none_or(|ix| *i > ix))
+            .or_else(|| self.clickable_menu_items().next())
+            .map(|(ix, _)| ix);
+        self.set_selected_index(next.unwrap_or(0), cx);
     }
 
     fn select_left(&mut self, _: &SelectLeft, window: &mut Window, cx: &mut Context<Self>) {
@@ -1662,6 +1655,34 @@ mod tests {
         assert_eq!(rebuild(cx, &["Alpha", "Beta"]), None);
         // and with nothing highlighted, nothing is
         assert_eq!(rebuild(cx, &["Alpha", "Beta", "Gamma"]), None);
+    }
+
+    /// A menu that opens on a label, as the folder chip's on "Recent
+    /// repositories", or on an item that cannot be chosen, takes its first
+    /// Down to the first item that can, and Down at the last goes round to
+    /// it: both went to the menu's first row, which showed nothing, so the
+    /// first Down seemed lost (elundqvist/kvist#660).
+    #[gpui::test]
+    fn the_first_down_goes_to_the_first_item_that_can_be_chosen(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::init);
+        let (menu, cx) = cx.add_window_view(|_, cx| {
+            items(
+                PopupMenu::new(cx).label("Recent"),
+                &["~None", "Alpha", "Beta"],
+            )
+        });
+        let down = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                menu.update(cx, |menu, cx| {
+                    menu.select_down(&SelectDown, window, cx);
+                    menu.selected_index
+                })
+            })
+        };
+
+        assert_eq!(down(cx), Some(2));
+        assert_eq!(down(cx), Some(3));
+        assert_eq!(down(cx), Some(2));
     }
 
     fn draw(cx: &mut gpui::VisualTestContext) {
