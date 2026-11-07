@@ -295,10 +295,14 @@ asks (section 4(b)); each says so at its top:
   `src/elements/div.rs`, a click is the release of the button that
   pressed: the release of any button took a left press as its click, and
   the right button pressed and let go on a drawer's tab while the left
-  was held opened the drawer. Tests of a click and the hover through a
-  key, of a lost release, by a move, by the pointer's leaving and by the
-  window's no longer being the active one, and of another button's
-  release.
+  was held opened the drawer. A press whose release went unheard ends at
+  the next press of its button, wherever that is, since another button's
+  release no longer ends it: kept, it took the release of another press
+  over the element as its click. Tests of a click and the hover through
+  a key, of the hover through text typed, into an editor and into a
+  filter, and of the keys that hide it, of a lost release, by a move, by
+  the pointer's leaving, by the window's no longer being the active one
+  and by the button's next press, and of another button's release.
 - `src/text_system.rs` and `src/text_system/line.rs`: a glyph the
   platform cannot render is drawn as nothing, and the line's paint goes
   on to the glyphs after it (elundqvist/kvist#540). The colour emoji
@@ -346,18 +350,6 @@ asks (section 4(b)); each says so at its top:
   `unicode-bidi` for the letters' classes, as gpui-pre-wgpu does. A test
   of a name cut at its end and at its start, of Arabic alone and of
   Latin.
-  key, of the hover through text typed, into an editor and into a filter,
-  and of the keys that hide it, of a lost release, by a move, by the
-  pointer's leaving and by the window's no longer being the active one,
-  and of another button's release.
-  was held opened the drawer. A press whose release went unheard ends at
-  the next press of its button, wherever that is, since another button's
-  release no longer ends it: kept, it took the release of another press
-  over the element as its click. Tests of a click and the hover through
-  a key, of the hover through text typed, into an editor and into a
-  filter, and of the keys that hide it, of a lost release, by a move, by
-  the pointer's leaving, by the window's no longer being the active one
-  and by the button's next press, and of another button's release.
 
 ## Tests
 
