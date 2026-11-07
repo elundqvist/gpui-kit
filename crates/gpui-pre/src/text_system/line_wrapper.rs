@@ -616,8 +616,14 @@ impl LineWrapper {
         matches!(c, '\u{1E00}'..='\u{1EFF}') || // Latin Extended Additional
         matches!(c, '\u{0300}'..='\u{036F}') || // Combining Diacritical Marks
 
-        // Bengali (https://en.wikipedia.org/wiki/Bengali_(Unicode_block))
-        matches!(c, '\u{0980}'..='\u{09FF}') ||
+        // Changed in elundqvist/gpui-kit (elundqvist/kvist#587): the scripts that put
+        // spaces between their words, Greek to Sinhala, among them Hebrew, Arabic and the
+        // Indic scripts (Bengali's was here), Georgian, Ethiopic, and Hebrew's and Arabic's
+        // presentation forms, so a row breaks at their spaces, where Hebrew and Arabic broke
+        // at any letter, `עול` and `ם` on two rows; Thai, Lao and CJK still break between
+        // letters
+        matches!(c, '\u{0370}'..='\u{0DFF}' | '\u{10A0}'..='\u{10FF}' | '\u{1200}'..='\u{139F}') ||
+        matches!(c, '\u{FB1D}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFC}') ||
 
         // Some other known special characters that should be treated as word characters,
         // e.g. `a-b`, `var_name`, `I'm`/`won’t`, '@mention`, `#hashtag`, `100%`, `3.1415`,
@@ -1299,6 +1305,25 @@ mod tests {
         assert_eq!(wrap("aaaa /123456789", 96.), [5]);
     }
 
+    /// Hebrew, Arabic and the other scripts that put spaces between their words wrap at a
+    /// space, where they broke at any letter, a word's last letters alone on the next row
+    /// (elundqvist/kvist#587); Thai still breaks between letters.
+    #[test]
+    fn test_wrap_line_breaks_space_separated_scripts_at_their_spaces() {
+        let mut wrapper = build_wrapper();
+        let mut wrap = |text: &str, width: f32| {
+            wrapper
+                .wrap_line(&[LineFragment::text(text)], px(width))
+                .map(|b| b.ix)
+                .collect::<Vec<_>>()
+        };
+        // ten characters a row, a word of eight after one of three
+        assert_eq!(wrap("אבג עולמותיו", 96.), [7]);
+        assert_eq!(wrap("ابج مرحباكمم", 96.), [7]);
+        assert_eq!(wrap("абв ελληνικά", 96.), [7]);
+        assert_eq!(wrap("กขค กขคกขคกข", 96.), [28]);
+    }
+
     #[test]
     fn test_truncate_line_end() {
         let mut wrapper = build_wrapper();
@@ -1600,6 +1625,15 @@ mod tests {
         assert_word("Ctrl+Space");
         assert_word("Shift+F7");
         assert_word("C++");
+
+        // the scripts that put spaces between their words (elundqvist/kvist#587)
+        assert_word("עולם");
+        assert_word("العربية،");
+        assert_word("Ελληνικά");
+        assert_word("नमस्ते");
+        assert_word("ქართული");
+        assert_not_word("ภาษาไทย");
+        assert_not_word("עולם שלום");
 
         // Space
         assert_not_word("foo bar");

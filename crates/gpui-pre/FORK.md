@@ -310,6 +310,16 @@ asks (section 4(b)); each says so at its top:
   stays with it, `1/2` (SY × NU), and a slash after a space may still
   begin a row. Tests of both wrappers with `Merge feature/topic-name`,
   a date, two slashes and a slash after a space.
+- `src/text_system/line_wrapper.rs`: the letters of the scripts that put
+  spaces between their words are word characters (`is_word_char`,
+  elundqvist/kvist#587): Greek to Sinhala, Hebrew, Arabic and the Indic
+  scripts among them, Georgian, Ethiopic, and Hebrew's and Arabic's
+  presentation forms, where only Latin, Cyrillic and Bengali were, so
+  a row breaks at their spaces; Hebrew and Arabic broke at any letter,
+  a tooltip's path of Hebrew folders with `עול` ending one row and `ם`
+  beginning the next. Thai, Lao and CJK still break between letters.
+  Both wrappers read it. A test of Hebrew, Arabic and Greek words that
+  wrap at their space, and of Thai, which does not.
 
 ## Tests
 
