@@ -21,11 +21,12 @@ use crate::{
     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
-    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, prelude::*, px, rems, size, transparent_black,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputAction,
+    TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
+    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
+    transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -5863,6 +5864,44 @@ impl Window {
         false
     }
 
+    /// Whether `key_down`, which no binding or listener took, is typed into
+    /// the focused input as its text, as the platform types a key that
+    /// produces a character with no modifier but Shift, or one that prefers
+    /// to be a character. Such a key leaves the window's input modality as it
+    /// was (elundqvist/kvist#632): gpui put the window in the keyboard's at
+    /// any key, where no hitbox is hovered, and the hover of a drawer's tab
+    /// under the pointer, and its tooltip, went at the first letter typed
+    /// into the editor. A key that moves through the window, an arrow, Tab,
+    /// Enter, or one a binding takes, is the keyboard's still, so a list's
+    /// row under the pointer is not lit beside the row the keys pick, and so
+    /// is a key typed into a field, an input whose confirm key is an action
+    /// rather than a line break (`TextInputConfiguration::input_action`), a
+    /// list's filter or a form's: a letter typed into the palette's left the
+    /// row under the pointer lit beside the one its text picked. An input
+    /// that breaks the line at Enter, or does not say, an editor, keeps it.
+    fn typed_as_text(&mut self, key_down: &KeyDownEvent, cx: &mut App) -> bool {
+        let keystroke = &key_down.keystroke;
+        if keystroke.key_char.is_none()
+            || !(key_down.prefer_character_input
+                || keystroke.modifiers.is_subset_of(&Modifiers::shift()))
+        {
+            return false;
+        }
+        let Some(mut input_handler) = self.platform_window.take_input_handler() else {
+            return false;
+        };
+        let action = input_handler
+            .text_input_configuration(self, cx)
+            .input_action;
+        let typed = input_handler.accepts_text_input(self, cx)
+            && matches!(
+                action,
+                TextInputAction::Unspecified | TextInputAction::Enter
+            );
+        self.platform_window.set_input_handler(input_handler);
+        typed
+    }
+
     /// Return a key binding string for an action, to display in the UI. Uses the highest precedence
     /// binding for the action (last binding added to the keymap).
     pub fn keystroke_text_for(&self, action: &dyn Action) -> String {
@@ -5930,7 +5969,9 @@ impl Window {
         // Hover is suppressed during keyboard modality so that keyboard navigation
         // doesn't show hover highlights on the item under the mouse cursor, but
         // not by a key typed while a mouse button is down: the press goes on,
-        // and its release is the mouse's input as the press was.
+        // and its release is the mouse's input as the press was. Nor by a key
+        // typed into the focused input as its text, which is known once the
+        // key is dispatched (`Window::typed_as_text`).
         let old_modality = self.last_input_modality;
         self.last_input_modality = match &event {
             PlatformInput::KeyDown(_) if self.mouse_buttons_down.is_empty() => {
@@ -5942,7 +5983,7 @@ impl Window {
             PlatformInput::Touch(_) => InputModality::Touch,
             _ => self.last_input_modality,
         };
-        if self.last_input_modality != old_modality {
+        if self.last_input_modality != old_modality && !matches!(event, PlatformInput::KeyDown(_)) {
             self.refresh();
         }
 
@@ -6074,6 +6115,14 @@ impl Window {
             let asked = std::mem::replace(&mut self.key_asking, asking);
             self.dispatch_key_event(any_key_event, cx);
             self.key_asking = asked;
+            if let PlatformInput::KeyDown(key_down) = &event {
+                if cx.propagate_event && self.typed_as_text(key_down, cx) {
+                    self.last_input_modality = old_modality;
+                }
+                if self.last_input_modality != old_modality {
+                    self.refresh();
+                }
+            }
         } else if let Some(touch_event) = event.touch_event() {
             self.dispatch_touch_event(touch_event, cx);
         }

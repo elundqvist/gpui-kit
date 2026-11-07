@@ -275,8 +275,23 @@ asks (section 4(b)); each says so at its top:
   active one, so a release the window never heard, one made over another
   client's grab, keeps no press. X11 reports only the left, middle and
   right buttons as held in a move, so a move with another button held
-  ends its press too, which costs no click: its release still comes. A
-  key with no button down hides the hover as before. In
+  ends its press too, which costs no click: its release still comes.
+  With no button down, a key typed into the focused input as its text,
+  one that produces a character with no modifier but Shift and that no
+  binding or listener takes, leaves the modality as it was
+  (`Window::typed_as_text`), so the drawer's tab under the pointer stays
+  hovered, and its tooltip shown, as letters are typed into the editor,
+  where both went at the first. A key that moves through the window, an
+  arrow, Tab or Enter a binding takes, or a key no input takes, is the
+  keyboard's as before and hides the hover: a list's row under the
+  pointer is not lit beside the row the keys pick. So is a key typed into
+  a field, an input whose confirm key is an action rather than a line
+  break (`TextInputConfiguration::input_action` other than `Enter` or
+  `Unspecified`; gpui-base's single-line input says `Done`), a list's
+  filter or a form's: a letter typed into the palette's left the row
+  under the pointer lit beside the one its text picked. The fork's crates
+  build on the published gpui, so a field says so through what that has
+  rather than a method of its own. In
   `src/elements/div.rs`, a click is the release of the button that
   pressed: the release of any button took a left press as its click, and
   the right button pressed and let go on a drawer's tab while the left
@@ -331,6 +346,10 @@ asks (section 4(b)); each says so at its top:
   `unicode-bidi` for the letters' classes, as gpui-pre-wgpu does. A test
   of a name cut at its end and at its start, of Arabic alone and of
   Latin.
+  key, of the hover through text typed, into an editor and into a filter,
+  and of the keys that hide it, of a lost release, by a move, by the
+  pointer's leaving and by the window's no longer being the active one,
+  and of another button's release.
 
 ## Tests
 

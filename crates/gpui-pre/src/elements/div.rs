@@ -4781,6 +4781,213 @@ mod tests {
         assert!(cx.update_window(window, |_, window, _| window.last_input_was_keyboard()).unwrap());
     }
 
+    /// An input that keeps what is typed into it, a field, a list's filter,
+    /// where its confirm key is an action rather than a line break.
+    struct TypedInto(Rc<RefCell<String>>, bool);
+
+    impl crate::InputHandler for TypedInto {
+        fn text_input_configuration(
+            &mut self,
+            _: &mut Window,
+            _: &mut App,
+        ) -> crate::TextInputConfiguration {
+            crate::TextInputConfiguration {
+                input_action: if self.1 {
+                    crate::TextInputAction::Done
+                } else {
+                    crate::TextInputAction::Unspecified
+                },
+                ..Default::default()
+            }
+        }
+        fn selected_text_range(
+            &mut self,
+            _: bool,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<crate::UTF16Selection> {
+            None
+        }
+        fn marked_text_range(&mut self, _: &mut Window, _: &mut App) -> Option<std::ops::Range<usize>> {
+            None
+        }
+        fn text_for_range(
+            &mut self,
+            _: std::ops::Range<usize>,
+            _: &mut Option<std::ops::Range<usize>>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<String> {
+            None
+        }
+        fn replace_text_in_range(
+            &mut self,
+            _: Option<std::ops::Range<usize>>,
+            text: &str,
+            _: &mut Window,
+            _: &mut App,
+        ) {
+            self.0.borrow_mut().push_str(text);
+        }
+        fn replace_and_mark_text_in_range(
+            &mut self,
+            _: Option<std::ops::Range<usize>>,
+            _: &str,
+            _: Option<std::ops::Range<usize>>,
+            _: &mut Window,
+            _: &mut App,
+        ) {
+        }
+        fn unmark_text(&mut self, _: &mut Window, _: &mut App) {}
+        fn bounds_for_range(
+            &mut self,
+            _: std::ops::Range<usize>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<Bounds<Pixels>> {
+            None
+        }
+        fn character_index_for_point(
+            &mut self,
+            _: Point<Pixels>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> Option<usize> {
+            None
+        }
+    }
+
+    /// A tab under the pointer, as `ClickThroughKeysView`'s, beside an
+    /// editor that has the keyboard, there while `input` is.
+    struct TypedBesideView {
+        hovered: Rc<Cell<bool>>,
+        focus: FocusHandle,
+        typed: Rc<RefCell<String>>,
+        input: bool,
+        filter: bool,
+    }
+
+    impl Render for TypedBesideView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let hovered = self.hovered.clone();
+            let (focus, typed, input) = (self.focus.clone(), self.typed.clone(), self.input);
+            let filter = self.filter;
+            div()
+                .size_full()
+                .child(
+                    canvas(
+                        |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+                        move |_, hitbox, window, _| hovered.set(hitbox.is_hovered(window)),
+                    )
+                    .size(px(20.)),
+                )
+                .child(
+                    div().track_focus(&self.focus).size(px(20.)).child(
+                        canvas(
+                            |_, _, _| {},
+                            move |_, _, window, cx| {
+                                if input {
+                                    window.handle_input(
+                                        &focus,
+                                        TypedInto(typed.clone(), filter),
+                                        cx,
+                                    );
+                                }
+                            },
+                        )
+                        .size_full(),
+                    ),
+                )
+        }
+    }
+
+    /// A key typed into the focused input as its text leaves the element
+    /// under the pointer hovered, its tooltip with it, where the first
+    /// letter typed into the editor put out the hover of the drawer's tab
+    /// the pointer rested on (elundqvist/kvist#632). A key that moves
+    /// through the window, one typed where no input takes it, or one typed
+    /// into a list's filter, is the keyboard's and hides the hover as
+    /// before, and a move brings it back.
+    #[test]
+    fn text_typed_into_an_input_keeps_the_hover_and_other_keys_hide_it() {
+        let mut cx = TestAppContext::single();
+        let hovered = Rc::new(Cell::new(false));
+        let typed = Rc::new(RefCell::new(String::new()));
+        let window = cx.add_window({
+            let (hovered, typed) = (hovered.clone(), typed.clone());
+            move |_, cx| TypedBesideView {
+                hovered,
+                focus: cx.focus_handle(),
+                typed,
+                input: true,
+                filter: false,
+            }
+        });
+        let view = window;
+        let window = AnyWindowHandle::from(window);
+        let focus = view.update(&mut cx, |view, _, _| view.focus.clone()).unwrap();
+        cx.update_window(window, |_, window, cx| window.focus(&focus, cx)).unwrap();
+        draw_window(&mut cx, window);
+        move_mouse(&mut cx, window, point(px(10.), px(10.)));
+        draw_window(&mut cx, window);
+        assert!(hovered.get());
+        let keyboard = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, window, _| window.last_input_was_keyboard()).unwrap()
+        };
+
+        for key in ["a", "shift-b", "space"] {
+            cx.dispatch_keystroke(window, Keystroke::parse(key).unwrap());
+            draw_window(&mut cx, window);
+            assert!(hovered.get(), "{key} typed as text put out the hover");
+            assert!(!keyboard(&mut cx), "{key}");
+        }
+        assert_eq!(*typed.borrow(), "aB ");
+
+        // a key that moves through the window, and one with Ctrl, which
+        // types nothing
+        for key in ["down", "ctrl-a"] {
+            move_mouse(&mut cx, window, point(px(10.), px(10.)));
+            draw_window(&mut cx, window);
+            cx.dispatch_keystroke(window, Keystroke::parse(key).unwrap());
+            draw_window(&mut cx, window);
+            assert!(!hovered.get(), "{key} left the hover");
+            assert!(keyboard(&mut cx), "{key}");
+        }
+        move_mouse(&mut cx, window, point(px(11.), px(10.)));
+        draw_window(&mut cx, window);
+        assert!(hovered.get());
+
+        // a letter where no input takes it is the keyboard's
+        view.update(&mut cx, |view, _, cx| {
+            view.input = false;
+            cx.notify();
+        })
+        .unwrap();
+        draw_window(&mut cx, window);
+        cx.dispatch_keystroke(window, Keystroke::parse("c").unwrap());
+        draw_window(&mut cx, window);
+        assert!(!hovered.get());
+        assert!(keyboard(&mut cx));
+        assert_eq!(*typed.borrow(), "aB ");
+
+        // a letter typed into a list's filter is the keyboard's, so the row
+        // under the pointer is not lit beside the row the text picked
+        view.update(&mut cx, |view, _, cx| {
+            view.input = true;
+            view.filter = true;
+            cx.notify();
+        })
+        .unwrap();
+        move_mouse(&mut cx, window, point(px(10.), px(10.)));
+        draw_window(&mut cx, window);
+        assert!(hovered.get());
+        cx.dispatch_keystroke(window, Keystroke::parse("d").unwrap());
+        draw_window(&mut cx, window);
+        assert!(!hovered.get(), "a letter typed into a filter left the hover");
+        assert!(keyboard(&mut cx));
+        assert_eq!(*typed.borrow(), "aB d");
+    }
+
     /// A release the window never heard, the pointer moving after it with no
     /// button down, leaves no press behind to keep the keys from the keyboard.
     #[test]

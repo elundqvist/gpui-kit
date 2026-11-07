@@ -1962,8 +1962,14 @@ pub enum Autocapitalize {
 
 /// The action a software keyboard advertises on its confirm ("enter") key.
 ///
-/// This affects only how the key is presented (icon or label); pressing it is
-/// still delivered as ordinary input.
+/// This affects how the key is presented (icon or label); pressing it is
+/// still delivered as ordinary input. A window takes an input whose confirm
+/// key is an action, not [`TextInputAction::Enter`] or
+/// [`TextInputAction::Unspecified`], for a field, a list's filter or a form's,
+/// and a letter typed into one as the keyboard's input, which hides the hover
+/// as a key that moves does; a letter typed into an input that breaks the line,
+/// or does not say, leaves the element under the pointer hovered
+/// (`Window::typed_as_text`, elundqvist/kvist#632).
 ///
 /// The variants are the HTML `enterkeyhint` attribute's value set
 /// (<https://html.spec.whatwg.org/multipage/interaction.html#input-modalities:-the-enterkeyhint-attribute>),

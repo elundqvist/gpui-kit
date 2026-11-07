@@ -4123,6 +4123,28 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
 
         None
     }
+
+    /// A single-line input's Enter is done with its text, never a line
+    /// break, which a software keyboard's confirm key says, and which makes
+    /// it a field to gpui: a letter typed into it, a list's filter as the
+    /// palette's, hides the hover as a key that moves does, so the row under
+    /// the pointer is not lit beside the row its text picked. A letter typed
+    /// into an editor or a text area leaves the element under the pointer
+    /// hovered (elundqvist/kvist#632).
+    fn text_input_configuration(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> gpui::TextInputConfiguration {
+        gpui::TextInputConfiguration {
+            input_action: if self.is_single_line() {
+                gpui::TextInputAction::Done
+            } else {
+                gpui::TextInputAction::Unspecified
+            },
+            ..Default::default()
+        }
+    }
 }
 
 impl<M: InputModeKind> Focusable for InputBaseState<M> {
@@ -4382,6 +4404,35 @@ mod tests {
         multi
             .input
             .update(cx, |state, _| assert!(state.shows_scrollbar()));
+    }
+
+    /// A single-line input's confirm key is done with its text, which makes
+    /// it a field to gpui: a letter typed into it, a list's filter, hides the
+    /// hover. An editor's and a text area's break the line, and a letter
+    /// typed into them leaves the element under the pointer hovered
+    /// (elundqvist/kvist#632).
+    #[gpui::test]
+    fn only_a_single_line_inputs_confirm_key_is_done(cx: &mut TestAppContext) {
+        fn action<M: InputModeKind>(
+            view: InputView<M>,
+            cx: &mut TestAppContext,
+        ) -> gpui::TextInputAction {
+            let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+            let input = view.input;
+            cx.update(|window, cx| {
+                input.update(cx, |state, cx| {
+                    state.text_input_configuration(window, cx).input_action
+                })
+            })
+        }
+        cx.update(crate::init);
+
+        let single = action(InputView::build(cx, |state| state), cx);
+        assert_eq!(single, gpui::TextInputAction::Done);
+        let text_area = action(InputView::build_textarea(cx, |state| state), cx);
+        assert_eq!(text_area, gpui::TextInputAction::Unspecified);
+        let editor = action(InputView::new(cx), cx);
+        assert_eq!(editor, gpui::TextInputAction::Unspecified);
     }
 
     #[gpui::test]
