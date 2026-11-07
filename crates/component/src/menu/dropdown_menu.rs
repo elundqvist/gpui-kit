@@ -129,15 +129,19 @@ where
                         menu.focus_handle(cx).focus(window, cx);
 
                         // Listen for dismiss events from the PopupMenu to close the popover.
-                        let popover_state = cx.entity();
+                        // Both states weakly: held, they held the menu, whose
+                        // listener this is, and a menu whose trigger went
+                        // while it was open, a drawer closed on it, was
+                        // never let go (elundqvist/kvist#354).
+                        let popover_state = cx.entity().downgrade();
                         window
                             .subscribe(&menu, cx, {
-                                let menu_state = menu_state.clone();
+                                let menu_state = menu_state.downgrade();
                                 move |_, _: &DismissEvent, window, cx| {
-                                    popover_state.update(cx, |state, cx| {
+                                    _ = popover_state.update(cx, |state, cx| {
                                         state.dismiss(window, cx);
                                     });
-                                    menu_state.update(cx, |state, _| {
+                                    _ = menu_state.update(cx, |state, _| {
                                         state.menu = None;
                                     });
                                 }
@@ -150,5 +154,73 @@ where
 
                 menu.clone()
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::menu::PopupMenuItem;
+    use gpui::{ParentElement as _, Render, WeakEntity, div, point, px};
+    use std::cell::RefCell;
+
+    /// A button with a menu, there while `shown`, and the menu it last
+    /// built.
+    struct Shown {
+        shown: bool,
+        menu: Rc<RefCell<Option<WeakEntity<PopupMenu>>>>,
+    }
+
+    impl Render for Shown {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let menu = self.menu.clone();
+            div().size_full().when(self.shown, |this| {
+                this.child(Button::new("trigger").label("Open").dropdown_menu(
+                    move |popup, _, cx| {
+                        *menu.borrow_mut() = Some(cx.entity().downgrade());
+                        popup.item(PopupMenuItem::new("Restart"))
+                    },
+                ))
+            })
+        }
+    }
+
+    /// A menu whose button goes while it is open, a drawer closed on it,
+    /// is let go with the button's state, and its popover is shut: the
+    /// listeners for its dismissal held the states that held the menu
+    /// and themselves, so neither went, and the application went on
+    /// taking a popup to be open (elundqvist/kvist#354).
+    #[gpui::test]
+    fn a_menu_whose_button_goes_while_it_is_open_is_let_go(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::GlobalState::init(cx);
+            cx.set_global(crate::Theme::default());
+            crate::init(cx);
+        });
+        let menu: Rc<RefCell<Option<WeakEntity<PopupMenu>>>> = Rc::default();
+        let (view, cx) = cx.add_window_view({
+            let menu = menu.clone();
+            move |_, _| Shown { shown: true, menu }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_click(point(px(10.), px(10.)), Default::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let open = menu.borrow().clone().expect("the menu, built as it opened");
+        assert!(open.upgrade().is_some());
+        cx.update(|_, cx| assert!(gpui_base::GlobalState::is_in_deferred_context(cx)));
+
+        view.update(cx, |view, cx| {
+            view.shown = false;
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        assert!(open.upgrade().is_none(), "the menu was kept");
+        cx.update(|_, cx| {
+            assert!(
+                !gpui_base::GlobalState::is_in_deferred_context(cx),
+                "a popup was taken to be open"
+            )
+        });
     }
 }
