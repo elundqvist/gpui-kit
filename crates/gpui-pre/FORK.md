@@ -320,6 +320,17 @@ asks (section 4(b)); each says so at its top:
   beginning the next. Thai, Lao and CJK still break between letters.
   Both wrappers read it. A test of Hebrew, Arabic and Greek words that
   wrap at their space, and of Thai, which does not.
+- `src/text_system/line_wrapper.rs`: a line laid out left to right for a
+  left-to-right letter in it stays so when truncation leaves it none
+  (`keep_left_to_right`, elundqvist/kvist#587): gpui-pre-wgpu lays a
+  line with a left-to-right letter out left to right and one of
+  right-to-left letters alone right to left, so a file's name cut short
+  to its Arabic, `ملف-طويل…`, had its ellipsis on its left and its start
+  at the right edge, where the whole name read from the left. What is
+  left begins with a U+200E, in the first run. The crate takes
+  `unicode-bidi` for the letters' classes, as gpui-pre-wgpu does. A test
+  of a name cut at its end and at its start, of Arabic alone and of
+  Latin.
 
 ## Tests
 

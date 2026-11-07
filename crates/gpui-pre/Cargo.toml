@@ -494,6 +494,11 @@ version = "0.1.40"
 [dependencies.ttf-parser]
 version = "0.25"
 
+[dependencies.unicode-bidi]
+version = "0.3.18"
+features = ["hardcoded-data"]
+default-features = false
+
 [dependencies.url]
 version = "2.2"
 

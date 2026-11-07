@@ -294,7 +294,24 @@ impl LineWrapper {
     }
 
     /// Truncate a line of text to the given width with this wrapper's font and font size.
+    ///
+    /// Changed in elundqvist/gpui-kit (elundqvist/kvist#587): a line laid out left to right
+    /// for a left-to-right letter in it, `ملف-طويل.rs`, is laid out so still when what is left
+    /// of it has none (`keep_left_to_right`).
     pub fn truncate_line<'a>(
+        &mut self,
+        line: SharedString,
+        truncate_width: Pixels,
+        truncation_affix: &str,
+        runs: &'a [TextRun],
+        truncate_from: TruncateFrom,
+    ) -> (SharedString, Cow<'a, [TextRun]>) {
+        let (result, cut_runs) =
+            self.cut_line(line.clone(), truncate_width, truncation_affix, runs, truncate_from);
+        keep_left_to_right(&line, result, cut_runs)
+    }
+
+    fn cut_line<'a>(
         &mut self,
         line: SharedString,
         truncate_width: Pixels,
@@ -907,6 +924,35 @@ impl LineWrapper {
     }
 }
 
+/// `result`, what truncation left of `line`, after a U+200E where `line` has a left-to-right
+/// letter and `result` none but right-to-left ones: the platform's text system lays a line with
+/// a left-to-right letter out left to right, and one of right-to-left letters alone right to
+/// left (elundqvist/kvist#587), so a file's name cut short to its Arabic, `ملف-طويل…`, had
+/// its ellipsis on its left and its start at the right edge where the whole name started at the
+/// left. The mark goes into the first run.
+fn keep_left_to_right<'a>(
+    line: &str,
+    result: SharedString,
+    runs: Cow<'a, [TextRun]>,
+) -> (SharedString, Cow<'a, [TextRun]>) {
+    use unicode_bidi::{BidiClass, bidi_class};
+    let left_to_right = |text: &str| text.chars().any(|c| bidi_class(c) == BidiClass::L);
+    if result.is_ascii()
+        || runs.is_empty()
+        || left_to_right(&result)
+        || !left_to_right(line)
+        || !result
+            .chars()
+            .any(|c| matches!(bidi_class(c), BidiClass::R | BidiClass::AL))
+    {
+        return (result, runs);
+    }
+    const MARK: char = '\u{200E}';
+    let mut runs = runs.into_owned();
+    runs[0].len += MARK.len_utf8();
+    (SharedString::from(format!("{MARK}{result}")), Cow::Owned(runs))
+}
+
 fn update_runs_after_truncation(
     result: &str,
     ellipsis: &str,
@@ -1371,6 +1417,31 @@ mod tests {
             "aa bbb cccc 🦀🦀🦀🦀…",
             "…",
         );
+    }
+
+    /// A line laid out left to right for a left-to-right letter in it is laid out so still when
+    /// truncation leaves it none, its ellipsis on its right (elundqvist/kvist#587): it begins
+    /// with a U+200E, which its first run takes. A line of right-to-left letters alone, and one
+    /// left a left-to-right letter, are left as they are.
+    #[test]
+    fn test_truncate_line_keeps_a_left_to_right_line_so() {
+        let mut wrapper = build_wrapper();
+        let mut cut = |text: &'static str, from: TruncateFrom| {
+            let runs = generate_test_runs(&[4, text.len() - 4]);
+            let (result, runs) = wrapper.truncate_line(text.into(), px(100.), "…", &runs, from);
+            assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), result.len(), "{result}");
+            (result.to_string(), runs[0].len)
+        };
+        let name = "\u{645}\u{644}\u{641}\u{637}\u{648}\u{64a}\u{644}\u{62c}\u{62f}\u{627}.rs";
+        let (end, first) = cut(name, TruncateFrom::End);
+        assert!(end.starts_with('\u{200e}') && end.ends_with('…'), "{end}");
+        assert_eq!(first, 4 + 3);
+        let (start, _) = cut(name, TruncateFrom::Start);
+        assert!(!start.starts_with('\u{200e}') && start.ends_with(".rs"), "{start}");
+        let (arabic, _) = cut("\u{645}\u{644}\u{641}\u{637}\u{648}\u{64a}\u{644}\u{62c}\u{62f}\u{627}\u{645}\u{644}", TruncateFrom::End);
+        assert!(!arabic.starts_with('\u{200e}'), "{arabic}");
+        let (latin, _) = cut("aa bbb cccc ddddd eeee ffff", TruncateFrom::End);
+        assert!(latin.starts_with('a'), "{latin}");
     }
 
     #[test]
