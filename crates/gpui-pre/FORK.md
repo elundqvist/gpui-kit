@@ -350,6 +350,14 @@ asks (section 4(b)); each says so at its top:
   and of the keys that hide it, of a lost release, by a move, by the
   pointer's leaving and by the window's no longer being the active one,
   and of another button's release.
+  was held opened the drawer. A press whose release went unheard ends at
+  the next press of its button, wherever that is, since another button's
+  release no longer ends it: kept, it took the release of another press
+  over the element as its click. Tests of a click and the hover through
+  a key, of the hover through text typed, into an editor and into a
+  filter, and of the keys that hide it, of a lost release, by a move, by
+  the pointer's leaving, by the window's no longer being the active one
+  and by the button's next press, and of another button's release.
 
 ## Tests
 

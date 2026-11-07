@@ -2909,8 +2909,21 @@ impl Interactivity {
                     let hitbox = hitbox.clone();
                     let has_aux_click_listeners = !aux_click_listeners.is_empty();
                     move |event: &MouseDownEvent, phase, window, _cx| {
-                        if phase == DispatchPhase::Bubble
-                            && (event.button == MouseButton::Left || has_aux_click_listeners)
+                        // a press of the button that pressed before, wherever
+                        // it is, is that press's end: its release went unheard,
+                        // and the press kept would take the release of another
+                        // press over the element as its click, since the
+                        // release of another button no longer ends it
+                        // (elundqvist/kvist#632)
+                        if phase == DispatchPhase::Capture {
+                            let mut pending_mouse_down = pending_mouse_down.borrow_mut();
+                            if pending_mouse_down
+                                .as_ref()
+                                .is_some_and(|down| down.button == event.button)
+                            {
+                                pending_mouse_down.take();
+                            }
+                        } else if (event.button == MouseButton::Left || has_aux_click_listeners)
                             && hitbox.is_hovered(window)
                         {
                             *pending_mouse_down.borrow_mut() = Some(event.clone());
@@ -5055,6 +5068,31 @@ mod tests {
         assert_eq!(clicks.get(), 0, "the right button's release was a click");
         mouse_up(&mut cx, window, at, MouseButton::Left);
         assert_eq!(clicks.get(), 1, "the left button's release was no click");
+    }
+
+    /// A press whose release the window never heard is ended by the next
+    /// press of its button, wherever that is: kept, it took the release of
+    /// another press over the element as its click, once another button's
+    /// click between no longer ended it (elundqvist/kvist#632).
+    #[test]
+    fn a_press_whose_release_was_lost_ends_at_its_buttons_next_press() {
+        let (mut cx, window, clicks, _hovered) = setup_click_through_keys();
+        let (on, off) = (point(px(10.), px(10.)), point(px(100.), px(100.)));
+
+        mouse_down(&mut cx, window, on, MouseButton::Left);
+        // its release went to another client
+        move_mouse(&mut cx, window, off);
+        mouse_down(&mut cx, window, off, MouseButton::Right);
+        mouse_up(&mut cx, window, off, MouseButton::Right);
+        mouse_down(&mut cx, window, off, MouseButton::Left);
+        move_mouse(&mut cx, window, on);
+        mouse_up(&mut cx, window, on, MouseButton::Left);
+        assert_eq!(clicks.get(), 0, "a press elsewhere, let go over the element, was its click");
+
+        // and a press and a release on it are a click still
+        mouse_down(&mut cx, window, on, MouseButton::Left);
+        mouse_up(&mut cx, window, on, MouseButton::Left);
+        assert_eq!(clicks.get(), 1);
     }
 
     struct TestTooltipView;
