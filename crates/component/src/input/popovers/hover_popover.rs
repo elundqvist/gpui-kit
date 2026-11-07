@@ -2,9 +2,9 @@ use std::{ops::Range, rc::Rc};
 
 use gpui::{
     AnyElement, App, AppContext as _, AvailableSpace, Bounds, Element, ElementId, Entity,
-    InteractiveElement, IntoElement, MouseDownEvent, MouseMoveEvent, ParentElement as _, Pixels,
-    Render, StatefulInteractiveElement as _, StyleRefinement, Styled, Window, deferred, div, point,
-    px,
+    InteractiveElement, IntoElement, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
+    ParentElement as _, Pixels, Render, StatefulInteractiveElement as _, StyleRefinement, Styled,
+    Window, deferred, div, point, px,
 };
 
 use crate::{
@@ -91,6 +91,9 @@ pub(crate) struct Popover {
     range: Range<usize>,
     width_limit: Range<Pixels>,
     content_builder: Box<dyn Fn(&mut Window, &mut App) -> AnyElement>,
+    /// What puts this popover away as the pointer leaves it and its range,
+    /// or a press lands outside it.
+    dismiss: fn(&mut EditorState, &mut gpui::Context<EditorState>),
 }
 
 impl Styled for Popover {
@@ -117,7 +120,19 @@ impl Popover {
             style: StyleRefinement::default(),
             width_limit: px(200.)..px(500.),
             content_builder: Box::new(move |window, cx| (f)(window, cx).into_any_element()),
+            dismiss: EditorState::clear_hover_state,
         }
+    }
+
+    /// Put away with `dismiss` instead of the hover's own: a problem's
+    /// popover was left up by the hover's, the pointer gone from the editor
+    /// (elundqvist/kvist#656).
+    pub fn dismiss_with(
+        mut self,
+        dismiss: fn(&mut EditorState, &mut gpui::Context<EditorState>),
+    ) -> Self {
+        self.dismiss = dismiss;
+        self
     }
 
     /// Get the bounds of the range in the editor, if it is visible.
@@ -262,13 +277,11 @@ impl Element for Popover {
 
         popover.paint(window, cx);
 
-        let editor = self.editor.clone();
+        let (editor, dismiss) = (self.editor.clone(), self.dismiss);
         // Mouse down out to hide.
         window.on_mouse_event(move |event: &MouseDownEvent, _, _, cx| {
             if !bounds.contains(&event.position) {
-                let _ = editor.update(cx, |editor, cx| {
-                    editor.clear_hover_state(cx);
-                });
+                let _ = editor.update(cx, dismiss);
             }
         });
 
@@ -278,10 +291,16 @@ impl Element for Popover {
         let keep_open_region = trigger_bounds.union(&bounds);
         window.on_mouse_event(move |event: &MouseMoveEvent, _, _, cx| {
             if !keep_open_region.contains(&event.position) {
-                let _ = editor.update(cx, |editor, cx| {
-                    editor.clear_hover_state(cx);
-                });
+                let _ = editor.update(cx, dismiss);
             }
+        });
+
+        // and out of the window, which sends no move: the popover stayed up
+        // as the pointer left the window from over its range
+        // (elundqvist/kvist#656)
+        let editor = self.editor.clone();
+        window.on_mouse_event(move |_: &MouseExitEvent, _, _, cx| {
+            let _ = editor.update(cx, dismiss);
         })
     }
 }

@@ -898,6 +898,24 @@ impl LineLayout {
         Some((offset + ix, line_end_affinity))
     }
 
+    /// Whether `pos`, on one of this line's rows, is past that row's end by
+    /// more than half its last glyph, over no text: a hover there took the
+    /// row's end and showed a problem that ends there, as on a line's last
+    /// word, where VS Code shows a hover only within half a character of a
+    /// line's end (elundqvist/kvist#656).
+    pub(crate) fn is_past_row_end(&self, pos: Point<Pixels>, last_layout: &LastLayout) -> bool {
+        let Some((i, _, x)) = self.wrapped_line_at(pos, last_layout) else {
+            return false;
+        };
+        let row = &self.wrapped_lines[i];
+        let last = row
+            .runs
+            .last()
+            .and_then(|run| run.glyphs.last())
+            .map_or(px(0.), |glyph| row.width - glyph.position.x);
+        x > row.width + last.half()
+    }
+
     pub(crate) fn index_for_position(
         &self,
         pos: Point<Pixels>,

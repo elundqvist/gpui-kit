@@ -2344,14 +2344,22 @@ impl<M: InputModeKind> InputBaseState<M> {
         // the same rectangle as painted, without the offset.
         let within_bounds = self.input_bounds.contains(&event.position);
 
-        if !within_bounds {
+        // Over the text, or no hover: the room below the last line is over
+        // none, where it took the last line's end and showed its problem, and
+        // so is the room past a row's end (elundqvist/kvist#656)
+        let over_text = within_bounds
+            .then(|| self.text_index_for_mouse_position(event.position, true))
+            .flatten();
+        let Some((offset, _)) = over_text else {
             // Clear hover when mouse leaves the input
             M::clear_hover_state(self, cx);
+            if self.diagnostic_popover.take().is_some() {
+                cx.notify();
+            }
             return;
-        }
+        };
 
         // Show diagnostic popover on mouse move
-        let (offset, _) = self.index_for_mouse_position(event.position);
         M::on_mouse_move(self, offset, event, window, cx);
 
         if self.is_code_editor() {
@@ -2993,15 +3001,28 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// selection must pass it on, or clicking past the last glyph of a wrapped row leaves a
     /// caret one row below the pointer.
     pub(crate) fn index_for_mouse_position(&self, position: Point<Pixels>) -> (usize, bool) {
+        // Mouse is below all visible lines, return end of text
+        self.text_index_for_mouse_position(position, false)
+            .unwrap_or((self.text.len(), false))
+    }
+
+    /// `index_for_mouse_position`, or `None` below the last line drawn,
+    /// where there is no text, and for a `hover` past the end of a row of
+    /// a multi-line text (`LineLayout::is_past_row_end`).
+    fn text_index_for_mouse_position(
+        &self,
+        position: Point<Pixels>,
+        hover: bool,
+    ) -> Option<(usize, bool)> {
         // If the text is empty, always return 0
         if self.text.len() == 0 {
-            return (0, false);
+            return Some((0, false));
         }
 
         let (Some(bounds), Some(last_layout)) =
             (self.last_bounds.as_ref(), self.last_layout.as_ref())
         else {
-            return (0, false);
+            return Some((0, false));
         };
 
         let line_height = last_layout.line_height;
@@ -3038,27 +3059,29 @@ impl<M: InputModeKind> InputBaseState<M> {
             if self.is_single_line() {
                 let local_index = line_layout.closest_index_for_x(pos.x, last_layout);
                 // A single line never wraps, so there is no boundary to disambiguate.
-                return (self.resolve_index(line_start_offset + local_index), false);
+                return Some((self.resolve_index(line_start_offset + local_index), false));
             }
 
             // Check if mouse is in this line's bounds
             if let Some((local_index, line_end_affinity)) =
                 line_layout.closest_index_for_position(pos, last_layout)
             {
-                return (
+                if hover && line_layout.is_past_row_end(pos, last_layout) {
+                    return None;
+                }
+                return Some((
                     self.resolve_index(line_start_offset + local_index),
                     line_end_affinity,
-                );
+                ));
             } else if pos.y < px(0.) {
                 // Mouse is above this line, return start of this line
-                return (self.resolve_index(line_start_offset), false);
+                return Some((self.resolve_index(line_start_offset), false));
             }
 
             y_offset += line_layout.size(line_height).height;
         }
 
-        // Mouse is below all visible lines, return end of text
-        (self.text.len(), false)
+        None
     }
 
     /// Map a display byte index back to a text offset, undoing the mask expansion when the input
@@ -5495,6 +5518,63 @@ mod tests {
         });
         cx.run_until_parked();
         cx.update(|_, cx| input.read_with(cx, |state, _| assert_caret_in_view(state, "a word deleted")));
+    }
+
+    /// A problem's popover shows over its text, and not in the room below
+    /// the last line, which took the last line's end and showed the
+    /// problem there of a last line that ends the file, nor in the room
+    /// past a line's end, which took its end and showed a problem on its
+    /// last word (elundqvist/kvist#656).
+    #[gpui::test]
+    fn the_room_below_and_past_the_lines_shows_no_problem(cx: &mut TestAppContext) {
+        use crate::input::{Diagnostic, Position};
+        let view = InputView::<EditorMode>::new(cx);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("select a;\nselect b", window, cx);
+                let set = state.diagnostics_mut().unwrap();
+                set.push(Diagnostic::new(
+                    Position::new(1, 7)..Position::new(1, 8),
+                    "b",
+                ));
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| _ = window.draw(cx));
+        let b = cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                let at = state.text.line_start_offset(1) + 7;
+                state.range_to_bounds(&(at..at + 1)).expect("`b` is drawn")
+            })
+        });
+        let shown = |cx: &mut VisualTestContext| {
+            cx.update(|_, cx| input.read_with(cx, |state, _| state.diagnostic_popover().is_some()))
+        };
+
+        cx.simulate_mouse_move(b.center(), None, gpui::Modifiers::none());
+        assert!(shown(&mut cx), "over `b`");
+        cx.simulate_mouse_move(
+            point(b.center().x, b.bottom() + px(200.)),
+            None,
+            gpui::Modifiers::none(),
+        );
+        assert!(!shown(&mut cx), "below the last line");
+
+        // nor the room past a row's end, past half its last glyph
+        cx.simulate_mouse_move(
+            point(b.right() + b.size.width * 0.4, b.center().y),
+            None,
+            gpui::Modifiers::none(),
+        );
+        assert!(shown(&mut cx), "just past `b`");
+        cx.simulate_mouse_move(
+            point(b.right() + px(200.), b.center().y),
+            None,
+            gpui::Modifiers::none(),
+        );
+        assert!(!shown(&mut cx), "past the end of `b`'s line");
     }
 
     /// The editor's problems move with what is typed above and before
