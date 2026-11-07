@@ -3,8 +3,8 @@ use std::{cell::Cell, rc::Rc};
 use gpui::{
     Anchor, AnyElement, App, Context, DismissEvent, ElementId, EventEmitter, FocusHandle,
     Focusable, InteractiveElement as _, IntoElement, KeyBinding, MouseButton, ParentElement as _,
-    Render, RenderOnce, Role, StatefulInteractiveElement as _, Subscription, Window, div,
-    prelude::FluentBuilder as _,
+    Pixels, Render, RenderOnce, Role, StatefulInteractiveElement as _, Subscription, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 
 use crate::{
@@ -173,6 +173,7 @@ type ContentBuilder =
 pub struct Popover {
     id: ElementId,
     anchor: Anchor,
+    offset: Pixels,
     default_open: bool,
     open: Option<bool>,
     tracked_focus_handle: Option<FocusHandle>,
@@ -188,6 +189,7 @@ impl Popover {
         Self {
             id: id.into(),
             anchor: Anchor::TopLeft,
+            offset: px(0.),
             default_open: false,
             open: None,
             tracked_focus_handle: None,
@@ -201,6 +203,12 @@ impl Popover {
 
     pub fn anchor(mut self, anchor: impl Into<Anchor>) -> Self {
         self.anchor = anchor.into();
+        self
+    }
+
+    /// The gap kept between the trigger and the content (`Popup::offset`).
+    pub fn offset(mut self, offset: Pixels) -> Self {
+        self.offset = offset;
         self
     }
 
@@ -301,6 +309,7 @@ impl RenderOnce for Popover {
         let open_at_press = Rc::new(Cell::new(None));
         let popup = Popup::new(self.id, trigger(open, window, cx))
             .anchor(self.anchor)
+            .offset(self.offset)
             .key_context(CONTEXT)
             .on_action({
                 let state = state.clone();

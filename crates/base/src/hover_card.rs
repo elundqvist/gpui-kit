@@ -2,8 +2,8 @@ use std::rc::Rc;
 
 use gpui::{
     Anchor, AnyElement, App, Context, ElementId, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, RenderOnce, Stateful, StatefulInteractiveElement as _, Task,
-    Window, div, prelude::FluentBuilder as _,
+    ParentElement as _, Pixels, Render, RenderOnce, Stateful, StatefulInteractiveElement as _,
+    Task, Window, div, prelude::FluentBuilder as _, px,
 };
 use instant::Duration;
 
@@ -23,6 +23,7 @@ type OpenChangeHandler = Rc<dyn Fn(&bool, &mut Window, &mut App)>;
 pub struct HoverCard {
     id: ElementId,
     anchor: Anchor,
+    offset: Pixels,
     trigger: Option<AnyElement>,
     content: Option<ContentBuilder>,
     open_delay: Duration,
@@ -35,6 +36,7 @@ impl HoverCard {
         Self {
             id: id.into(),
             anchor: Anchor::TopCenter,
+            offset: px(0.),
             trigger: None,
             content: None,
             open_delay: Duration::from_secs_f64(0.6),
@@ -45,6 +47,12 @@ impl HoverCard {
 
     pub fn anchor(mut self, anchor: impl Into<Anchor>) -> Self {
         self.anchor = anchor.into();
+        self
+    }
+
+    /// The gap kept between the trigger and the content (`Popup::offset`).
+    pub fn offset(mut self, offset: Pixels) -> Self {
+        self.offset = offset;
         self
     }
 
@@ -227,7 +235,8 @@ impl RenderOnce for HoverCard {
                 }),
             ),
         )
-        .anchor(self.anchor);
+        .anchor(self.anchor)
+        .offset(self.offset);
 
         if !open {
             return popup;

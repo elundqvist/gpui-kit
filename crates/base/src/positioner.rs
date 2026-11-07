@@ -146,6 +146,17 @@ impl Positioner {
         self.margin = margin;
         self
     }
+
+    /// Where this element puts a popup of `popup_size` in a window of
+    /// `viewport_size` with no client inset: for a check of where a popup
+    /// opens without drawing it.
+    pub fn resolved(
+        &self,
+        popup_size: Size<Pixels>,
+        viewport_size: Size<Pixels>,
+    ) -> ResolvedPosition {
+        resolve(self.strategy, popup_size, viewport_size, self.margin)
+    }
 }
 
 /// Resolves the bounds of a popup of `popup_size`.
@@ -174,8 +185,14 @@ fn resolve(
             align,
             offset,
         } => {
-            let placement =
-                resolve_placement(trigger_bounds, popup_size, viewport_size, margin, placement);
+            let placement = resolve_placement(
+                trigger_bounds,
+                popup_size,
+                viewport_size,
+                margin,
+                offset,
+                placement,
+            );
             let origin = side_origin(trigger_bounds, popup_size, placement, align, offset);
             ResolvedPosition {
                 bounds: clamp(Bounds::new(origin, popup_size), viewport_size, margin),
@@ -185,19 +202,24 @@ fn resolve(
     }
 }
 
+/// The side a popup goes on. The room on each side is past the `offset`
+/// gap the popup keeps from its trigger: a popup that fitted below only
+/// without its gap stayed below and was held into the window over its
+/// trigger by up to the gap (elundqvist/kvist#640).
 fn resolve_placement(
     trigger_bounds: Bounds<Pixels>,
     popup_size: Size<Pixels>,
     viewport_size: Size<Pixels>,
     margin: Pixels,
+    offset: Pixels,
     preferred: Option<Placement>,
 ) -> Placement {
     let right_limit = (viewport_size.width - margin).max(margin);
     let bottom_limit = (viewport_size.height - margin).max(margin);
-    let available_left = (trigger_bounds.left() - margin).max(px(0.));
-    let available_right = (right_limit - trigger_bounds.right()).max(px(0.));
-    let available_above = (trigger_bounds.top() - margin).max(px(0.));
-    let available_below = (bottom_limit - trigger_bounds.bottom()).max(px(0.));
+    let available_left = (trigger_bounds.left() - margin - offset).max(px(0.));
+    let available_right = (right_limit - trigger_bounds.right() - offset).max(px(0.));
+    let available_above = (trigger_bounds.top() - margin - offset).max(px(0.));
+    let available_below = (bottom_limit - trigger_bounds.bottom() - offset).max(px(0.));
 
     match preferred {
         Some(Placement::Right) if popup_size.width <= available_right => Placement::Right,
@@ -487,6 +509,34 @@ mod tests {
         );
 
         assert_eq!(position.bounds.top(), px(228.));
+    }
+
+    /// A popup that fits below its trigger only without its gap goes above
+    /// it, where it stayed below and was held into the window over its
+    /// trigger by up to the gap (elundqvist/kvist#640).
+    #[test]
+    fn the_room_on_a_side_is_past_the_gap() {
+        // the room below the trigger, to the margin of a viewport 400 high
+        let below = |room: f32| {
+            let trigger_bounds = trigger(200., 396. - room - 20., 40., 20.);
+            resolve(
+                Strategy::Side {
+                    trigger_bounds,
+                    placement: Some(Placement::Bottom),
+                    align: Align::Start,
+                    offset: px(4.),
+                },
+                Size::new(px(40.), px(30.)),
+                viewport(),
+                MARGIN,
+            )
+        };
+
+        assert_eq!(below(34.).placement, Some(Placement::Bottom));
+        let short = below(32.);
+        assert_eq!(short.placement, Some(Placement::Top));
+        let trigger_top = 396. - 32. - 20.;
+        assert_eq!(short.bounds.bottom(), px(trigger_top - 4.));
     }
 
     #[test]

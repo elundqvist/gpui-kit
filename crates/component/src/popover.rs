@@ -17,6 +17,11 @@ pub use gpui_base::PopoverState;
 
 pub(crate) fn init(_: &mut App) {}
 
+/// The gap between a popover and its trigger, on whichever side of it the
+/// popover goes: drawn below the trigger by its anchor and above it for want
+/// of room, the gap is kept between the two either way.
+pub(crate) const POPOVER_GAP: Pixels = px(4.);
+
 /// How long a dropdown takes to settle into place after it opens.
 ///
 /// This is shadcn/ui's figure: its popup surfaces carry `animate-in`, whose
@@ -272,7 +277,6 @@ impl Styled for Popover {
 
 impl Popover {
     pub(crate) fn render_popover_content(
-        anchor: Anchor,
         appearance: bool,
         _: &mut Window,
         cx: &mut App,
@@ -282,17 +286,11 @@ impl Popover {
             .occlude()
             .tab_group()
             .when(appearance, |this| this.popover_style(cx).p_3())
-            .map(|this| match anchor {
-                Anchor::TopLeft | Anchor::TopCenter | Anchor::TopRight => this.top_1(),
-                Anchor::BottomLeft | Anchor::BottomCenter | Anchor::BottomRight => this.bottom_1(),
-                Anchor::LeftCenter | Anchor::RightCenter => this.top_1(), // Fallback for centered
-            })
     }
 }
 
 impl RenderOnce for Popover {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
-        let anchor = self.anchor;
         let appearance = self.appearance;
         let style = self.style;
         let children = self.children;
@@ -300,11 +298,13 @@ impl RenderOnce for Popover {
 
         BasePopover::new(self.id)
             .anchor(self.anchor)
+            // the gap on whichever side of the trigger the content goes
+            .offset(POPOVER_GAP)
             .mouse_button(self.mouse_button)
             .default_open(self.default_open)
             .overlay_closable(self.overlay_closable)
             .content(move |state, window, cx| {
-                Self::render_popover_content(anchor, appearance, window, cx)
+                Self::render_popover_content(appearance, window, cx)
                     .when_some(content, |this, content| {
                         this.child((content)(state, window, cx))
                     })

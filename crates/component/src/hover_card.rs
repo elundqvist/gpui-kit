@@ -131,11 +131,12 @@ impl RenderOnce for HoverCard {
 
         BaseHoverCard::new(self.id)
             .anchor(anchor)
+            .offset(crate::popover::POPOVER_GAP)
             .open_delay(self.open_delay)
             .close_delay(self.close_delay)
             .trigger((trigger)(window, cx))
             .content(move |state, window, cx| {
-                Popover::render_popover_content(anchor, appearance, window, cx)
+                Popover::render_popover_content(appearance, window, cx)
                     .overflow_hidden()
                     .when_some(content, |this, content| {
                         this.child((content)(state, window, cx))
