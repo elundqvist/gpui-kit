@@ -356,7 +356,7 @@ pub(crate) struct WaylandClientState {
     horizontal_modifier: f32,
     scroll_event_received: bool,
     enter_token: Option<()>,
-    button_pressed: Option<MouseButton>,
+    buttons_pressed: HeldButtons,
     mouse_focused_window: Option<WaylandWindowStatePtr>,
     keyboard_focused_window: Option<WaylandWindowStatePtr>,
     loop_handle: LoopHandle<'static, WaylandClientStatePtr>,
@@ -958,7 +958,7 @@ impl WaylandClient {
             discrete_scroll_delta: None,
             vertical_modifier: -1.0,
             horizontal_modifier: -1.0,
-            button_pressed: None,
+            buttons_pressed: HeldButtons::default(),
             mouse_focused_window: None,
             keyboard_focused_window: None,
             loop_handle: handle.clone(),
@@ -2064,6 +2064,34 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
     }
 }
 
+/// The pointer's buttons held, the one pressed last at the end: a move
+/// reports it as its pressed button. Changed in elundqvist/gpui-kit
+/// (elundqvist/kvist#632): one button was kept, and any button's release
+/// let it go, so with the left held while the right was pressed and let
+/// go, a move reported no button held, and the window took its press to
+/// be over.
+#[derive(Default)]
+struct HeldButtons(SmallVec<[MouseButton; 2]>);
+
+impl HeldButtons {
+    fn press(&mut self, button: MouseButton) {
+        self.release(button);
+        self.0.push(button);
+    }
+
+    fn release(&mut self, button: MouseButton) {
+        self.0.retain(|held| *held != button);
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    fn last(&self) -> Option<MouseButton> {
+        self.0.last().copied()
+    }
+}
+
 fn linux_button_to_gpui(button: u32) -> Option<MouseButton> {
     // These values are coming from <linux/input-event-codes.h>.
     const BTN_LEFT: u32 = 0x110;
@@ -2111,7 +2139,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 let position = point(px(surface_x as f32 / zoom), px(surface_y as f32 / zoom));
                 state.serial_tracker.update(SerialKind::MouseEnter, serial);
                 state.mouse_location = Some(position);
-                state.button_pressed = None;
+                state.buttons_pressed.clear();
 
                 if let Some(window) = window {
                     state.mouse_focused_window = Some(window.clone());
@@ -2149,12 +2177,12 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 if let Some(focused_window) = state.mouse_focused_window.clone() {
                     let input = PlatformInput::MouseExited(MouseExitEvent {
                         position: state.mouse_location.unwrap(),
-                        pressed_button: state.button_pressed,
+                        pressed_button: state.buttons_pressed.last(),
                         modifiers: state.modifiers,
                     });
                     state.mouse_focused_window = None;
                     state.mouse_location = None;
-                    state.button_pressed = None;
+                    state.buttons_pressed.clear();
                     state.cursor_hidden_window = None;
 
                     drop(state);
@@ -2209,7 +2237,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     }
                     let input = PlatformInput::MouseMove(MouseMoveEvent {
                         position: state.mouse_location.unwrap(),
-                        pressed_button: state.button_pressed,
+                        pressed_button: state.buttons_pressed.last(),
                         modifiers: state.modifiers,
                     });
                     drop(state);
@@ -2283,7 +2311,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                         state.click.last_mouse_button = Some(button);
                         state.click.last_location = state.mouse_location.unwrap();
 
-                        state.button_pressed = Some(button);
+                        state.buttons_pressed.press(button);
 
                         if let Some(window) = state.mouse_focused_window.clone() {
                             let input = PlatformInput::MouseDown(MouseDownEvent {
@@ -2298,7 +2326,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                         }
                     }
                     wl_pointer::ButtonState::Released => {
-                        state.button_pressed = None;
+                        state.buttons_pressed.release(button);
 
                         if let Some(window) = state.mouse_focused_window.clone() {
                             let input = PlatformInput::MouseUp(MouseUpEvent {
@@ -2947,6 +2975,24 @@ mod tests {
         fn commit_ime_state(&self) {
             self.commit_count.set(self.commit_count.get() + 1);
         }
+    }
+
+    /// The left held, the right pressed and let go: a move reports the
+    /// left as held still, where the right's release let every button go
+    /// (elundqvist/kvist#632).
+    #[test]
+    fn a_button_let_go_leaves_the_others_held() {
+        let mut held = HeldButtons::default();
+        held.press(MouseButton::Left);
+        held.press(MouseButton::Right);
+        assert_eq!(held.last(), Some(MouseButton::Right));
+        held.release(MouseButton::Right);
+        assert_eq!(held.last(), Some(MouseButton::Left));
+        held.press(MouseButton::Middle);
+        held.release(MouseButton::Left);
+        assert_eq!(held.last(), Some(MouseButton::Middle));
+        held.release(MouseButton::Middle);
+        assert_eq!(held.last(), None);
     }
 
     #[test]

@@ -302,6 +302,13 @@ asks (section 4(b)); each says so at its top:
   and a bit left by a release the window never heard goes. Tests of a
   repeat, of one handled after others, of the keys let go, of the
   keymap and of the releases dropped.
+- `src/linux/wayland/client.rs`: the Wayland client keeps every pointer
+  button held, the one pressed last reported as a move's pressed button
+  (`HeldButtons`, elundqvist/kvist#632), where it kept one and let it go
+  at any button's release: with the left held while the right was
+  pressed and let go, a move said no button was held, and gpui-pre's
+  window, which counts a press as over at such a move, took the left's
+  press to be over. A test of a button let go among others.
 
 ## Trying a drag by hand
 
