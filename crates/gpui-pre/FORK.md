@@ -350,6 +350,17 @@ asks (section 4(b)); each says so at its top:
   `unicode-bidi` for the letters' classes, as gpui-pre-wgpu does. A test
   of a name cut at its end and at its start, of Arabic alone and of
   Latin.
+- `src/text_system.rs`: `shape_text` shapes a run whose background
+  alone differs from the run before it with that run, as `layout_line`
+  does (elundqvist/kvist#653): a background is painted under the glyphs
+  by their index and does not touch them, and a run that changed only it
+  made the line's runs another key to the layout cache, so a line was
+  shaped anew each time a part of it was picked or lit. Kvist's
+  read-only view draws its pick so, and each press on a line of 1.4 MB
+  took 430 ms, the next press read after it. A run of another colour,
+  underline or strikethrough is still shaped apart. A test that a line
+  with a part on another background has the plain line's layout, and
+  with a part in another colour another.
 
 ## Tests
 

@@ -562,14 +562,23 @@ impl WindowTextSystem {
 
                 let run_len_within_line = cmp::min(line_end - run_start, run.len);
 
-                let decoration_changed = if let Some(last_run) = decoration_runs.last_mut()
+                // shaped apart where the glyphs are drawn otherwise, as
+                // `layout_line` has it: not for a background, which does
+                // not touch them. A line picked in part was shaped anew
+                // for each pick, half a second for a line of a megabyte
+                // (elundqvist/kvist#653).
+                let shaped_apart = decoration_runs.last().is_none_or(|last_run| {
+                    last_run.color != run.color
+                        || last_run.underline != run.underline
+                        || last_run.strikethrough != run.strikethrough
+                });
+                if let Some(last_run) = decoration_runs.last_mut()
                     && last_run.color == run.color
                     && last_run.underline == run.underline
                     && last_run.strikethrough == run.strikethrough
                     && last_run.background_color == run.background_color
                 {
                     last_run.len += run_len_within_line as u32;
-                    false
                 } else {
                     decoration_runs.push(DecorationRun {
                         len: run_len_within_line as u32,
@@ -578,13 +587,12 @@ impl WindowTextSystem {
                         underline: run.underline,
                         strikethrough: run.strikethrough,
                     });
-                    true
-                };
+                }
 
                 let font_id = self.resolve_font(&run.font);
                 if let Some(font_run) = font_runs.last_mut()
                     && font_id == font_run.font_id
-                    && !decoration_changed
+                    && !shaped_apart
                 {
                     font_run.len += run_len_within_line;
                 } else {
@@ -1245,5 +1253,47 @@ pub fn font_name_with_fallbacks_shared<'a>(
         ".ZedSans" | "Zed Plex Sans" => const { &SharedString::new_static("IBM Plex Sans") },
         ".ZedMono" | "Zed Plex Mono" => const { &SharedString::new_static("Lilex") },
         _ => name,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{TestAppContext, TestDispatcher, black, font, red};
+
+    /// A part of a line on another background is shaped with the rest of
+    /// it, as `layout_line` shapes it, and the line is not shaped again for
+    /// it: the read-only view's pick, a background over a part of the line,
+    /// had a line of a megabyte shaped anew at each press, half a second
+    /// before the next press was read (elundqvist/kvist#653). A part in
+    /// another colour is shaped apart.
+    #[test]
+    fn a_background_over_a_part_of_a_line_does_not_shape_it_again() {
+        let cx = TestAppContext::build(TestDispatcher::new(0), None);
+        let text_system = WindowTextSystem::new(cx.text_system().clone());
+        let run = |len, color, background_color| TextRun {
+            len,
+            font: font("Dummy"),
+            color,
+            background_color,
+            underline: None,
+            strikethrough: None,
+        };
+        let shape = |runs: &[TextRun]| {
+            let line = text_system
+                .shape_text("one two three".into(), px(16.), runs, None, None)
+                .unwrap();
+            line[0].layout.clone()
+        };
+
+        let plain = shape(&[run(13, black(), None)]);
+        let picked = shape(&[
+            run(4, black(), None),
+            run(3, black(), Some(red())),
+            run(6, black(), None),
+        ]);
+        assert!(Arc::ptr_eq(&plain, &picked));
+        let coloured = shape(&[run(4, black(), None), run(9, red(), None)]);
+        assert!(!Arc::ptr_eq(&plain, &coloured));
     }
 }
