@@ -316,11 +316,17 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
                                     menu.set_previous_focus(previous_focus_handle, cx);
                                 });
 
-                                // Set up the subscription for dismiss handling
+                                // Set up the subscription for dismiss handling,
+                                // holding the state weakly: the state holds the
+                                // subscription, and a menu whose element went
+                                // while it was open was never let go, nor its
+                                // state (elundqvist/kvist#634)
                                 let _subscription = window.subscribe(&menu, cx, {
-                                    let shared_state = shared_state.clone();
+                                    let shared_state = Rc::downgrade(&shared_state);
                                     move |_, _: &DismissEvent, window, _cx| {
-                                        shared_state.borrow_mut().open = false;
+                                        if let Some(shared_state) = shared_state.upgrade() {
+                                            shared_state.borrow_mut().open = false;
+                                        }
                                         window.refresh();
                                     }
                                 });
@@ -385,6 +391,65 @@ mod tests {
                         ),
                 )
         }
+    }
+
+    /// A context menu on a row, there while `shown`, and the menu it last
+    /// built.
+    struct Shown {
+        shown: bool,
+        menu: Rc<RefCell<Option<gpui::WeakEntity<PopupMenu>>>>,
+    }
+
+    impl Render for Shown {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let menu = self.menu.clone();
+            div().size_full().when(self.shown, |this| {
+                this.child(div().id("row").size_full().context_menu(move |popup, _, cx| {
+                    *menu.borrow_mut() = Some(cx.entity().downgrade());
+                    popup.menu("Close", Box::new(RemoveTab))
+                }))
+            })
+        }
+    }
+
+    /// A context menu whose element goes while it is open, a drawer closed
+    /// on it, is let go with the element's state: the listener for its
+    /// dismissal held the state that held the menu and the listener, and
+    /// neither went (elundqvist/kvist#634).
+    #[gpui::test]
+    fn a_menu_whose_element_goes_while_it_is_open_is_let_go(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(Theme::default());
+            super::super::popup_menu::init(cx);
+        });
+        let menu: Rc<RefCell<Option<gpui::WeakEntity<PopupMenu>>>> = Rc::default();
+        let (view, cx) = cx.add_window_view({
+            let menu = menu.clone();
+            move |_, _| Shown { shown: true, menu }
+        });
+        let draw = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        };
+        draw(cx);
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Right,
+            position: point(px(50.), px(50.)),
+            modifiers: Default::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        draw(cx);
+        let open = menu.borrow().clone().expect("the menu, built as it opened");
+        assert!(open.upgrade().is_some());
+
+        view.update(cx, |view, cx| {
+            view.shown = false;
+            cx.notify();
+        });
+        draw(cx);
+        draw(cx);
+        assert!(open.upgrade().is_none(), "the menu was kept");
     }
 
     #[gpui::test]
