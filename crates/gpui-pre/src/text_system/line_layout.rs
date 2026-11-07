@@ -208,95 +208,183 @@ impl LineLayout {
         wrap_width: Pixels,
         max_lines: Option<usize>,
     ) -> SmallVec<[WrapBoundary; 1]> {
-        let mut boundaries = SmallVec::new();
-        let mut first_non_whitespace_ix = None;
-        let mut last_candidate_ix = None;
-        let mut last_candidate_x = px(0.);
-        let mut last_boundary = WrapBoundary {
-            run_ix: 0,
-            glyph_ix: 0,
-        };
-        let mut last_boundary_x = px(0.);
-        let mut prev_ch = '\0';
-        let mut glyphs = self
+        let glyphs = self.runs.iter().enumerate().flat_map(move |(run_ix, run)| {
+            run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
+                let character = text[glyph.index..].chars().next().unwrap();
+                (
+                    WrapBoundary { run_ix, glyph_ix },
+                    character,
+                    glyph.position.x,
+                )
+            })
+        });
+        wrap_points(glyphs, self.width, wrap_width, max_lines)
+    }
+
+    /// Where the rows of this line wrapped to `wrap_width` begin in its
+    /// text, after the first, found in the text's order: each glyph as
+    /// wide as it is drawn, its clusters in the order of their text
+    /// (elundqvist/kvist#648). `compute_wrap_boundaries` breaks the line
+    /// as it is drawn, so a line with a right-to-left part put the end of
+    /// a word, drawn on the left, on the first row and its start on the
+    /// second.
+    pub(crate) fn text_order_row_starts(
+        &self,
+        text: &str,
+        wrap_width: Pixels,
+        max_lines: Option<usize>,
+    ) -> SmallVec<[usize; 1]> {
+        let (clusters, width) = self.text_order_clusters(text);
+        wrap_points(clusters.into_iter(), width, wrap_width, max_lines)
+    }
+
+    /// This line's clusters in the order of its text, each its index, its
+    /// character and where it begins were the line drawn in that order,
+    /// and the line's width. A glyph is as wide as the room from where it
+    /// is drawn to the glyph drawn next to its right: a line of
+    /// right-to-left letters alone is laid out right to left, its glyphs
+    /// in the order of their text and their x falling, and the room to the
+    /// glyph after it in the line was the next one's width, the last one's
+    /// the whole line's.
+    pub(crate) fn text_order_clusters(&self, text: &str) -> (Vec<(usize, char, Pixels)>, Pixels) {
+        let mut drawn: Vec<(usize, Pixels)> = self
             .runs
             .iter()
+            .flat_map(|run| run.glyphs.iter())
+            .map(|glyph| (glyph.index, glyph.position.x))
+            .collect();
+        drawn.sort_by_key(|(_, x)| *x);
+        let mut widths: Vec<(usize, Pixels)> = drawn
+            .iter()
             .enumerate()
-            .flat_map(move |(run_ix, run)| {
-                run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
-                    let character = text[glyph.index..].chars().next().unwrap();
-                    (
-                        WrapBoundary { run_ix, glyph_ix },
-                        character,
-                        glyph.position.x,
-                    )
-                })
+            .map(|(k, (index, x))| {
+                let right = drawn.get(k + 1).map_or(self.width, |(_, x)| *x);
+                (*index, right - *x)
             })
-            .peekable();
-
-        while let Some((boundary, ch, x)) = glyphs.next() {
-            if ch == '\n' {
-                continue;
+            .collect();
+        widths.sort_by_key(|(index, _)| *index);
+        let mut x = px(0.);
+        let mut clusters: Vec<(usize, char, Pixels)> = Vec::with_capacity(widths.len());
+        for (index, width) in widths {
+            match clusters.last() {
+                Some((last, _, _)) if *last == index => {}
+                _ => clusters.push((index, text[index..].chars().next().unwrap(), x)),
             }
+            x += width;
+        }
+        (clusters, x)
+    }
+}
 
-            // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
-            // but there are some differences, so we have to duplicate the code here.
-            if LineWrapper::is_word_char(ch) {
-                // Changed in elundqvist/gpui-kit (elundqvist/kvist#497): a word may
-                // begin a row after a `，` as after a space, and (elundqvist/kvist#522)
-                // after a slash, as in `LineWrapper::wrap_line`
-                if (prev_ch == ' '
-                    || LineWrapper::is_closing_mark(prev_ch)
-                    || LineWrapper::breaks_after_slash(prev_ch, ch))
-                    && ch != ' '
-                    && first_non_whitespace_ix.is_some()
-                {
-                    last_candidate_ix = Some(boundary);
-                    last_candidate_x = x;
-                }
-            } else {
-                // Changed in elundqvist/gpui-kit (elundqvist/kvist#497): no row
-                // starts with a `，` or ends with a `「`, nor (elundqvist/kvist#522)
-                // with a slash but after a space, as in `LineWrapper::wrap_line`
-                if ch != ' '
-                    && !LineWrapper::holds_slash(prev_ch, ch)
-                    && first_non_whitespace_ix.is_some()
-                    && LineWrapper::may_break_between(prev_ch, ch)
-                {
-                    last_candidate_ix = Some(boundary);
-                    last_candidate_x = x;
-                }
-            }
+/// Where a line of `items`, each a place to break before, its character
+/// and where it begins, `end` wide, breaks into rows `wrap_width` wide.
+fn wrap_points<B: Copy + Ord>(
+    items: impl Iterator<Item = (B, char, Pixels)>,
+    end: Pixels,
+    wrap_width: Pixels,
+    max_lines: Option<usize>,
+) -> SmallVec<[B; 1]> {
+    let mut boundaries = SmallVec::new();
+    let mut first_non_whitespace_ix = None;
+    let mut last_candidate_ix = None;
+    let mut last_candidate_x = px(0.);
+    let mut glyphs = items.peekable();
+    // a row breaks after its first glyph at the earliest
+    let Some(&(mut last_boundary, _, _)) = glyphs.peek() else {
+        return boundaries;
+    };
+    let mut last_boundary_x = px(0.);
+    let mut prev_ch = '\0';
 
-            if ch != ' ' && first_non_whitespace_ix.is_none() {
-                first_non_whitespace_ix = Some(boundary);
-            }
-
-            let next_x = glyphs.peek().map_or(self.width, |(_, _, x)| *x);
-            let width = next_x - last_boundary_x;
-
-            if width > wrap_width && boundary > last_boundary {
-                // When used line_clamp, we should limit the number of lines.
-                if let Some(max_lines) = max_lines
-                    && boundaries.len() >= max_lines.saturating_sub(1)
-                {
-                    break;
-                }
-
-                if let Some(last_candidate_ix) = last_candidate_ix.take() {
-                    last_boundary = last_candidate_ix;
-                    last_boundary_x = last_candidate_x;
-                } else {
-                    last_boundary = boundary;
-                    last_boundary_x = x;
-                }
-                boundaries.push(last_boundary);
-            }
-            prev_ch = ch;
+    while let Some((boundary, ch, x)) = glyphs.next() {
+        if ch == '\n' {
+            continue;
         }
 
-        boundaries
+        // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
+        // but there are some differences, so we have to duplicate the code here.
+        if LineWrapper::is_word_char(ch) {
+            // Changed in elundqvist/gpui-kit (elundqvist/kvist#497): a word may
+            // begin a row after a `，` as after a space, and (elundqvist/kvist#522)
+            // after a slash, as in `LineWrapper::wrap_line`
+            if (prev_ch == ' '
+                || LineWrapper::is_closing_mark(prev_ch)
+                || LineWrapper::breaks_after_slash(prev_ch, ch))
+                && ch != ' '
+                && first_non_whitespace_ix.is_some()
+            {
+                last_candidate_ix = Some(boundary);
+                last_candidate_x = x;
+            }
+        } else {
+            // Changed in elundqvist/gpui-kit (elundqvist/kvist#497): no row
+            // starts with a `，` or ends with a `「`, nor (elundqvist/kvist#522)
+            // with a slash but after a space, as in `LineWrapper::wrap_line`
+            if ch != ' '
+                && !LineWrapper::holds_slash(prev_ch, ch)
+                && first_non_whitespace_ix.is_some()
+                && LineWrapper::may_break_between(prev_ch, ch)
+            {
+                last_candidate_ix = Some(boundary);
+                last_candidate_x = x;
+            }
+        }
+
+        if ch != ' ' && first_non_whitespace_ix.is_none() {
+            first_non_whitespace_ix = Some(boundary);
+        }
+
+        let next_x = glyphs.peek().map_or(end, |(_, _, x)| *x);
+        let width = next_x - last_boundary_x;
+
+        if width > wrap_width && boundary > last_boundary {
+            // When used line_clamp, we should limit the number of lines.
+            if let Some(max_lines) = max_lines
+                && boundaries.len() >= max_lines.saturating_sub(1)
+            {
+                break;
+            }
+
+            if let Some(last_candidate_ix) = last_candidate_ix.take() {
+                last_boundary = last_candidate_ix;
+                last_boundary_x = last_candidate_x;
+            } else {
+                last_boundary = boundary;
+                last_boundary_x = x;
+            }
+            boundaries.push(last_boundary);
+        }
+        prev_ch = ch;
     }
+
+    boundaries
+}
+
+/// Whether `text` has a right-to-left letter in it: its rows are then
+/// laid out each on its own (`LineLayoutCache::rows_laid_out_apart`), as
+/// what is drawn of a row depends on where it breaks.
+pub(crate) fn has_right_to_left(text: &str) -> bool {
+    use unicode_bidi::{BidiClass, bidi_class};
+    text.chars()
+        .any(|c| !c.is_ascii() && matches!(bidi_class(c), BidiClass::R | BidiClass::AL))
+}
+
+/// The part of `runs` over `range` of their text.
+fn runs_within(runs: &[FontRun], range: Range<usize>) -> SmallVec<[FontRun; 1]> {
+    let mut within = SmallVec::new();
+    let mut start = 0;
+    for run in runs {
+        let end = start + run.len;
+        let (from, to) = (start.max(range.start), end.min(range.end));
+        if from < to {
+            within.push(FontRun {
+                len: to - from,
+                font_id: run.font_id,
+            });
+        }
+        start = end;
+    }
+    within
 }
 
 /// A line of text that has been wrapped to fit a given width
@@ -310,6 +398,12 @@ pub struct WrappedLineLayout {
 
     /// The width of the line, if it was wrapped
     pub wrap_width: Option<Pixels>,
+
+    /// Where each row after the first begins in the text, for a line whose
+    /// rows were each laid out on its own, one with right-to-left text in
+    /// it (elundqvist/kvist#648): a row's first glyph drawn need not be its
+    /// first in the text. Empty where each row's first glyph drawn is.
+    pub(crate) row_starts: SmallVec<[usize; 1]>,
 }
 
 /// A boundary at which a line was wrapped
@@ -369,6 +463,17 @@ impl WrappedLineLayout {
         &self.unwrapped_layout.runs
     }
 
+    /// Where the row after the `ix`th wrap boundary begins in the text.
+    pub fn row_start(&self, ix: usize) -> usize {
+        match self.row_starts.get(ix) {
+            Some(start) => *start,
+            None => {
+                let boundary = self.wrap_boundaries[ix];
+                self.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index
+            }
+        }
+    }
+
     /// The index corresponding to a given position in this layout for the given line height.
     ///
     /// See also [`Self::closest_index_for_position`].
@@ -409,7 +514,7 @@ impl WrappedLineLayout {
             };
             let run = &self.unwrapped_layout.runs[line_start_boundary.run_ix];
             let glyph = &run.glyphs[line_start_boundary.glyph_ix];
-            wrapped_line_start_index = glyph.index;
+            wrapped_line_start_index = self.row_start(wrapped_line_ix - 1);
             wrapped_line_start_x = glyph.position.x;
         } else {
             wrapped_line_start_index = 0;
@@ -423,7 +528,7 @@ impl WrappedLineLayout {
             let next_wrap_boundary = self.wrap_boundaries[next_wrap_boundary_ix];
             let run = &self.unwrapped_layout.runs[next_wrap_boundary.run_ix];
             let glyph = &run.glyphs[next_wrap_boundary.glyph_ix];
-            wrapped_line_end_index = glyph.index;
+            wrapped_line_end_index = self.row_start(next_wrap_boundary_ix);
             wrapped_line_end_x = glyph.position.x;
         } else {
             wrapped_line_end_index = self.unwrapped_layout.len;
@@ -453,14 +558,8 @@ impl WrappedLineLayout {
     /// Returns the pixel position for the given byte index.
     pub fn position_for_index(&self, index: usize, line_height: Pixels) -> Option<Point<Pixels>> {
         let mut line_start_ix = 0;
-        let mut line_end_indices = self
-            .wrap_boundaries
-            .iter()
-            .map(|wrap_boundary| {
-                let run = &self.unwrapped_layout.runs[wrap_boundary.run_ix];
-                let glyph = &run.glyphs[wrap_boundary.glyph_ix];
-                glyph.index
-            })
+        let mut line_end_indices = (0..self.wrap_boundaries.len())
+            .map(|ix| self.row_start(ix))
             .chain([self.len()])
             .enumerate();
         for (ix, line_end_ix) in line_end_indices {
@@ -653,15 +752,27 @@ impl LineLayoutCache {
             drop(current_frame);
             let text = SharedString::from(text);
             let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
-            let wrap_boundaries = if let Some(wrap_width) = wrap_width {
-                unwrapped_layout.compute_wrap_boundaries(text.as_ref(), wrap_width, max_lines)
-            } else {
-                SmallVec::new()
-            };
-            let layout = Arc::new(WrappedLineLayout {
-                unwrapped_layout,
-                wrap_boundaries,
-                wrap_width,
+            let layout = Arc::new(match wrap_width {
+                Some(wrap_width)
+                    if unwrapped_layout.width > wrap_width && has_right_to_left(&text) =>
+                {
+                    let row_starts =
+                        unwrapped_layout.text_order_row_starts(&text, wrap_width, max_lines);
+                    self.rows_laid_out_apart(&text, font_size, runs, &row_starts, wrap_width)
+                }
+                _ => WrappedLineLayout {
+                    wrap_boundaries: match wrap_width {
+                        Some(wrap_width) => unwrapped_layout.compute_wrap_boundaries(
+                            text.as_ref(),
+                            wrap_width,
+                            max_lines,
+                        ),
+                        None => SmallVec::new(),
+                    },
+                    unwrapped_layout,
+                    wrap_width,
+                    row_starts: SmallVec::new(),
+                },
             });
             let key = Arc::new(CacheKey {
                 text,
@@ -678,6 +789,90 @@ impl LineLayoutCache {
             current_frame.used_wrapped_lines.push(key);
 
             layout
+        }
+    }
+
+    /// `text` wrapped at `row_starts`, each row laid out as a line of its
+    /// own, as UAX #9 has a paragraph's lines reordered each on its own
+    /// once it is broken in the text's order (elundqvist/kvist#648). The
+    /// rows' glyphs make one line, each row's after the one before it and
+    /// in the order they are drawn, so the line is drawn and read as any
+    /// wrapped at its glyphs.
+    fn rows_laid_out_apart(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+        row_starts: &[usize],
+        wrap_width: Pixels,
+    ) -> WrappedLineLayout {
+        let ends = row_starts.iter().copied().chain([text.len()]);
+        let mut line = LineLayout {
+            font_size,
+            ..Default::default()
+        };
+        let mut wrap_boundaries: SmallVec<[WrapBoundary; 1]> = SmallVec::new();
+        let mut kept_starts = SmallVec::new();
+        let mut start = 0;
+        for end in ends {
+            let row = self.platform_text_system.layout_line(
+                &text[start..end],
+                font_size,
+                &runs_within(runs, start..end),
+            );
+            // the row's glyphs in the order they are drawn, left to right, as
+            // a row is drawn from its first glyph at its left edge: a row of
+            // right-to-left letters alone is laid out right to left, its
+            // glyphs in the order of their text, the first at its right edge
+            let mut glyphs: Vec<(FontId, ShapedGlyph)> = row
+                .runs
+                .into_iter()
+                .flat_map(|run| {
+                    let font_id = run.font_id;
+                    run.glyphs.into_iter().map(move |glyph| (font_id, glyph))
+                })
+                .collect();
+            if glyphs.is_empty() {
+                // a row that drew no glyph is the end of the row before it
+                start = end;
+                continue;
+            }
+            glyphs.sort_by_key(|(_, glyph)| glyph.position.x);
+            let first_run = line.runs.len();
+            if first_run > 0 {
+                wrap_boundaries.push(WrapBoundary {
+                    run_ix: first_run,
+                    glyph_ix: 0,
+                });
+                kept_starts.push(start);
+            }
+            let x = line.width;
+            for (font_id, glyph) in glyphs {
+                let glyph = ShapedGlyph {
+                    position: point(glyph.position.x + x, glyph.position.y),
+                    index: glyph.index + start,
+                    ..glyph
+                };
+                let in_row = line.runs.len() > first_run;
+                match line.runs.last_mut() {
+                    Some(run) if in_row && run.font_id == font_id => run.glyphs.push(glyph),
+                    _ => line.runs.push(ShapedRun {
+                        font_id,
+                        glyphs: vec![glyph],
+                    }),
+                }
+            }
+            line.width += row.width;
+            line.ascent = line.ascent.max(row.ascent);
+            line.descent = line.descent.max(row.descent);
+            start = end;
+        }
+        line.len = text.len();
+        WrappedLineLayout {
+            unwrapped_layout: Arc::new(line),
+            wrap_boundaries,
+            wrap_width: Some(wrap_width),
+            row_starts: kept_starts,
         }
     }
 
@@ -1272,5 +1467,292 @@ mod tests {
         };
         assert_eq!(a.closest_index_for_x(px(3.)), 0);
         assert_eq!(a.closest_index_for_x(px(5.)), 1);
+    }
+
+    /// A text system that lays out each character 10 px wide, as a bidi
+    /// shaper would: a line with a Latin letter left to right, each run of
+    /// Hebrew in it right to left, a line of Hebrew alone right to left,
+    /// its glyphs in the order of their text, as cosmic-text has it.
+    struct BidiTextSystem;
+
+    impl crate::PlatformTextSystem for BidiTextSystem {
+        fn add_fonts(&self, fonts: Vec<std::borrow::Cow<'static, [u8]>>) -> anyhow::Result<()> {
+            crate::NoopTextSystem.add_fonts(fonts)
+        }
+        fn all_font_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn font_id(&self, descriptor: &crate::Font) -> anyhow::Result<FontId> {
+            crate::NoopTextSystem.font_id(descriptor)
+        }
+        fn font_metrics(&self, font_id: FontId) -> crate::FontMetrics {
+            crate::NoopTextSystem.font_metrics(font_id)
+        }
+        fn typographic_bounds(
+            &self,
+            font_id: FontId,
+            glyph_id: GlyphId,
+        ) -> anyhow::Result<crate::Bounds<f32>> {
+            crate::NoopTextSystem.typographic_bounds(font_id, glyph_id)
+        }
+        fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> anyhow::Result<Size<f32>> {
+            crate::NoopTextSystem.advance(font_id, glyph_id)
+        }
+        fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
+            crate::NoopTextSystem.glyph_for_char(font_id, ch)
+        }
+        fn glyph_raster_bounds(
+            &self,
+            params: &crate::RenderGlyphParams,
+        ) -> anyhow::Result<crate::Bounds<crate::DevicePixels>> {
+            crate::NoopTextSystem.glyph_raster_bounds(params)
+        }
+        fn rasterize_glyph(
+            &self,
+            params: &crate::RenderGlyphParams,
+            raster_bounds: crate::Bounds<crate::DevicePixels>,
+        ) -> anyhow::Result<(Size<crate::DevicePixels>, Vec<u8>)> {
+            crate::NoopTextSystem.rasterize_glyph(params, raster_bounds)
+        }
+        fn layout_line(&self, text: &str, font_size: Pixels, _runs: &[FontRun]) -> LineLayout {
+            let hebrew = |c: char| ('\u{05D0}'..='\u{05EA}').contains(&c);
+            let mut order: Vec<(usize, char)> = text.char_indices().collect();
+            if order.iter().any(|(_, c)| c.is_ascii_alphabetic()) {
+                // each run of Hebrew, its spaces between its words in it
+                let mut i = 0;
+                while i < order.len() {
+                    if !hebrew(order[i].1) {
+                        i += 1;
+                        continue;
+                    }
+                    let mut end = i;
+                    for j in i..order.len() {
+                        if hebrew(order[j].1) {
+                            end = j + 1;
+                        } else if order[j].1 != ' ' {
+                            break;
+                        }
+                    }
+                    order[i..end].reverse();
+                    i = end;
+                }
+            }
+            // a line of Hebrew alone is laid out right to left, as
+            // cosmic-text lays it out: its glyphs in the order of their
+            // text, the first at its right edge
+            let right_to_left = !text.chars().any(|c| c.is_ascii_alphabetic());
+            let n = order.len();
+            let glyphs = order
+                .iter()
+                .enumerate()
+                .map(|(at, (index, c))| ShapedGlyph {
+                    id: GlyphId(*c as u32),
+                    position: point(
+                        px(if right_to_left { n - 1 - at } else { at } as f32 * 10.),
+                        px(0.),
+                    ),
+                    index: *index,
+                    is_emoji: false,
+                })
+                .collect();
+            LineLayout {
+                font_size,
+                width: px(order.len() as f32 * 10.),
+                ascent: px(10.),
+                descent: px(-3.),
+                runs: vec![ShapedRun {
+                    font_id: FontId(0),
+                    glyphs,
+                }],
+                len: text.len(),
+            }
+        }
+        fn recommended_rendering_mode(
+            &self,
+            font_id: FontId,
+            font_size: Pixels,
+        ) -> crate::TextRenderingMode {
+            crate::NoopTextSystem.recommended_rendering_mode(font_id, font_size)
+        }
+    }
+
+    /// A wrapped line with a right-to-left part breaks in the order of its
+    /// text, each row laid out on its own: the Hebrew's first word, drawn
+    /// rightmost, is on the first row, where breaking the line as it is
+    /// drawn put its last word there and its first on the next
+    /// (elundqvist/kvist#648).
+    #[test]
+    fn a_wrapped_line_with_hebrew_in_it_breaks_in_its_texts_order() {
+        let cache = LineLayoutCache::new(Arc::new(BidiTextSystem));
+        let text =
+            "ab \u{05D0}\u{05D1}\u{05D2} \u{05D3}\u{05D4}\u{05D5} \u{05D6}\u{05D7}\u{05D8} cd";
+        let runs = [FontRun {
+            len: text.len(),
+            font_id: FontId(0),
+        }];
+        let wrapped = cache.layout_wrapped_line(text, px(16.), &runs, Some(px(80.)), None);
+
+        let at = |c: char| text.find(c).unwrap();
+        let rows: Vec<usize> = (0..wrapped.wrap_boundaries().len())
+            .map(|ix| wrapped.row_start(ix))
+            .collect();
+        assert_eq!(rows, [at('\u{05D3}'), at('c')]);
+        // each row drawn of its own glyphs, the first word of the Hebrew
+        // rightmost on the first row
+        let row_of = |c: char| {
+            let p = wrapped.position_for_index(at(c), px(20.)).unwrap();
+            (p.y / px(20.)) as usize
+        };
+        assert_eq!(row_of('\u{05D0}'), 0);
+        assert_eq!(row_of('\u{05D6}'), 1);
+        assert_eq!(row_of('d'), 2);
+        let first_row: Vec<usize> = wrapped.runs()[..wrapped.wrap_boundaries()[0].run_ix]
+            .iter()
+            .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.index))
+            .collect();
+        assert_eq!(
+            first_row,
+            [
+                0,
+                1,
+                2,
+                at('\u{05D2}'),
+                at('\u{05D1}'),
+                at('\u{05D0}'),
+                at('\u{05D2}') + 2
+            ]
+        );
+
+        // a line of Latin alone is broken where it is drawn, as before
+        let latin = cache.layout_wrapped_line(
+            "ab cd ef gh",
+            px(16.),
+            &[FontRun {
+                len: 11,
+                font_id: FontId(0),
+            }],
+            Some(px(50.)),
+            None,
+        );
+        assert!(latin.row_starts.is_empty());
+        assert_eq!(latin.row_start(0), 3);
+    }
+
+    /// A line of Latin and Hebrew clamped to two rows with an ellipsis is
+    /// cut on the rows it is drawn in, broken in the order of its text: the
+    /// cut broke it as it is drawn, into two rows where its text's order
+    /// has three, so it was left whole and drawn in two rows, the second
+    /// wider than the width (elundqvist/kvist#648).
+    #[test]
+    fn a_line_with_hebrew_in_it_clamped_with_an_ellipsis_is_cut_on_its_rows() {
+        use crate::{LineWrapper, TextRun, TextSystem, TruncateFrom, font};
+
+        let platform = Arc::new(BidiTextSystem);
+        let text_system = Arc::new(TextSystem::new(platform.clone()));
+        let font_id = text_system.resolve_font(&font("Dummy"));
+        let mut wrapper = LineWrapper::new(font_id, px(16.), text_system);
+        // 160 px: two rows as it is drawn, three in its text's order
+        let text = "ab \u{05D0} \u{05D1} \u{05D2} \u{05D3}\u{05D4}\u{05D5}\u{05D6} cd";
+        let wrap_width = px(80.);
+        let runs = [TextRun {
+            len: text.len(),
+            font: font("Dummy"),
+            ..Default::default()
+        }];
+        let (truncated, _) = wrapper.truncate_wrapped_line(
+            text.into(),
+            wrap_width,
+            2,
+            "\u{2026}",
+            &runs,
+            TruncateFrom::End,
+        );
+        assert!(truncated.ends_with('\u{2026}'), "'{truncated}' is cut");
+
+        // and drawn in two rows, each within the width
+        let cache = LineLayoutCache::new(platform);
+        let font_runs = [FontRun {
+            len: truncated.len(),
+            font_id,
+        }];
+        let drawn =
+            cache.layout_wrapped_line(&truncated, px(16.), &font_runs, Some(wrap_width), Some(2));
+        assert_eq!(
+            drawn.wrap_boundaries().len(),
+            1,
+            "'{truncated}' in two rows"
+        );
+        let boundary = drawn.wrap_boundaries()[0];
+        let second_x = drawn.runs()[boundary.run_ix].glyphs[boundary.glyph_ix]
+            .position
+            .x;
+        assert!(second_x <= wrap_width, "its first row {second_x:?} wide");
+        let second_width = drawn.unwrapped_layout.width - second_x;
+        assert!(
+            second_width <= wrap_width,
+            "its second row {second_width:?} wide"
+        );
+    }
+
+    /// A wrapped line of Hebrew alone, laid out right to left, its glyphs
+    /// in the order of their text, breaks between its words, each its
+    /// width, and each row is drawn from its first glyph at its left edge
+    /// rightwards within the width: the room to the next glyph in the line
+    /// was taken for a glyph's width, the last one's the whole line's, and
+    /// a row's first glyph in its text, drawn at its right edge, was taken
+    /// for its left edge, so each row after the first hung to the left of
+    /// the text (elundqvist/kvist#648).
+    #[test]
+    fn a_wrapped_line_of_hebrew_alone_is_drawn_row_by_row_within_its_width() {
+        let cache = LineLayoutCache::new(Arc::new(BidiTextSystem));
+        let word = "\u{05D0}\u{05D1}\u{05D2}";
+        let text = [word; 6].join(" ");
+        let runs = [FontRun {
+            len: text.len(),
+            font_id: FontId(0),
+        }];
+        let wrap_width = px(80.);
+        let wrapped = cache.layout_wrapped_line(&text, px(16.), &runs, Some(wrap_width), None);
+
+        // two words a row, each row's start a word's
+        let word_at = |k: usize| k * (word.len() + 1);
+        let rows: Vec<usize> = (0..wrapped.wrap_boundaries().len())
+            .map(|ix| wrapped.row_start(ix))
+            .collect();
+        assert_eq!(rows, [word_at(2), word_at(4)]);
+
+        let glyphs: Vec<&ShapedGlyph> = wrapped
+            .runs()
+            .iter()
+            .flat_map(|run| run.glyphs.iter())
+            .collect();
+        let row_ends = wrapped
+            .wrap_boundaries()
+            .iter()
+            .map(|boundary| {
+                wrapped.runs()[..boundary.run_ix]
+                    .iter()
+                    .map(|run| run.glyphs.len())
+                    .sum::<usize>()
+                    + boundary.glyph_ix
+            })
+            .chain([glyphs.len()]);
+        let mut row_start = 0;
+        for (row, row_end) in row_ends.enumerate() {
+            let left = glyphs[row_start].position.x;
+            let mut x = left;
+            for glyph in &glyphs[row_start..row_end] {
+                assert!(glyph.position.x >= x, "row {row} drawn right to left");
+                x = glyph.position.x;
+                assert!(x - left < wrap_width, "row {row} wider than its width");
+            }
+            // the row's first word in its text drawn rightmost
+            let first = glyphs[row_end - 1].index;
+            assert!(
+                (word_at(row * 2)..word_at(row * 2) + word.len()).contains(&first),
+                "row {row} ends drawn with {first}"
+            );
+            row_start = row_end;
+        }
     }
 }

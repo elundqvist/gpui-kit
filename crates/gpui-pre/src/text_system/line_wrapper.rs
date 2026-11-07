@@ -1,5 +1,6 @@
 // Changed in elundqvist/gpui-kit from gpui-pre 0.3.3 as published to crates.io: FORK.md at the
 // crate's root lists the changes.
+use super::line_layout::has_right_to_left;
 use crate::{
     FontId, FontRun, LineLayout, Pixels, SharedString, TextRun, TextSystem, WrapBoundary, px,
 };
@@ -22,6 +23,86 @@ pub enum TruncateFrom {
 /// character it is shaped with (`LineWrapper::width_beside`), past other
 /// marks and spaces.
 const SHAPED_WITH_REACH: usize = 16;
+
+/// Where the rows of a part of a paragraph begin after the first, as the
+/// window breaks it to draw it (`LineWrapper::shape_rows`).
+enum RowBreaks {
+    /// At glyphs, broken as it is drawn.
+    Drawn(SmallVec<[WrapBoundary; 1]>),
+    /// At indices of its text, broken in the text's order, a part with
+    /// right-to-left text in it (elundqvist/kvist#648).
+    TextOrder(SmallVec<[usize; 1]>),
+}
+
+impl RowBreaks {
+    fn len(&self) -> usize {
+        match self {
+            Self::Drawn(boundaries) => boundaries.len(),
+            Self::TextOrder(starts) => starts.len(),
+        }
+    }
+
+    /// Where the `row`th row of `part`, laid out as `layout`, may be cut:
+    /// each cluster's start in it, from its first, and its end, each with
+    /// the width of the row before it. A part shaped has rows past it, so
+    /// its row ends where the next begins.
+    fn cuts(&self, layout: &LineLayout, part: &str, row: usize) -> Vec<(usize, Pixels)> {
+        let mut cuts: Vec<(usize, Pixels)> = Vec::new();
+        match self {
+            Self::Drawn(boundaries) => {
+                let glyphs: Vec<(usize, Pixels)> = layout
+                    .runs
+                    .iter()
+                    .flat_map(|run| run.glyphs.iter())
+                    .map(|glyph| (glyph.index, glyph.position.x))
+                    .collect();
+                // each row's first glyph, `glyphs.len()` ending the last
+                let row_starts: Vec<usize> = iter::once(0)
+                    .chain(boundaries.iter().map(|boundary| {
+                        layout.runs[..boundary.run_ix]
+                            .iter()
+                            .map(|run| run.glyphs.len())
+                            .sum::<usize>()
+                            + boundary.glyph_ix
+                    }))
+                    .chain(iter::once(glyphs.len()))
+                    .collect();
+                let row_x = glyphs.get(row_starts[row]).map_or(px(0.), |(_, x)| *x);
+                for k in row_starts[row]..row_starts[row + 1] {
+                    let (index, x) = glyphs[k];
+                    if cuts.last().is_none_or(|(at, _)| *at < index) {
+                        cuts.push((index, x - row_x));
+                    }
+                }
+                let row_end = glyphs.get(row_starts[row + 1]);
+                cuts.push((
+                    row_end.map_or(part.len(), |(index, _)| *index),
+                    row_end.map_or(layout.width, |(_, x)| *x) - row_x,
+                ));
+            }
+            Self::TextOrder(starts) => {
+                let (clusters, width) = layout.text_order_clusters(part);
+                let start = if row == 0 { 0 } else { starts[row - 1] };
+                let end = starts.get(row).copied().unwrap_or(part.len());
+                let x_at = |index: usize| {
+                    clusters
+                        .iter()
+                        .find(|(at, _, _)| *at >= index)
+                        .map_or(width, |(_, _, x)| *x)
+                };
+                let row_x = x_at(start);
+                cuts.extend(
+                    clusters
+                        .iter()
+                        .filter(|(index, _, _)| (start..end).contains(index))
+                        .map(|(index, _, x)| (*index, *x - row_x)),
+                );
+                cuts.push((end, x_at(end) - row_x));
+            }
+        }
+        cuts
+    }
+}
 
 /// The GPUI line wrapper, used to wrap lines of text to a given width.
 pub struct LineWrapper {
@@ -449,7 +530,7 @@ impl LineWrapper {
                 .find('\n')
                 .map_or(text.len(), |ix| paragraph_start + ix);
             let paragraph = &text[paragraph_start..paragraph_end];
-            let (layout, shaped, boundaries) = self.shape_rows(
+            let (layout, shaped, breaks) = self.shape_rows(
                 paragraph,
                 paragraph_start,
                 runs,
@@ -458,7 +539,7 @@ impl LineWrapper {
                 shape,
             );
             let whole = shaped == paragraph.len();
-            let rows = boundaries.len() + 1;
+            let rows = breaks.len() + 1;
             let last = paragraph_end == text.len();
             if whole && rows < rows_left && !last {
                 // a newline before the last row: it ends a row
@@ -471,39 +552,8 @@ impl LineWrapper {
                 return (text, Cow::Borrowed(runs));
             }
             // The last row allowed is in this paragraph: it ends in the affix,
-            // cut where the two fit, a cluster at a time. A part shaped has
-            // rows past it, so its row ends where the next begins.
-            let glyphs: Vec<(usize, Pixels)> = layout
-                .runs
-                .iter()
-                .flat_map(|run| run.glyphs.iter())
-                .map(|glyph| (glyph.index, glyph.position.x))
-                .collect();
-            // each row's first glyph, `glyphs.len()` ending the last
-            let row_starts: Vec<usize> = iter::once(0)
-                .chain(boundaries.iter().map(|boundary| {
-                    layout.runs[..boundary.run_ix]
-                        .iter()
-                        .map(|run| run.glyphs.len())
-                        .sum::<usize>()
-                        + boundary.glyph_ix
-                }))
-                .chain(iter::once(glyphs.len()))
-                .collect();
-            let row = rows_left - 1;
-            let row_x = glyphs.get(row_starts[row]).map_or(px(0.), |(_, x)| *x);
-            let mut cuts: Vec<(usize, Pixels)> = Vec::new();
-            for k in row_starts[row]..row_starts[row + 1] {
-                let (index, x) = glyphs[k];
-                if cuts.last().is_none_or(|(at, _)| *at < index) {
-                    cuts.push((index, x - row_x));
-                }
-            }
-            let row_end = glyphs.get(row_starts[row + 1]);
-            cuts.push((
-                row_end.map_or(shaped, |(index, _)| *index),
-                row_end.map_or(layout.width, |(_, x)| *x) - row_x,
-            ));
+            // cut where the two fit, a cluster at a time.
+            let cuts = breaks.cuts(&layout, &paragraph[..shaped], rows_left - 1);
             let affix_width = self.shape(truncation_affix, &[], 0, shape).width;
             let row_start = paragraph_start + cuts[0].0;
             let mut fits = cuts
@@ -556,7 +606,7 @@ impl LineWrapper {
         wrap_width: Pixels,
         rows: usize,
         shape: &dyn Fn(&str, &[FontRun]) -> Arc<LineLayout>,
-    ) -> (Arc<LineLayout>, usize, SmallVec<[WrapBoundary; 1]>) {
+    ) -> (Arc<LineLayout>, usize, RowBreaks) {
         let chars = (wrap_width * (rows + 3) as f32 / (self.font_size * 0.15)).ceil() as usize;
         let mut len = match chars.saturating_mul(4) {
             bytes if bytes >= paragraph.len() => paragraph.len(),
@@ -565,13 +615,18 @@ impl LineWrapper {
         loop {
             let part = &paragraph[..len];
             let layout = self.shape(part, runs, start, shape);
-            let boundaries = if layout.width <= wrap_width {
-                SmallVec::new()
+            // Changed in elundqvist/gpui-kit (elundqvist/kvist#648): a part
+            // with right-to-left text in it breaks in the order of its text,
+            // as `LineLayoutCache::layout_wrapped_line` breaks it to draw it
+            let breaks = if layout.width <= wrap_width {
+                RowBreaks::Drawn(SmallVec::new())
+            } else if has_right_to_left(part) {
+                RowBreaks::TextOrder(layout.text_order_row_starts(part, wrap_width, None))
             } else {
-                layout.compute_wrap_boundaries(part, wrap_width, None)
+                RowBreaks::Drawn(layout.compute_wrap_boundaries(part, wrap_width, None))
             };
-            if len == paragraph.len() || boundaries.len() > rows {
-                return (layout, len, boundaries);
+            if len == paragraph.len() || breaks.len() > rows {
+                return (layout, len, breaks);
             }
             len = paragraph.ceil_char_boundary((len * 2).max(len + 1).min(paragraph.len()));
         }

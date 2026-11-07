@@ -375,6 +375,59 @@ impl GlyphRow {
     }
 }
 
+/// Which of a line's decoration runs each of its glyphs is in, found from
+/// the run of the glyph drawn before it, forward or back. Added in
+/// elundqvist/gpui-kit (elundqvist/kvist#648): the runs were stepped
+/// through forward alone, and the glyphs of right-to-left text, drawn last
+/// letter first and their indices falling, all took the run of the first
+/// one drawn, so a link or a pick in Hebrew was drawn on none of it.
+struct DecorationCursor<'a> {
+    runs: &'a [DecorationRun],
+    /// The run the glyph before was in, `runs.len()` past the last, and
+    /// where it begins and ends; none before the first glyph.
+    at: Option<(usize, usize, usize)>,
+}
+
+impl<'a> DecorationCursor<'a> {
+    fn new(runs: &'a [DecorationRun]) -> Self {
+        Self { runs, at: None }
+    }
+
+    /// Whether the glyph at `index` is in the run of the glyph before it.
+    fn holds(&self, index: usize) -> bool {
+        self.at
+            .is_some_and(|(_, start, end)| (start..end).contains(&index))
+    }
+
+    /// Moves to the run the glyph at `index` is in: none where it is the
+    /// run of the glyph before it, and else that run, none past the last.
+    /// A run that ends inside a glyph's cluster is passed over.
+    fn seek(&mut self, index: usize) -> Option<Option<&'a DecorationRun>> {
+        let runs = self.runs;
+        let end_of = |ix: usize, start: usize| {
+            runs.get(ix)
+                .map_or(usize::MAX, |run| start + run.len as usize)
+        };
+        let (mut ix, mut start, mut end) = match self.at {
+            Some((_, start, end)) if (start..end).contains(&index) => return None,
+            Some(at) => at,
+            None => (0, 0, end_of(0, 0)),
+        };
+        while index >= end {
+            ix += 1;
+            start = end;
+            end = end_of(ix, start);
+        }
+        while index < start {
+            ix -= 1;
+            end = start;
+            start = end - runs[ix].len as usize;
+        }
+        self.at = Some((ix, start, end));
+        Some(runs.get(ix))
+    }
+}
+
 fn paint_line(
     origin: Point<Pixels>,
     layout: &LineLayout,
@@ -396,9 +449,8 @@ fn paint_line(
     window.paint_layer(line_bounds, |window| {
         let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
         let baseline_offset = point(px(0.), padding_top + layout.ascent);
-        let mut decoration_runs = decoration_runs.iter();
+        let mut decorations = DecorationCursor::new(decoration_runs);
         let mut wraps = wrap_boundaries.iter().peekable();
-        let mut run_end = 0;
         let mut color = black();
         let mut current_underline: Option<(Point<Pixels>, UnderlineStyle)> = None;
         let mut current_strikethrough: Option<(Point<Pixels>, StrikethroughStyle)> = None;
@@ -435,7 +487,7 @@ fn paint_line(
                             glyph_origin.x - underline_origin.x,
                             underline_style,
                         );
-                        if glyph.index < run_end {
+                        if decorations.holds(glyph.index) {
                             underline_origin.x = origin.x;
                             underline_origin.y += line_height;
                         } else {
@@ -453,7 +505,7 @@ fn paint_line(
                             glyph_origin.x - strikethrough_origin.x,
                             strikethrough_style,
                         );
-                        if glyph.index < run_end {
+                        if decorations.holds(glyph.index) {
                             strikethrough_origin.x = origin.x;
                             strikethrough_origin.y += line_height;
                         } else {
@@ -478,18 +530,7 @@ fn paint_line(
 
                 let mut finished_underline: Option<(Point<Pixels>, UnderlineStyle)> = None;
                 let mut finished_strikethrough: Option<(Point<Pixels>, StrikethroughStyle)> = None;
-                if glyph.index >= run_end {
-                    let mut style_run = decoration_runs.next();
-
-                    // ignore style runs that apply to a partial glyph
-                    while let Some(run) = style_run {
-                        if glyph.index < run_end + (run.len as usize) {
-                            break;
-                        }
-                        run_end += run.len as usize;
-                        style_run = decoration_runs.next();
-                    }
-
+                if let Some(style_run) = decorations.seek(glyph.index) {
                     if let Some(style_run) = style_run {
                         if let Some((_, underline_style)) = &mut current_underline
                             && style_run.underline.as_ref() != Some(underline_style)
@@ -528,10 +569,8 @@ fn paint_line(
                             ));
                         }
 
-                        run_end += style_run.len as usize;
                         color = style_run.color;
                     } else {
-                        run_end = layout.len;
                         finished_underline = current_underline.take();
                         finished_strikethrough = current_strikethrough.take();
                     }
@@ -647,9 +686,8 @@ fn paint_line_background(
         ),
     );
     window.paint_layer(line_bounds, |window| {
-        let mut decoration_runs = decoration_runs.iter();
+        let mut decorations = DecorationCursor::new(decoration_runs);
         let mut wraps = wrap_boundaries.iter().peekable();
-        let mut run_end = 0;
         let mut current_background: Option<(Point<Pixels>, Hsla)> = None;
         let text_system = cx.text_system().clone();
         let mut row = GlyphRow::new(aligned_origin_x(
@@ -682,7 +720,7 @@ fn paint_line_background(
                             },
                             *background_color,
                         ));
-                        if glyph.index < run_end {
+                        if decorations.holds(glyph.index) {
                             background_origin.x = origin.x;
                             background_origin.y += line_height;
                         } else {
@@ -706,18 +744,7 @@ fn paint_line_background(
                 }
 
                 let mut finished_background: Option<(Point<Pixels>, Hsla)> = None;
-                if glyph.index >= run_end {
-                    let mut style_run = decoration_runs.next();
-
-                    // ignore style runs that apply to a partial glyph
-                    while let Some(run) = style_run {
-                        if glyph.index < run_end + (run.len as usize) {
-                            break;
-                        }
-                        run_end += run.len as usize;
-                        style_run = decoration_runs.next();
-                    }
-
+                if let Some(style_run) = decorations.seek(glyph.index) {
                     if let Some(style_run) = style_run {
                         if let Some((_, background_color)) = &mut current_background
                             && style_run.background_color.as_ref() != Some(background_color)
@@ -730,9 +757,7 @@ fn paint_line_background(
                                 run_background,
                             ));
                         }
-                        run_end += style_run.len as usize;
                     } else {
-                        run_end = layout.len;
                         finished_background = current_background.take();
                     }
                 }
@@ -1142,6 +1167,83 @@ mod tests {
             (underline[0] / factor - 100.).abs() < 0.25,
             "from the first marked glyph: {}",
             underline[0] / factor
+        );
+    }
+
+    /// A run in right-to-left text, its glyphs drawn last letter first, their indices falling,
+    /// is drawn on its own glyphs: the runs were stepped through forward alone, and the
+    /// first glyph drawn of the Hebrew, its last letter, passed the picked run, which was then
+    /// drawn on none of it (elundqvist/kvist#648).
+    #[crate::test]
+    fn test_a_run_in_right_to_left_text_is_drawn_on_its_own_glyphs(cx: &mut crate::TestAppContext) {
+        use crate::{
+            Context, IntoElement, ParentElement as _, Render, Styled as _, Window, canvas, div,
+        };
+
+        // "ab" and four Hebrew letters of two bytes, drawn last letter first
+        let text = "ab\u{05D0}\u{05D1}\u{05D2}\u{05D3}";
+        let glyphs = [(0, 0.), (1, 10.), (8, 20.), (6, 30.), (4, 40.), (2, 50.)];
+        let run = |len: u32, picked: bool| DecorationRun {
+            len,
+            color: crate::black(),
+            background_color: picked.then(crate::red),
+            underline: None,
+            strikethrough: None,
+        };
+        // the second and third Hebrew letters picked
+        let line = make_shaped_line(
+            text,
+            &glyphs,
+            60.,
+            &[run(4, false), run(4, true), run(2, false)],
+        );
+
+        struct Row(ShapedLine);
+
+        impl Render for Row {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let line = self.0.clone();
+                div().size_full().child(
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, cx| {
+                            line.paint_background(
+                                bounds.origin,
+                                px(20.),
+                                TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            )
+                            .unwrap();
+                        },
+                    )
+                    .size_full(),
+                )
+            }
+        }
+
+        let (_, cx) = cx.add_window_view(|_, _| Row(line));
+        cx.run_until_parked();
+        let (picked, factor) = cx.update(|window, _| {
+            let scene = &window.rendered_frame.scene;
+            (
+                scene
+                    .quads
+                    .iter()
+                    .map(|q| (q.bounds.origin.x.0, q.bounds.size.width.0))
+                    .collect::<Vec<_>>(),
+                window.scale_factor(),
+            )
+        });
+        let picked: Vec<(f32, f32)> = picked
+            .iter()
+            .map(|(x, width)| (x / factor, width / factor))
+            .collect();
+        assert_eq!(
+            picked,
+            [(30., 20.)],
+            "the picked letters' background, where they are drawn"
         );
     }
 

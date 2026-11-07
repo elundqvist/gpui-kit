@@ -361,6 +361,39 @@ asks (section 4(b)); each says so at its top:
   underline or strikethrough is still shaped apart. A test that a line
   with a part on another background has the plain line's layout, and
   with a part in another colour another.
+- `src/text_system/line_layout.rs`, `src/text_system/line.rs`,
+  `src/text_system/line_wrapper.rs` and `src/elements/text.rs`: a wrapped
+  line with a right-to-left letter in it breaks into rows in the order
+  of its text, each row laid out as a line of its own
+  (`LineLayout::text_order_row_starts`,
+  `LineLayoutCache::rows_laid_out_apart`, elundqvist/kvist#648), as
+  UAX #9 has a paragraph's lines reordered each on its own once it is
+  broken: rows were cut from the line as it is drawn, so a line of Latin
+  with a Hebrew part put the end of the Hebrew, drawn on the left, on
+  the first row and its first words on the second. The breaks are found
+  as `compute_wrap_boundaries` finds them, over the line's clusters in
+  the text's order, each as wide as the room from where it is drawn to
+  the glyph drawn next to its right (a line of right-to-left letters
+  alone is laid out right to left, its glyphs in the order of their
+  text). The rows' glyphs make one line, each row's after the one
+  before it and in the order they are drawn, so it is drawn, hit and
+  measured as any wrapped line, each row from its first glyph at its
+  left edge; `WrappedLineLayout::row_start` says where a row begins in
+  the text, which its first glyph drawn need not. A line of
+  left-to-right text alone is broken as before. A line cut with an
+  ellipsis (`LineWrapper::truncate_wrapped_line`) is cut on the rows it
+  is drawn in, broken in its text's order where it has right-to-left
+  text in it. A line's decoration runs are found for each glyph from
+  the run of the glyph drawn before it, forward or back
+  (`DecorationCursor`), where they were stepped through forward alone
+  and right-to-left text, drawn last letter first, took the run of its
+  first glyph drawn for all of it, a link or a pick in it drawn on none
+  of it. Tests, with a text system that lays out Hebrew right to left
+  as cosmic-text does, of a line of Latin and Hebrew broken at its
+  Hebrew words in their order, and of Latin alone; of a line of Hebrew
+  alone drawn row by row within its width; of a line of Latin and
+  Hebrew clamped with an ellipsis cut on its rows; and of a run in
+  Hebrew drawn on its own glyphs.
 
 ## Tests
 
