@@ -6,7 +6,7 @@ use std::{
     os::fd::{AsRawFd, BorrowedFd},
     path::PathBuf,
     rc::{Rc, Weak},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use ashpd::WindowIdentifier;
@@ -83,11 +83,10 @@ use super::{
 };
 
 use crate::linux::{
-    ComposeEdit, DOUBLE_CLICK_INTERVAL, LinuxClient, LinuxCommon, LinuxKeyboardLayout,
-    PIPE_READ_TIMEOUT, SCROLL_LINES, capslock_from_xkb, compose_key, cursor_style_to_icon_names,
-    end_compose, get_xkb_compose_state, is_within_click_distance, keystroke_from_xkb,
-    modifiers_from_xkb, new_xkb_context, open_uri_internal, read_fd_with_timeout,
-    reveal_path_internal,
+    ComposeEdit, LastPress, LinuxClient, LinuxCommon, LinuxKeyboardLayout, PIPE_READ_TIMEOUT,
+    SCROLL_LINES, capslock_from_xkb, compose_key, continues_click_run, cursor_style_to_icon_names,
+    end_compose, get_xkb_compose_state, keystroke_from_xkb, modifiers_from_xkb, new_xkb_context,
+    open_uri_internal, read_fd_with_timeout, reveal_path_internal,
     wayland::{
         clipboard::{Clipboard, DataOffer, FILE_LIST_MIME_TYPE, TEXT_MIME_TYPES},
         cursor::Cursor,
@@ -404,9 +403,9 @@ fn file_uri_list(paths: &FileDragPaths) -> String {
 }
 
 pub struct ClickState {
-    last_mouse_button: Option<MouseButton>,
-    last_click: Instant,
-    last_location: Point<Pixels>,
+    /// The last press of the run of clicks, by the compositor's time
+    /// (`continues_click_run`).
+    last_press: Option<LastPress>,
     current_count: usize,
 }
 
@@ -932,9 +931,7 @@ impl WaylandClient {
             },
             external_drag: None,
             click: ClickState {
-                last_click: Instant::now(),
-                last_mouse_button: None,
-                last_location: Point::default(),
+                last_press: None,
                 current_count: 0,
             },
             repeat: KeyRepeat {
@@ -2246,9 +2243,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
             }
             wl_pointer::Event::Button {
                 serial,
+                time,
                 button,
                 state: WEnum::Value(button_state),
-                ..
             } => {
                 // Record presses only. Requests referencing this serial (popup grabs,
                 // interactive moves) are declined when given a release serial.
@@ -2290,26 +2287,14 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                                 }
                             }
                         }
-                        let click_elapsed = state.click.last_click.elapsed();
-
-                        if click_elapsed < DOUBLE_CLICK_INTERVAL
-                            && state
-                                .click
-                                .last_mouse_button
-                                .is_some_and(|prev_button| prev_button == button)
-                            && is_within_click_distance(
-                                state.click.last_location,
-                                state.mouse_location.unwrap(),
-                            )
-                        {
+                        let position = state.mouse_location.unwrap();
+                        if continues_click_run(state.click.last_press, time, button, position) {
                             state.click.current_count += 1;
                         } else {
                             state.click.current_count = 1;
                         }
 
-                        state.click.last_click = Instant::now();
-                        state.click.last_mouse_button = Some(button);
-                        state.click.last_location = state.mouse_location.unwrap();
+                        state.click.last_press = Some((time, button, position));
 
                         state.buttons_pressed.press(button);
 

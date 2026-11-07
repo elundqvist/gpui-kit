@@ -853,6 +853,31 @@ pub(super) fn is_within_click_distance(a: Point<Pixels>, b: Point<Pixels>) -> bo
     diff.x.abs() <= DOUBLE_CLICK_DISTANCE && diff.y.abs() <= DOUBLE_CLICK_DISTANCE
 }
 
+/// The last press of a run of clicks: the time the server gave it, in its
+/// milliseconds, its button and where it was.
+#[cfg(any(feature = "wayland", feature = "x11"))]
+pub(super) type LastPress = (u32, gpui::MouseButton, Point<Pixels>);
+
+/// Whether a press at `time`, the server's, goes on the run of clicks
+/// `last` ended: the same button, near it and within the time a double
+/// click is counted in, by the times the server gave the two presses
+/// (elundqvist/kvist#653). By when the client read them, a press read late
+/// behind a long frame began a run of its own, and the third press of a
+/// triple click was a first click. The clock goes round every 49 days.
+#[cfg(any(feature = "wayland", feature = "x11"))]
+pub(super) fn continues_click_run(
+    last: Option<LastPress>,
+    time: u32,
+    button: gpui::MouseButton,
+    position: Point<Pixels>,
+) -> bool {
+    last.is_some_and(|(at, last_button, last_position)| {
+        Duration::from_millis(u64::from(time.wrapping_sub(at))) < DOUBLE_CLICK_INTERVAL
+            && last_button == button
+            && is_within_click_distance(last_position, position)
+    })
+}
+
 #[cfg(any(feature = "wayland", feature = "x11"))]
 pub(super) fn new_xkb_context() -> anyhow::Result<xkb::Context> {
     validate_xkb_context(xkb::Context::new(xkb::CONTEXT_NO_FLAGS))
@@ -1506,6 +1531,25 @@ pub(super) fn compositor_gpu_hint_from_dev_t(dev: u64) -> Option<gpui_wgpu::Comp
 mod tests {
     use super::*;
     use gpui::{Point, px};
+
+    /// A run of clicks is counted by the times the server gave the
+    /// presses, however late they are read (elundqvist/kvist#653).
+    #[cfg(any(feature = "wayland", feature = "x11"))]
+    #[test]
+    fn a_run_of_clicks_goes_by_the_presses_own_times() {
+        use gpui::MouseButton::{Left, Right};
+        let at = Point::new(px(10.), px(10.));
+        let last = Some((1_000, Left, at));
+        assert!(continues_click_run(last, 1_390, Left, at));
+        assert!(!continues_click_run(last, 1_400, Left, at));
+        assert!(!continues_click_run(last, 1_100, Right, at));
+        let away = Point::new(px(20.), px(10.));
+        assert!(!continues_click_run(last, 1_100, Left, away));
+        assert!(!continues_click_run(None, 1_100, Left, at));
+        // the server's clock gone round between the two
+        let late = Some((u32::MAX - 50, Left, at));
+        assert!(continues_click_run(late, 100, Left, at));
+    }
 
     #[cfg(any(feature = "wayland", feature = "x11"))]
     #[test]

@@ -309,6 +309,17 @@ asks (section 4(b)); each says so at its top:
   pressed and let go, a move said no button was held, and gpui-pre's
   window, which counts a press as over at such a move, took the left's
   press to be over. A test of a button let go among others.
+- `src/linux/platform.rs`, `src/linux/x11/client.rs` and
+  `src/linux/wayland/client.rs`: a run of clicks is counted by the times
+  the server gave the presses (`continues_click_run`,
+  elundqvist/kvist#653), where both clients counted it by when they read
+  them: a press read late, behind a frame that took half a second, began
+  a run of its own, and the third press of a triple click on a line of a
+  megabyte came as a first click. A press goes on the run where it is of
+  the same button, near the last press and within the time a double
+  click is counted in after it by the server's clock, which goes round
+  every 49 days. A test of presses within and past that time, of another
+  button, of a press away from the last and of the clock gone round.
 
 ## Trying a drag by hand
 

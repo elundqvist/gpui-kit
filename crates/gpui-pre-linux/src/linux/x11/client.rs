@@ -52,11 +52,11 @@ use super::{
 };
 
 use crate::linux::{
-    ComposeEdit, DEFAULT_CURSOR_ICON_NAME, LinuxClient, capslock_from_xkb, compose_key,
-    cursor_style_to_icon_names, end_compose, get_xkb_compose_state, is_within_click_distance,
+    ComposeEdit, DEFAULT_CURSOR_ICON_NAME, LastPress, LinuxClient, capslock_from_xkb, compose_key,
+    continues_click_run, cursor_style_to_icon_names, end_compose, get_xkb_compose_state,
     keystroke_from_xkb, log_cursor_icon_warning, modifiers_from_xkb, new_xkb_context,
     open_uri_internal,
-    platform::{DOUBLE_CLICK_INTERVAL, SCROLL_LINES},
+    platform::SCROLL_LINES,
     reveal_path_internal,
     xdg_desktop_portal::{Event as XDPEvent, XDPEventSource},
 };
@@ -64,7 +64,7 @@ use crate::linux::{LinuxCommon, LinuxKeyboardLayout, X11Window, modifiers_from_x
 
 use gpui::{
     AnyWindowHandle, Bounds, ClipboardItem, CursorStyle, DisplayId, FileDropEvent, Keystroke,
-    Modifiers, ModifiersChangedEvent, MouseButton, Pixels, PlatformDisplay, PlatformInput,
+    Modifiers, ModifiersChangedEvent, Pixels, PlatformDisplay, PlatformInput,
     PlatformKeyboardLayout, PlatformWindow, Point, RequestFrameOptions, ScrollDelta, Size,
     Task, TouchPhase, WindowButtonLayout, WindowParams, point, px,
 };
@@ -485,9 +485,9 @@ pub struct X11ClientState {
     pub(crate) loop_handle: LoopHandle<'static, X11Client>,
     pub(crate) event_loop: Option<calloop::EventLoop<'static, X11Client>>,
 
-    pub(crate) last_click: Instant,
-    pub(crate) last_mouse_button: Option<MouseButton>,
-    pub(crate) last_location: Point<Pixels>,
+    /// The last press of the run of clicks, by the server's time
+    /// (`continues_click_run`).
+    pub(crate) last_press: Option<LastPress>,
     pub(crate) current_count: usize,
     pub(crate) pinch_scale: f32,
 
@@ -873,9 +873,7 @@ impl X11Client {
             event_loop: Some(event_loop),
             loop_handle: handle,
             common,
-            last_click: Instant::now(),
-            last_mouse_button: None,
-            last_location: Point::new(px(0.0), px(0.0)),
+            last_press: None,
             current_count: 0,
             pinch_scale: 1.0,
             gpu_context: Rc::new(RefCell::new(None)),
@@ -1752,21 +1750,13 @@ impl X11Client {
                 }
                 match button_or_scroll_from_event_detail(event.detail) {
                     Some(ButtonOrScroll::Button(button)) => {
-                        let click_elapsed = state.last_click.elapsed();
-                        if click_elapsed < DOUBLE_CLICK_INTERVAL
-                            && state
-                                .last_mouse_button
-                                .is_some_and(|prev_button| prev_button == button)
-                            && is_within_click_distance(state.last_location, position)
-                        {
+                        if continues_click_run(state.last_press, event.time, button, position) {
                             state.current_count += 1;
                         } else {
                             state.current_count = 1;
                         }
 
-                        state.last_click = Instant::now();
-                        state.last_mouse_button = Some(button);
-                        state.last_location = position;
+                        state.last_press = Some((event.time, button, position));
                         let current_count = state.current_count;
 
                         drop(state);
