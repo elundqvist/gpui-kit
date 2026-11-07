@@ -1733,6 +1733,8 @@ pub(super) struct PrepaintState {
     line_numbers: Option<Vec<SmallVec<[ShapedLine; 1]>>>,
     /// Size of the scrollable area by entire lines.
     scroll_size: Size<Pixels>,
+    /// The widest line seen in view, for [`InputBaseState::widest_line`].
+    widest_line: Option<(gpui::Font, Pixels, Pixels)>,
     cursor_bounds: Option<Bounds<Pixels>>,
     cursor_scroll_offset: Point<Pixels>,
     /// row index (zero based), no wrap, same line as the cursor.
@@ -2053,6 +2055,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
         );
 
         let mut longest_line_width = wrap_width.unwrap_or(px(0.));
+        let mut widest_line = None;
         // 1. Single line
         // 2. Multi-line with soft wrap disabled.
         if state.is_single_line() || !state.soft_wrap {
@@ -2074,6 +2077,26 @@ impl<M: InputModeKind> Element for TextElement<M> {
                     wrap_width,
                 )
                 .width;
+            // and, in an editor, no narrower than the widest line seen in
+            // view: the longest by bytes is not the widest where glyphs differ
+            // in width
+            if !state.is_single_line() {
+                let in_view = lines
+                    .iter()
+                    .map(|line| line.longest_width)
+                    .max()
+                    .unwrap_or_default();
+                let font = style.font();
+                let seen = match &state.widest_line {
+                    Some((seen_font, size, width)) if *seen_font == font && *size == text_size => {
+                        *width
+                    }
+                    _ => px(0.),
+                };
+                let width = seen.max(in_view);
+                longest_line_width = longest_line_width.max(width);
+                widest_line = Some((font, text_size, width));
+            }
         }
         last_layout.lines = Rc::new(lines);
 
@@ -2282,6 +2305,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             bounds,
             last_layout,
             scroll_size,
+            widest_line,
             line_numbers,
             cursor_bounds,
             cursor_scroll_offset,
@@ -2647,6 +2671,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
                 state.painted_selection = painted_selection;
             }
             state.scroll_size = prepaint.scroll_size;
+            state.widest_line = prepaint.widest_line.take();
             state.fold_placeholders = fold_placeholders;
             // the scroll the frame applied is told above, by `bounds`, whose
             // origin carries it (`layout_cursor`): the scrollbar's prepaint,

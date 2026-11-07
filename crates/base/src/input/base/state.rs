@@ -693,6 +693,14 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(crate) deferred_scroll_follows_caret: bool,
     /// The size of the scrollable content.
     pub(crate) scroll_size: gpui::Size<Pixels>,
+    /// The widest line a multi-line editor without soft wrap laid out in
+    /// view since the text was put in, with the font and text size it was
+    /// laid out in: what its sideways scroll reaches at least, as VS Code
+    /// keeps it. The longest line by bytes alone stopped it short of a
+    /// line of fewer but wider glyphs (elundqvist/kvist#647). A single line
+    /// is always in view and takes its own width, which shrinks as it is
+    /// cut.
+    pub(super) widest_line: Option<(gpui::Font, Pixels, Pixels)>,
     pub(super) editor_scrollbar_snapshot: Cell<Option<EditorScrollbarSnapshot>>,
     /// Where the caret is painted in the frame being drawn: set as the text
     /// is laid out. See [`Self::painted_caret`].
@@ -1090,6 +1098,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             last_cursor: None,
             scroll_handle: ScrollHandle::new(),
             scroll_size: gpui::size(px(0.), px(0.)),
+            widest_line: None,
             editor_scrollbar_snapshot: Cell::new(None),
             painted_caret: Cell::new(None),
             fold_placeholders: Vec::new(),
@@ -1491,6 +1500,8 @@ impl<M: InputModeKind> InputBaseState<M> {
         // override the cursor-follow scroll for the next painted frame to keep
         // the start visible; the deferred offset is consumed during that paint.
         self.scroll_handle.set_offset(point(px(0.), px(0.)));
+        // the text is another: its lines are measured afresh
+        self.widest_line = None;
         if self.is_single_line() {
             self.deferred_scroll_offset = Some(point(px(0.), px(0.)));
             self.deferred_scroll_follows_caret = false;
@@ -5518,6 +5529,107 @@ mod tests {
         });
         cx.run_until_parked();
         cx.update(|_, cx| input.read_with(cx, |state, _| assert_caret_in_view(state, "a word deleted")));
+    }
+
+    /// A single line cut from its end keeps its end at the field's right
+    /// edge: its scroll is its own width, which shrinks as it is cut, where
+    /// it kept the widest the line had been, and the caret, followed to the
+    /// field's left edge, hid what was left of the text to its left
+    /// (elundqvist/kvist#647).
+    #[gpui::test]
+    fn a_single_line_cut_from_its_end_keeps_its_end_at_the_right_edge(cx: &mut TestAppContext) {
+        let view = InputView::build(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("x".repeat(1000), window, cx)
+            })
+        });
+        let draw = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.update(|window, cx| _ = window.draw(cx));
+        };
+        let backspace = |cx: &mut VisualTestContext, times: usize| {
+            cx.update(|window, cx| {
+                input.update(cx, |state, cx| {
+                    for _ in 0..times {
+                        state.backspace(&Backspace, window, cx);
+                    }
+                })
+            });
+        };
+        draw(&mut cx);
+        backspace(&mut cx, 1);
+        draw(&mut cx);
+        let whole = cx.update(|_, cx| input.read_with(cx, |state, _| state.scroll_size.width));
+
+        backspace(&mut cx, 599);
+        draw(&mut cx);
+        draw(&mut cx);
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                let (scroll, field) = (state.scroll_size.width, state.input_bounds.size.width);
+                assert!(scroll > field, "the line still overflows the field");
+                assert!(scroll < whole * 0.5, "{scroll:?} as wide as {whole:?}");
+                let offset = state.scroll_handle.offset().x;
+                assert!(
+                    offset >= field - scroll - px(1.),
+                    "its end {:?} short of the right edge {field:?}",
+                    scroll + offset
+                );
+            })
+        });
+    }
+
+    /// The sideways scroll reaches the end of the widest line in view,
+    /// and stays as wide as it once it is scrolled out of view, where it
+    /// stopped at the width of the longest line by bytes: a line of fewer
+    /// but wider glyphs was cut at End (elundqvist/kvist#647). The test's
+    /// glyphs are all one wide, so the line of more glyphs is the wider.
+    #[gpui::test]
+    fn the_sideways_scroll_reaches_the_widest_line_in_view(cx: &mut TestAppContext) {
+        let view = InputView::<EditorMode>::build_editor(cx, |state| state.soft_wrap(false));
+        let mut cx = VisualTestContext::from_window(view.window_handle.into(), cx);
+        let input = view.input;
+        let (narrow, wide) = ("\u{fdfd}".repeat(100), "x".repeat(200));
+        let below = "\n".repeat(200);
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(format!("{narrow}\n{wide}{below}end"), window, cx)
+            })
+        });
+        let draw = |cx: &mut VisualTestContext| {
+            cx.run_until_parked();
+            cx.update(|window, cx| _ = window.draw(cx));
+        };
+        draw(&mut cx);
+        let (scroll, wide_width) = cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                let layout = state.last_layout.as_ref().unwrap();
+                (state.scroll_size.width, layout.lines[1].longest_width)
+            })
+        });
+        assert!(scroll >= wide_width, "{scroll:?} short of {wide_width:?}");
+
+        // the wide line scrolled out of view up: the scroll keeps its width
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.move_to_end(&MoveToEnd, window, cx);
+            })
+        });
+        draw(&mut cx);
+        let (scroll, first_in_view) = cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                let layout = state.last_layout.as_ref().unwrap();
+                (state.scroll_size.width, layout.visible_buffer_lines[0])
+            })
+        });
+        assert!(first_in_view > 1, "the wide line is still in view");
+        assert!(
+            scroll >= wide_width,
+            "{scroll:?} short of {wide_width:?} out of view"
+        );
     }
 
     /// A problem's popover shows over its text, and not in the room below
