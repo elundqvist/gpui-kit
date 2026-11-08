@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre 0.3.3 as published to crates.io: FORK.md at the
+// crate's root lists the changes.
 use std::{
     collections::BinaryHeap,
     sync::Arc,
@@ -716,5 +718,46 @@ mod tests {
 
         assert!(fired.load(Ordering::SeqCst));
         assert_eq!(dispatcher.cancel_pending_timers(), 0);
+    }
+
+    /// A timer ends on time with every thread of the pool held: it took a
+    /// thread of the pool to be awaited, and ended only as the pool let go,
+    /// a second late here (elundqvist/kvist#638).
+    #[test]
+    fn a_timer_ends_on_time_with_the_pool_held() {
+        let dispatcher = Arc::new(ThreadedDispatcher::new());
+        let background = BackgroundExecutor::new(dispatcher);
+        let threads =
+            thread::available_parallelism().map_or(MIN_THREADS, |i| i.get().max(MIN_THREADS));
+        let held = Arc::new(AtomicUsize::new(0));
+        let go = Arc::new((Mutex::new(false), Condvar::new()));
+        for _ in 0..threads {
+            let (held, go) = (held.clone(), go.clone());
+            background
+                .spawn(async move {
+                    held.fetch_add(1, Ordering::SeqCst);
+                    let (gone, wake) = &*go;
+                    let mut gone = gone.lock();
+                    while !*gone {
+                        wake.wait(&mut gone);
+                    }
+                })
+                .detach();
+        }
+        while held.load(Ordering::SeqCst) < threads {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let start = Instant::now();
+        let timer = background.timer(Duration::from_millis(20));
+        let waiter = thread::spawn(move || {
+            futures::executor::block_on(timer);
+            start.elapsed()
+        });
+        thread::sleep(Duration::from_secs(1));
+        *go.0.lock() = true;
+        go.1.notify_all();
+        let ended = waiter.join().unwrap();
+        assert!(ended < Duration::from_millis(500), "{ended:?}");
     }
 }

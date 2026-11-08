@@ -394,6 +394,21 @@ asks (section 4(b)); each says so at its top:
   alone drawn row by row within its width; of a line of Latin and
   Hebrew clamped with an ellipsis cut on its rows; and of a run in
   Hebrew drawn on its own glyphs.
+- `src/executor.rs` and `src/platform/threaded_dispatcher.rs`:
+  `BackgroundExecutor::timer` takes no thread of the pool
+  (elundqvist/kvist#638): the timer, which the platform fires on a
+  thread of its own (gpui-pre-linux's `LinuxDispatcher`'s timer thread,
+  which its X11 and Wayland clients share, the threaded dispatcher's,
+  GCD on macOS), is polled where it is woken, as it fires, and its task
+  ends there. Spawned on the pool to be awaited, a timer ended only once a
+  thread of the pool was free: with every thread held, a 20 ms timer
+  ended when they let go, 1.0 s later, where it now ends in 20 ms.
+  Kvist holds threads of the pool while it waits on a language server,
+  and every one of its timers, a hover's delay, a typing pause, a
+  caret's blink, waited with them. Under the test dispatcher a timer is
+  still a task of the scheduler, whose clock drives it. A test, with
+  the threaded dispatcher, of a timer with every thread of the pool
+  held.
 
 ## Tests
 

@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre 0.3.3 as published to crates.io: FORK.md at the
+// crate's root lists the changes.
 use crate::{App, PlatformDispatcher, PlatformScheduler};
 #[cfg(not(target_family = "wasm"))]
 use futures::channel::mpsc;
@@ -191,14 +193,38 @@ impl BackgroundExecutor {
     }
 
     /// Returns a task that will complete after the given duration.
-    /// Depending on other concurrent tasks the elapsed duration may be longer
-    /// than requested.
+    ///
+    /// It takes no thread of the pool: the platform's timer ends it on the
+    /// thread the timer fires on (elundqvist/kvist#638). Spawned on the pool
+    /// to be awaited, a timer ended only once a thread of the pool was free,
+    /// and with every thread held, a 20 ms timer ended when they let go, a
+    /// second later in its test. Under the test dispatcher it is still a
+    /// task of the scheduler, whose clock drives it.
     #[track_caller]
     pub fn timer(&self, duration: Duration) -> Task<()> {
         if duration.is_zero() {
             return Task::ready(());
         }
-        self.spawn(self.inner.scheduler().timer(duration))
+        let timer = self.inner.scheduler().timer(duration);
+        #[cfg(any(test, feature = "test-support"))]
+        if self.dispatcher.as_test().is_some() {
+            return self.spawn(timer);
+        }
+        // polled where it is woken, the timer's thread as it fires: a poll
+        // of a timer that has fired only reads that it has
+        let (runnable, task) = async_task::Builder::new()
+            .metadata(crate::RunnableMeta {
+                location: core::panic::Location::caller(),
+                spawned: scheduler::SpawnTime(Instant::now()),
+            })
+            .spawn(
+                move |_| timer,
+                |runnable: async_task::Runnable<crate::RunnableMeta>| {
+                    runnable.run();
+                },
+            );
+        runnable.schedule();
+        Task::from_async_task(task)
     }
 
     /// In tests, run an arbitrary number of tasks (determined by the SEED environment variable)
