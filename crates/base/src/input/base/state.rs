@@ -733,6 +733,8 @@ pub struct InputBaseState<M: InputModeKind> {
 
     /// Diagnostic currently requested by pointer hover; applications render it.
     pub(super) diagnostic_popover: Option<Rc<crate::input::DiagnosticEntry>>,
+    /// The pointer's way to the problem's popover (elundqvist/kvist#666).
+    pub(crate) problem_approach: crate::input::lsp::Approach,
 
     context_menu_handler: Option<
         Rc<
@@ -1113,6 +1115,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             editor_style: InputEditorStyle::default(),
             projected_editor_style: InputEditorStyle::default(),
             diagnostic_popover: None,
+            problem_approach: Default::default(),
             context_menu_handler: None,
             context_menu_shown: false,
             pending_context_menu: None,
@@ -2355,6 +2358,14 @@ impl<M: InputModeKind> InputBaseState<M> {
         // the same rectangle as painted, without the offset.
         let within_bounds = self.input_bounds.contains(&event.position);
 
+        // On its way to a popover shown the pointer leaves it up, and what it
+        // crosses on the way shows nothing, as VS Code's hover has it
+        // (elundqvist/kvist#666): text with no problem or a line's end took
+        // the popover away before the pointer reached it
+        let to_problem =
+            self.diagnostic_popover.is_some() && self.problem_approach.heading_for(event.position);
+        let to_hover = M::heading_for_hover(self, event.position);
+
         // Over the text, or no hover: the room below the last line is over
         // none, where it took the last line's end and showed its problem, and
         // so is the room past a row's end (elundqvist/kvist#656)
@@ -2363,27 +2374,52 @@ impl<M: InputModeKind> InputBaseState<M> {
             .flatten();
         let Some((offset, _)) = over_text else {
             // Clear hover when mouse leaves the input
-            M::clear_hover_state(self, cx);
-            if self.diagnostic_popover.take().is_some() {
+            if !to_hover {
+                M::clear_hover_state(self, cx);
+            }
+            if !to_problem && self.diagnostic_popover.take().is_some() {
                 cx.notify();
             }
             return;
         };
 
-        // Show diagnostic popover on mouse move
-        M::on_mouse_move(self, offset, event, window, cx);
-
-        if self.is_code_editor() {
-            if let Some(diagnostic) = self
-                .mode
-                .diagnostics()
-                .and_then(|set| set.for_offset(offset))
-            {
-                self.diagnostic_popover = Some(Rc::new(diagnostic.clone()));
-                cx.notify();
-            } else {
-                self.diagnostic_popover = None;
+        // what is under the pointer, and whether it is the problem shown
+        let under = self
+            .is_code_editor()
+            .then(|| {
+                self.mode
+                    .diagnostics()
+                    .and_then(|set| set.for_offset(offset))
+                    .cloned()
+            })
+            .flatten();
+        let same = self
+            .diagnostic_popover
+            .as_ref()
+            .is_some_and(|shown| under.as_ref().map(|under| &under.range) == Some(&shown.range));
+        // on its way to either popover, neither a word's hover nor a problem's popover
+        // shows for what it crosses, and a hover asked for before is not shown: a word
+        // crossed on the way to a problem's popover opened its hover over it
+        let heading = to_hover || (to_problem && !same);
+        if heading {
+            M::cancel_hover(self);
+        }
+        // the hover follows the pointer, and so does Ctrl's link
+        if !heading || event.modifiers.secondary() {
+            M::on_mouse_move(self, offset, event, window, cx);
+        }
+        if heading || !self.is_code_editor() {
+            return;
+        }
+        if let Some(diagnostic) = under {
+            // shown anew, the way to it starts again
+            if !same {
+                self.problem_approach = Default::default();
             }
+            self.diagnostic_popover = Some(Rc::new(diagnostic));
+            cx.notify();
+        } else {
+            self.diagnostic_popover = None;
         }
     }
 

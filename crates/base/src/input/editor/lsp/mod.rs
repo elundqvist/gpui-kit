@@ -5,6 +5,7 @@ use std::rc::Rc;
 
 use crate::input::{EditorMode, InputBaseState, RopeExt};
 
+mod approach;
 mod code_actions;
 mod completions;
 mod definitions;
@@ -13,6 +14,8 @@ mod hover;
 mod overlay;
 mod semantic_tokens;
 
+pub(crate) use approach::Approach;
+pub use approach::PopoverKind;
 pub use code_actions::*;
 pub use completions::*;
 pub use definitions::*;

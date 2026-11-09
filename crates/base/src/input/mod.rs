@@ -84,7 +84,7 @@ pub use lsp::{
     CodeActionItem, CodeActionMenuState, CodeActionProvider, CompletionMenuOptions,
     CompletionMenuState, CompletionProvider, DefinitionProvider, DocumentColorProvider,
     DocumentRangeSemanticTokensProvider, HoverPopoverState, HoverProvider, InputOverlayKind, Lsp,
-    ShowDocumentHandler,
+    PopoverKind, ShowDocumentHandler,
 };
 pub use lsp_types::Position;
 pub use mask_pattern::MaskPattern;

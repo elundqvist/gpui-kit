@@ -156,6 +156,44 @@ impl InputBaseState<EditorMode> {
         }
     }
 
+    /// The popover of `kind` drawn at `bounds`, over what shows it,
+    /// `trigger`: the pointer on its way to it leaves it up
+    /// (elundqvist/kvist#666).
+    pub fn popover_drawn(
+        &mut self,
+        kind: super::PopoverKind,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        trigger: gpui::Bounds<gpui::Pixels>,
+    ) {
+        self.approach(kind).drawn_at(bounds, trigger);
+    }
+
+    /// Whether the pointer at `at` is on its way to the popover of `kind`,
+    /// which it then leaves up: no further from it than the nearest it has
+    /// come, give or take 4 px, as VS Code's hover has it.
+    pub fn heading_for_popover(
+        &mut self,
+        kind: super::PopoverKind,
+        at: gpui::Point<gpui::Pixels>,
+    ) -> bool {
+        self.approach(kind).heading_for(at)
+    }
+
+    /// Put away the popover of `kind`.
+    pub fn dismiss_popover(&mut self, kind: super::PopoverKind, cx: &mut Context<Self>) {
+        match kind {
+            super::PopoverKind::Hover => self.clear_hover_state(cx),
+            super::PopoverKind::Problem => self.clear_diagnostic_popover(cx),
+        }
+    }
+
+    fn approach(&mut self, kind: super::PopoverKind) -> &mut super::Approach {
+        match kind {
+            super::PopoverKind::Hover => &mut self.extras.hover_approach,
+            super::PopoverKind::Problem => &mut self.problem_approach,
+        }
+    }
+
     pub fn route_overlay_action(
         &mut self,
         action: Box<dyn gpui::Action>,

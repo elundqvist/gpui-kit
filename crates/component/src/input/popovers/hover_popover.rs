@@ -10,7 +10,7 @@ use gpui::{
 use crate::{
     StyledExt, ThemeStyled as _,
     input::{
-        EditorState,
+        EditorState, PopoverKind,
         popovers::{plain_text_as_markdown, render_markdown},
     },
 };
@@ -91,9 +91,10 @@ pub(crate) struct Popover {
     range: Range<usize>,
     width_limit: Range<Pixels>,
     content_builder: Box<dyn Fn(&mut Window, &mut App) -> AnyElement>,
-    /// What puts this popover away as the pointer leaves it and its range,
-    /// or a press lands outside it.
-    dismiss: fn(&mut EditorState, &mut gpui::Context<EditorState>),
+    /// Which of the editor's popovers this is: what puts it away as the
+    /// pointer leaves it and its range, or a press lands outside it, and
+    /// what keeps it up while the pointer is on its way to it.
+    kind: PopoverKind,
 }
 
 impl Styled for Popover {
@@ -120,18 +121,15 @@ impl Popover {
             style: StyleRefinement::default(),
             width_limit: px(200.)..px(500.),
             content_builder: Box::new(move |window, cx| (f)(window, cx).into_any_element()),
-            dismiss: EditorState::clear_hover_state,
+            kind: PopoverKind::Hover,
         }
     }
 
-    /// Put away with `dismiss` instead of the hover's own: a problem's
-    /// popover was left up by the hover's, the pointer gone from the editor
-    /// (elundqvist/kvist#656).
-    pub fn dismiss_with(
-        mut self,
-        dismiss: fn(&mut EditorState, &mut gpui::Context<EditorState>),
-    ) -> Self {
-        self.dismiss = dismiss;
+    /// A problem's popover, put away as one and not by the hover's
+    /// dismissal, which left it up once the pointer had gone from the
+    /// editor (elundqvist/kvist#656).
+    pub fn problem(mut self) -> Self {
+        self.kind = PopoverKind::Problem;
         self
     }
 
@@ -257,7 +255,13 @@ impl Element for Popover {
 
         window.with_absolute_element_offset(bounds.origin, |window| {
             popover.prepaint(window, cx);
-        })
+        });
+
+        // where the pointer heads for, on its way from the range
+        let trigger = self.trigger_bounds(cx).unwrap_or(bounds);
+        let kind = self.kind;
+        self.editor
+            .update(cx, |editor, _| editor.popover_drawn(kind, bounds, trigger));
     }
 
     fn paint(
@@ -277,22 +281,28 @@ impl Element for Popover {
 
         popover.paint(window, cx);
 
-        let (editor, dismiss) = (self.editor.clone(), self.dismiss);
+        let (editor, kind) = (self.editor.clone(), self.kind);
         // Mouse down out to hide.
         window.on_mouse_event(move |event: &MouseDownEvent, _, _, cx| {
             if !bounds.contains(&event.position) {
-                let _ = editor.update(cx, dismiss);
+                editor.update(cx, |editor, cx| editor.dismiss_popover(kind, cx));
             }
         });
 
-        // Mouse out of trigger + popover bounds
+        // Mouse out of trigger + popover bounds, and not on its way to the
+        // popover (elundqvist/kvist#666)
         let editor = self.editor.clone();
         let trigger_bounds = self.trigger_bounds(cx).unwrap_or(bounds);
         let keep_open_region = trigger_bounds.union(&bounds);
         window.on_mouse_event(move |event: &MouseMoveEvent, _, _, cx| {
-            if !keep_open_region.contains(&event.position) {
-                let _ = editor.update(cx, dismiss);
+            if keep_open_region.contains(&event.position) {
+                return;
             }
+            editor.update(cx, |editor, cx| {
+                if !editor.heading_for_popover(kind, event.position) {
+                    editor.dismiss_popover(kind, cx);
+                }
+            });
         });
 
         // and out of the window, which sends no move: the popover stayed up
@@ -300,7 +310,7 @@ impl Element for Popover {
         // (elundqvist/kvist#656)
         let editor = self.editor.clone();
         window.on_mouse_event(move |_: &MouseExitEvent, _, _, cx| {
-            let _ = editor.update(cx, dismiss);
+            editor.update(cx, |editor, cx| editor.dismiss_popover(kind, cx));
         })
     }
 }

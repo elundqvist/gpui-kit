@@ -131,6 +131,14 @@ impl InputModeKind for EditorMode {
         state.handle_hover_definition(offset, window, cx);
     }
 
+    fn heading_for_hover(state: &mut InputBaseState<Self>, at: gpui::Point<gpui::Pixels>) -> bool {
+        state.extras.hover_popover.is_some() && state.extras.hover_approach.heading_for(at)
+    }
+
+    fn cancel_hover(state: &mut InputBaseState<Self>) {
+        state.extras.lsp._hover_task = gpui::Task::ready(Ok(()));
+    }
+
     fn on_mouse_move(
         state: &mut InputBaseState<Self>,
         offset: usize,

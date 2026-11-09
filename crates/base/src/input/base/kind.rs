@@ -289,6 +289,19 @@ pub trait InputModeKind: sealed::Sealed + Sized + 'static {
     ) {
     }
 
+    /// Whether the pointer at `at` is on its way to the hover popover
+    /// shown, which it leaves up (`Approach`).
+    fn heading_for_hover(
+        _state: &mut InputBaseState<Self>,
+        _at: gpui::Point<gpui::Pixels>,
+    ) -> bool {
+        false
+    }
+
+    /// Drops a hover asked for and not yet shown: the pointer is on its way to a popover,
+    /// and what it crosses shows nothing.
+    fn cancel_hover(_state: &mut InputBaseState<Self>) {}
+
     /// Reacts to the pointer moving, for the hover popover.
     fn on_mouse_move(
         _state: &mut InputBaseState<Self>,
@@ -334,6 +347,8 @@ pub struct EditorExtras {
     pub(crate) inline_completion: InlineCompletion,
     pub(crate) context_menu_content: ContextMenuContent,
     pub(crate) hover_popover: Option<HoverPopoverState>,
+    /// The pointer's way to the hover popover (elundqvist/kvist#666).
+    pub(crate) hover_approach: crate::input::lsp::Approach,
     pub(crate) hover_definition: HoverDefinition,
     pub(crate) context_menu_task: Task<anyhow::Result<()>>,
 }
@@ -346,6 +361,7 @@ impl Default for EditorExtras {
             inline_completion: InlineCompletion::default(),
             context_menu_content: ContextMenuContent::default(),
             hover_popover: None,
+            hover_approach: Default::default(),
             hover_definition: HoverDefinition::default(),
             context_menu_task: Task::ready(Ok(())),
         }

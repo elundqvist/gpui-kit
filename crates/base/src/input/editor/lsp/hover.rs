@@ -65,6 +65,16 @@ impl InputBaseState<EditorMode> {
                             let end = editor.text.position_to_offset(&range.end);
                             symbol_range = start..end;
                         }
+                        // shown anew, the way to it starts again
+                        if editor
+                            .extras
+                            .hover_popover
+                            .as_ref()
+                            .map(|shown| &shown.symbol_range)
+                            != Some(&symbol_range)
+                        {
+                            editor.extras.hover_approach = Default::default();
+                        }
                         editor.extras.hover_popover = Some(HoverPopoverState {
                             symbol_range,
                             hover,
