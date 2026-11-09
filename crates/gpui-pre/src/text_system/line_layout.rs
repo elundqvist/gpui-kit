@@ -34,6 +34,17 @@ pub struct LineLayout {
     /// Where its clusters are drawn, where some are drawn right to left: found the first
     /// time a caret or a click in it asks. A line laid out takes `Default::default()`.
     pub drawn: DrawnOrder,
+    /// The bidi levels of the line's text above its paragraph's, as UAX #9 resolves them,
+    /// each stretch of its indices with its level, in their order; the rest is at the
+    /// paragraph's level (`paragraph_right_to_left`). Text at an odd level goes right to left,
+    /// which tells which way each cluster goes, and a caret between two levels stands by the
+    /// lower (`x_for_index`, elundqvist/kvist#681). Found as the line is laid out, where the
+    /// text system does not say. `None` in a line made by hand, and the order its clusters
+    /// are drawn in tells which way they go.
+    pub levels: Option<Vec<(Range<usize>, u8)>>,
+    /// Whether the paragraph the line is laid out as, or is a row of, is read right to left,
+    /// at level 1, where `levels` says.
+    pub paragraph_right_to_left: bool,
 }
 
 /// A run of text that has been shaped .
@@ -139,8 +150,8 @@ impl LineLayout {
         self.len
     }
 
-    /// `closest_index_for_x` among the boundaries of the text in `range`, its end taken as
-    /// the end of that text (`end_x_for_index`): the row of a wrapped line that `range` is,
+    /// `closest_index_for_x` among the boundaries of the text in `range`, its ends taken as
+    /// the ends of that text (`x_for_index_in`): the row of a wrapped line that `range` is,
     /// whose end is not where the next row's start is drawn where it is read right to left.
     pub(crate) fn closest_index_in(&self, x: Pixels, range: Range<usize>) -> usize {
         match self.drawn() {
@@ -159,13 +170,26 @@ impl LineLayout {
     /// it is drawn right to left. Digits in Hebrew are drawn left to right, each to the
     /// right of the one before, and a lone letter among letters drawn the other way is
     /// taken to be drawn as they are.
+    ///
+    /// Where the line says its text's levels (`levels`), a caret between text at two levels
+    /// stands at the edge of the text at the lower, the line's ends at its paragraph's, as the
+    /// primary caret of macOS's text views stands where text typed in the paragraph's
+    /// direction goes: in `abc ש def` the
+    /// caret before `ש` stands at its left edge, after `abc `, and the one after it at its
+    /// right edge, before ` def`; at the start of a word of Hebrew after Latin at the word's
+    /// left end, and at the end of `abc שלום` at the line's right end; in `abc שלום 123`,
+    /// drawn `abc 123 םולש`, the one before the digits after the space before them, right of
+    /// `123`. Each gap between two clusters has a caret of its own: with every
+    /// caret at the edge of the cluster after it, the start and the end of a word of Hebrew
+    /// among Latin, and the two sides of a lone letter, stood at their right end, nothing
+    /// stood at their left, a click there went past them, a letter typed after the Latin was
+    /// drawn left of the caret and a click right of a line that ends in Hebrew went to the
+    /// Hebrew's start (elundqvist/kvist#681).
     pub fn x_for_index(&self, index: usize) -> Pixels {
         if let Some(drawn) = self.drawn() {
+            let rows = 0..drawn.clusters.len();
             let c = drawn.clusters.partition_point(|cluster| cluster.start < index);
-            return match drawn.clusters.get(c) {
-                Some(cluster) => cluster.caret(),
-                None => drawn.clusters.last().map_or(self.width, Cluster::caret_after),
-            };
+            return drawn.caret_at(c, rows.clone(), drawn.extent(rows));
         }
         for run in &self.runs {
             for glyph in &run.glyphs {
@@ -177,17 +201,19 @@ impl LineLayout {
         self.width
     }
 
-    /// Where a caret at `index` stands as the end of the text before it: at the far end of
-    /// the cluster before it as it is read, where `x_for_index` has the caret at a line's
-    /// end. At the end of a row of a wrapped line that is the row's own end, where
-    /// `x_for_index` has the start of the row after it.
-    pub fn end_x_for_index(&self, index: usize) -> Pixels {
+    /// `x_for_index` in the text in `range`, the row of a wrapped line it is, its ends the
+    /// row's: at the row's end that is where its own text ends, where `x_for_index` has the
+    /// start of the row after it, and at the row's start, the text before it on the row
+    /// before, it is not the text a caret there stands beside (elundqvist/kvist#669).
+    pub(crate) fn x_for_index_in(&self, index: usize, range: Range<usize>) -> Pixels {
         match self.drawn() {
             Some(drawn) => {
-                match drawn.clusters.partition_point(|cluster| cluster.start < index) {
-                    0 => self.x_for_index(index),
-                    c => drawn.clusters[c - 1].caret_after(),
-                }
+                let rows = drawn.clusters_in(range);
+                let c = drawn
+                    .clusters
+                    .partition_point(|cluster| cluster.start < index)
+                    .clamp(rows.start, rows.end);
+                drawn.caret_at(c, rows.clone(), drawn.extent(rows))
             }
             None => self.x_for_index(index),
         }
@@ -243,6 +269,37 @@ impl LineLayout {
         None
     }
 
+    /// The levels of the text of `range` (`levels`), its indices from the range's start.
+    pub(crate) fn levels_within(&self, range: Range<usize>) -> Option<Vec<(Range<usize>, u8)>> {
+        Some(
+            self.levels
+                .as_ref()?
+                .iter()
+                .filter_map(|(r, level)| {
+                    let (start, end) = (r.start.max(range.start), r.end.min(range.end));
+                    (start < end).then(|| (start - range.start..end - range.start, *level))
+                })
+                .collect(),
+        )
+    }
+
+    /// Takes in the levels of the text of `line`, put after this one's at `start`: none said
+    /// where either does not say.
+    fn join_levels(&mut self, line: &LineLayout, start: usize) {
+        match (&mut self.levels, &line.levels) {
+            (Some(levels), Some(more)) => {
+                for (r, level) in more {
+                    let r = r.start + start..r.end + start;
+                    match levels.last_mut() {
+                        Some((last, was)) if last.end == r.start && was == level => last.end = r.end,
+                        _ => levels.push((r, *level)),
+                    }
+                }
+            }
+            (said, _) => *said = None,
+        }
+    }
+
     /// Split this layout at a byte index, returning `(prefix, suffix)`.
     ///
     /// - `prefix` contains glyphs for bytes `[0, byte_index)` with original positions.
@@ -292,6 +349,8 @@ impl LineLayout {
             runs: left_runs,
             len: byte_index,
             drawn: Default::default(),
+            levels: self.levels_within(0..byte_index),
+            paragraph_right_to_left: self.paragraph_right_to_left,
         };
 
         let right = LineLayout {
@@ -302,6 +361,8 @@ impl LineLayout {
             runs: right_runs,
             len: self.len - byte_index,
             drawn: Default::default(),
+            levels: self.levels_within(byte_index..self.len),
+            paragraph_right_to_left: self.paragraph_right_to_left,
         };
 
         (left, right)
@@ -467,6 +528,99 @@ fn wrap_points<B: Copy + Ord>(
     boundaries
 }
 
+/// Whether the text system lays `text` out left to right as a paragraph: where its first
+/// strong letter is not of a right-to-left script, as UAX #9 has it, and, but in CoreText, where
+/// it has a left-to-right letter in it whatever its first (elundqvist/kvist#587, gpui-pre-wgpu's
+/// `starts_right_to_left`).
+pub(crate) fn laid_out_left_to_right(text: &str) -> bool {
+    use unicode_bidi::{BidiClass, Direction, bidi_class, get_base_direction};
+    get_base_direction(text) != Direction::Rtl
+        || (!cfg!(target_os = "macos") && text.chars().any(|c| bidi_class(c) == BidiClass::L))
+}
+
+/// The levels of the text of `text` above its paragraph's, in a paragraph laid out left to
+/// right where `left_to_right`, as UAX #9 resolves them with its line's trailing spaces put
+/// at the paragraph's (`LineLayout::levels`): nothing in a paragraph laid out left to right
+/// where it has no right-to-left letter or embedding.
+fn levels_of(text: &str, left_to_right: bool) -> Vec<(Range<usize>, u8)> {
+    use unicode_bidi::{BidiInfo, Level};
+    let mut ranges: Vec<(Range<usize>, u8)> = Vec::new();
+    if left_to_right && !may_go_right_to_left(text) {
+        return ranges;
+    }
+    let base = if left_to_right { Level::ltr() } else { Level::rtl() };
+    let info = BidiInfo::new(text, Some(base));
+    for paragraph in &info.paragraphs {
+        let levels = info.reordered_levels(paragraph, paragraph.range.clone());
+        for (at, c) in text[paragraph.range.clone()].char_indices() {
+            let at = paragraph.range.start + at;
+            let Some(level) = levels.get(at).filter(|level| **level > base) else {
+                continue;
+            };
+            match ranges.last_mut() {
+                Some((last, was)) if last.end == at && *was == level.number() => {
+                    last.end = at + c.len_utf8()
+                }
+                _ => ranges.push((at..at + c.len_utf8(), level.number())),
+            }
+        }
+    }
+    ranges
+}
+
+/// Whether `text` has a right-to-left letter or embedding in it, without which all of it
+/// goes left to right whatever its paragraph's direction.
+fn may_go_right_to_left(text: &str) -> bool {
+    use unicode_bidi::{BidiClass, bidi_class};
+    !text.is_ascii()
+        && text.chars().any(|c| {
+            matches!(
+                bidi_class(c),
+                BidiClass::R | BidiClass::AL | BidiClass::RLE | BidiClass::RLO | BidiClass::RLI
+            )
+        })
+}
+
+/// Leaves out of `layout`, a line shaped after a direction mark of `shift` bytes, the mark's
+/// glyph, and puts the rest back at their own indices, the line drawn from its left edge and
+/// as wide as its own glyphs: the mark stands at the line's left end where it is laid out
+/// `left_to_right`, else at its right. A glyph the shaper merged the mark into, as it may
+/// where it hides the mark and its font has no glyph to show it as, is the first letter's.
+fn leave_out_mark(layout: &mut LineLayout, shift: usize, left_to_right: bool) {
+    fn glyphs(layout: &LineLayout) -> impl Iterator<Item = &ShapedGlyph> {
+        layout.runs.iter().flat_map(|run| &run.glyphs)
+    }
+    let merged = !glyphs(layout).any(|glyph| glyph.index == shift);
+    let mark_x = glyphs(layout)
+        .filter(|glyph| glyph.index < shift)
+        .map(|glyph| glyph.position.x)
+        .reduce(Pixels::max);
+    for run in &mut layout.runs {
+        run.glyphs.retain(|glyph| merged || glyph.index >= shift);
+        for glyph in &mut run.glyphs {
+            glyph.index = glyph.index.saturating_sub(shift);
+        }
+    }
+    layout.runs.retain(|run| !run.glyphs.is_empty());
+    if merged {
+        return;
+    }
+    if left_to_right {
+        let left = glyphs(layout)
+            .map(|glyph| glyph.position.x)
+            .reduce(Pixels::min)
+            .unwrap_or(layout.width);
+        for run in &mut layout.runs {
+            for glyph in &mut run.glyphs {
+                glyph.position.x -= left;
+            }
+        }
+        layout.width -= left;
+    } else if let Some(x) = mark_x {
+        layout.width = x;
+    }
+}
+
 /// Whether `text` has a right-to-left letter in it: its rows are then
 /// laid out each on its own (`LineLayoutCache::rows_laid_out_apart`), as
 /// what is drawn of a row depends on where it breaks.
@@ -491,12 +645,21 @@ struct Drawn {
     clusters: Box<[Cluster]>,
     /// Where each is in `clusters`, in the order they are drawn, left to right.
     by_x: Box<[u32]>,
+    /// The level of the line's paragraph, 1 where it is read right to left, where the line
+    /// says its text's levels (`LineLayout::levels`).
+    paragraph: Option<u8>,
 }
 
 impl Drawn {
     /// The clusters of `line` and where they are drawn, `None` where each is drawn to
     /// the right of the one before it in the text.
     fn of(line: &LineLayout) -> Option<Self> {
+        // the levels of its text, where it says and some of it goes right to left
+        let paragraph = u8::from(line.paragraph_right_to_left);
+        let said = line
+            .levels
+            .as_deref()
+            .filter(|levels| !levels.is_empty() || paragraph == 1);
         let mut glyphs = line.runs.iter().flat_map(|run| &run.glyphs);
         let mut last = glyphs.next()?;
         let mut in_order = true;
@@ -509,7 +672,7 @@ impl Drawn {
                 last = glyph;
             }
         }
-        if in_order {
+        if in_order && said.is_none() {
             return None;
         }
         let mut clusters: Vec<Cluster> = line
@@ -520,6 +683,7 @@ impl Drawn {
                 start: glyph.index,
                 left: glyph.position.x,
                 right: line.width,
+                level: 0,
                 right_to_left: false,
             })
             .collect();
@@ -531,7 +695,7 @@ impl Drawn {
             }
             same
         });
-        if clusters.windows(2).all(|pair| pair[0].left <= pair[1].left) {
+        if said.is_none() && clusters.windows(2).all(|pair| pair[0].left <= pair[1].left) {
             return None;
         }
         let mut by_x: Vec<u32> = (0..clusters.len() as u32).collect();
@@ -547,20 +711,90 @@ impl Drawn {
         for pair in by_x.windows(2) {
             clusters[pair[0] as usize].right = clusters[pair[1] as usize].left;
         }
-        // drawn next to the one before it in the text on its right, or next to the one
-        // after it on its left: right to left. Drawn next to them the other way, or next
-        // to neither, left to right; the two ways never both hold.
-        for c in 0..clusters.len() {
-            let r = rank[c];
-            let before = c.checked_sub(1).map(|b| rank[b]);
-            let after = rank.get(c + 1).copied();
-            clusters[c].right_to_left =
-                before == Some(r + 1) || (r > 0 && after == Some(r - 1));
+        if let Some(levels) = said {
+            // as the shaper laid them out: a lone letter of Hebrew among Latin, or a line of
+            // one, is drawn next to no other the same way (elundqvist/kvist#681)
+            let mut k = 0;
+            for cluster in &mut clusters {
+                while levels.get(k).is_some_and(|(r, _)| r.end <= cluster.start) {
+                    k += 1;
+                }
+                cluster.level = match levels.get(k) {
+                    Some((r, level)) if r.start <= cluster.start => *level,
+                    _ => paragraph,
+                };
+                cluster.right_to_left = cluster.level % 2 == 1;
+            }
+        } else {
+            // drawn next to the one before it in the text on its right, or next to the one
+            // after it on its left: right to left. Drawn next to them the other way, or next
+            // to neither, left to right; the two ways never both hold.
+            for c in 0..clusters.len() {
+                let r = rank[c];
+                let before = c.checked_sub(1).map(|b| rank[b]);
+                let after = rank.get(c + 1).copied();
+                clusters[c].right_to_left =
+                    before == Some(r + 1) || (r > 0 && after == Some(r - 1));
+                clusters[c].level = u8::from(clusters[c].right_to_left);
+            }
         }
         Some(Self {
             clusters: clusters.into(),
             by_x: by_x.into(),
+            paragraph: said.is_some().then_some(paragraph),
         })
+    }
+
+    /// Where the clusters of the text in `range` are in `clusters`.
+    fn clusters_in(&self, range: Range<usize>) -> Range<usize> {
+        let from = self.clusters.partition_point(|cluster| cluster.start < range.start);
+        let to = self.clusters.partition_point(|cluster| cluster.start < range.end);
+        from..to.max(from)
+    }
+
+    /// Where the clusters in `rows` are drawn, from the left edge of the leftmost to the
+    /// right edge of the rightmost.
+    fn extent(&self, rows: Range<usize>) -> Range<Pixels> {
+        if rows == (0..self.clusters.len()) {
+            let edge = |k: Option<&u32>| k.map(|c| &self.clusters[*c as usize]);
+            return match (edge(self.by_x.first()), edge(self.by_x.last())) {
+                (Some(left), Some(right)) => left.left..right.right,
+                _ => px(0.)..px(0.),
+            };
+        }
+        let clusters = &self.clusters[rows];
+        let left = clusters.iter().map(|cluster| cluster.left).reduce(Pixels::min);
+        let right = clusters.iter().map(|cluster| cluster.right).reduce(Pixels::max);
+        left.unwrap_or_default()..right.unwrap_or_default()
+    }
+
+    /// Where a caret at the boundary before the `c`th cluster stands, in the text of the
+    /// clusters in `rows`, the line's or a row's, drawn over `extent`, `rows.end` being its
+    /// end: at the edge of the cluster after it that it is read from (`Cluster::caret`), and at
+    /// the end at the far edge of the last. Where the line says its text's levels, at the
+    /// edge of the cluster at the lower level of the two either side, the text's ends at the
+    /// paragraph's: where the text starts or ends at a higher level, at that end of `extent`
+    /// as the paragraph is read (`LineLayout::x_for_index`).
+    fn caret_at(&self, c: usize, rows: Range<usize>, extent: Range<Pixels>) -> Pixels {
+        let next = (c < rows.end).then(|| &self.clusters[c]);
+        let before = (c > rows.start).then(|| &self.clusters[c - 1]);
+        let Some(paragraph) = self.paragraph else {
+            return match (before, next) {
+                (_, Some(next)) => next.caret(),
+                (Some(before), None) => before.caret_after(),
+                (None, None) => extent.start,
+            };
+        };
+        let level = |cluster: Option<&Cluster>| cluster.map_or(paragraph, |cluster| cluster.level);
+        match (before, next) {
+            (_, Some(next)) if next.level <= level(before) => next.caret(),
+            (Some(before), _) if before.level <= level(next) => before.caret_after(),
+            // the text's start, or its end, as the paragraph is read
+            (None, _) if paragraph == 1 => extent.end,
+            (None, _) => extent.start,
+            (Some(_), _) if paragraph == 1 => extent.start,
+            (Some(_), _) => extent.end,
+        }
     }
 
     /// The cluster drawn over `x`, where it is in `clusters`: none left of the first.
@@ -580,16 +814,22 @@ impl Drawn {
     /// `range` taken as the end of its text; of two whose carets stand there alike, the one
     /// on the side of `x` that the cluster drawn over it is read from.
     fn closest(&self, x: Pixels, range: Range<usize>, len: usize) -> usize {
-        let from = self.clusters.partition_point(|cluster| cluster.start < range.start);
-        let to = self.clusters.partition_point(|cluster| cluster.start < range.end);
-        let end = match to.checked_sub(1) {
-            Some(last) if last >= from => self.clusters[last].caret_after(),
-            _ => return range.start,
-        };
-        let mut carets = self.clusters[from..to]
-            .iter()
-            .map(|cluster| (cluster.start, cluster.caret()))
-            .chain([(range.end, end)]);
+        let rows = self.clusters_in(range.clone());
+        if rows.is_empty() {
+            return range.start;
+        }
+        let extent = self.extent(rows.clone());
+        let carets: Vec<(usize, Pixels)> = (rows.start..=rows.end)
+            .map(|c| {
+                let index = if c < rows.end {
+                    self.clusters[c].start
+                } else {
+                    range.end
+                };
+                (index, self.caret_at(c, rows.clone(), extent.clone()))
+            })
+            .collect();
+        let carets = carets.iter().copied();
         // the side of the cluster under x it is read from
         let side = self
             .under(x)
@@ -615,6 +855,7 @@ impl Drawn {
             return side;
         }
         carets
+            .clone()
             .find(|(_, caret)| (*caret - x).abs() <= nearest)
             .map_or(range.start, |(index, _)| index)
     }
@@ -627,6 +868,9 @@ struct Cluster {
     start: usize,
     left: Pixels,
     right: Pixels,
+    /// Its bidi level, where the line says (`LineLayout::levels`), else 1 where it goes
+    /// right to left.
+    level: u8,
     right_to_left: bool,
 }
 
@@ -979,11 +1223,9 @@ impl WrappedLineLayout {
                 };
                 // the end of a row before another is its own end, not where the next
                 // row's start is drawn
-                let x = if index == line_end_ix && ix < self.wrap_boundaries.len() {
-                    self.unwrapped_layout.end_x_for_index(index)
-                } else {
-                    self.unwrapped_layout.x_for_index(index)
-                };
+                let x = self
+                    .unwrapped_layout
+                    .x_for_index_in(index, line_start_ix..line_end_ix);
                 return Some(point(x - line_start_x, line_y));
             }
         }
@@ -1061,10 +1303,53 @@ impl LineLayoutCache {
         self.shaped_bytes.load(Ordering::Relaxed)
     }
 
-    /// `text` shaped by the platform's text system.
+    /// `text` shaped by the platform's text system, with its text's levels and its
+    /// paragraph's direction (`LineLayout::levels`) where the text system does
+    /// not say: a line with no right-to-left letter in it goes left to right, its paragraph's
+    /// direction not looked for.
     fn shape(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
         self.shaped_bytes.fetch_add(text.len(), Ordering::Relaxed);
-        self.platform_text_system.layout_line(text, font_size, runs)
+        let mut layout = self.platform_text_system.layout_line(text, font_size, runs);
+        if layout.levels.is_none() {
+            let left_to_right = !may_go_right_to_left(text) || laid_out_left_to_right(text);
+            layout.levels = Some(levels_of(text, left_to_right));
+            layout.paragraph_right_to_left = !left_to_right;
+        }
+        layout
+    }
+
+    /// `text` shaped as a line of a paragraph laid out left to right where `left_to_right`,
+    /// else right to left (elundqvist/kvist#681): a line the text system would lay out the
+    /// other way on its own, a row of Hebrew alone in a paragraph of Latin, is shaped after
+    /// the mark that says which way, U+200E or U+200F, whose glyph is then left out and the
+    /// rest put back at their own indices and from the line's left edge.
+    fn shape_as(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+        left_to_right: bool,
+    ) -> LineLayout {
+        if laid_out_left_to_right(text) == left_to_right {
+            return self.shape(text, font_size, runs);
+        }
+        let mark = if left_to_right { '\u{200E}' } else { '\u{200F}' };
+        let shift = mark.len_utf8();
+        let mut marked_runs: SmallVec<[FontRun; 2]> = SmallVec::from(runs);
+        if let Some(first) = marked_runs.first_mut() {
+            first.len += shift;
+        }
+        self.shaped_bytes.fetch_add(text.len(), Ordering::Relaxed);
+        let mut layout = self.platform_text_system.layout_line(
+            &format!("{mark}{text}"),
+            font_size,
+            &marked_runs,
+        );
+        leave_out_mark(&mut layout, shift, left_to_right);
+        layout.len = text.len();
+        layout.levels = Some(levels_of(text, left_to_right));
+        layout.paragraph_right_to_left = !left_to_right;
+        layout
     }
 
     pub fn layout_index(&self) -> LineLayoutIndex {
@@ -1231,7 +1516,12 @@ impl LineLayoutCache {
     /// once it is broken in the text's order (elundqvist/kvist#648). The
     /// rows' glyphs make one line, each row's after the one before it and
     /// in the order they are drawn, so the line is drawn and read as any
-    /// wrapped at its glyphs.
+    /// wrapped at its glyphs. A row is laid out in the direction of the
+    /// paragraph: in one laid out left to right, a row of right-to-left
+    /// letters alone is too, its words right to left within it, where it
+    /// was laid out as a paragraph of its own, right to left, its spaces
+    /// and punctuation at its ends where such a paragraph puts them
+    /// (elundqvist/kvist#681).
     fn rows_laid_out_apart(
         &self,
         text: &str,
@@ -1241,19 +1531,24 @@ impl LineLayoutCache {
         wrap_width: Pixels,
     ) -> WrappedLineLayout {
         let ends = row_starts.iter().copied().chain([text.len()]);
+        let left_to_right = laid_out_left_to_right(text);
         let mut line = LineLayout {
             font_size,
+            levels: Some(Vec::new()),
+            paragraph_right_to_left: !left_to_right,
             ..Default::default()
         };
         let mut wrap_boundaries: SmallVec<[WrapBoundary; 1]> = SmallVec::new();
         let mut kept_starts = SmallVec::new();
         let mut start = 0;
         for end in ends {
-            let row = self.shape(
+            let row = self.shape_as(
                 &text[start..end],
                 font_size,
                 &runs_within(runs, start..end),
+                left_to_right,
             );
+            line.join_levels(&row, start);
             // the row's glyphs in the order they are drawn, left to right, as
             // a row is drawn from its first glyph at its left edge: a row of
             // right-to-left letters alone is laid out right to left, its
@@ -1402,6 +1697,7 @@ impl LineLayoutCache {
         let mut line = LineLayout {
             font_size,
             len: text.len(),
+            levels: Some(Vec::new()),
             ..Default::default()
         };
         let mut start = 0;
@@ -1411,6 +1707,7 @@ impl LineLayoutCache {
         for end in cuts.iter().copied().chain([text.len()]) {
             let runs = runs_within(runs, start..end);
             let piece = self.layout_line(&text[start..end], font_size, &runs, None);
+            line.join_levels(&piece, start);
             for run in &piece.runs {
                 let mut glyphs = run.glyphs.clone();
                 for glyph in &mut glyphs {
@@ -1792,7 +2089,7 @@ mod tests {
                 glyphs,
             }],
             len: 0,
-            drawn: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -2024,58 +2321,11 @@ mod tests {
             crate::NoopTextSystem.rasterize_glyph(params, raster_bounds)
         }
         fn layout_line(&self, text: &str, font_size: Pixels, _runs: &[FontRun]) -> LineLayout {
-            let hebrew = |c: char| ('\u{05D0}'..='\u{05EA}').contains(&c);
-            let mut order: Vec<(usize, char)> = text.char_indices().collect();
-            if order.iter().any(|(_, c)| c.is_ascii_alphabetic()) {
-                // each run of Hebrew, its spaces between its words in it
-                let mut i = 0;
-                while i < order.len() {
-                    if !hebrew(order[i].1) {
-                        i += 1;
-                        continue;
-                    }
-                    let mut end = i;
-                    for j in i..order.len() {
-                        if hebrew(order[j].1) {
-                            end = j + 1;
-                        } else if order[j].1 != ' ' {
-                            break;
-                        }
-                    }
-                    order[i..end].reverse();
-                    i = end;
-                }
-            }
-            // a line of Hebrew alone is laid out right to left, as
-            // cosmic-text lays it out: its glyphs in the order of their
-            // text, the first at its right edge
-            let right_to_left = !text.chars().any(|c| c.is_ascii_alphabetic());
-            let n = order.len();
-            let glyphs = order
-                .iter()
-                .enumerate()
-                .map(|(at, (index, c))| ShapedGlyph {
-                    id: GlyphId(*c as u32),
-                    position: point(
-                        px(if right_to_left { n - 1 - at } else { at } as f32 * 10.),
-                        px(0.),
-                    ),
-                    index: *index,
-                    is_emoji: false,
-                })
-                .collect();
-            LineLayout {
-                font_size,
-                width: px(order.len() as f32 * 10.),
-                ascent: px(10.),
-                descent: px(-3.),
-                runs: vec![ShapedRun {
-                    font_id: FontId(0),
-                    glyphs,
-                }],
-                len: text.len(),
-                drawn: Default::default(),
-            }
+            // as cosmic-text lays a line out: left to right with a Latin letter in it or
+            // after a U+200E, and right to left after a U+200F
+            let left_to_right = !text.starts_with('\u{200F}')
+                && (text.starts_with('\u{200E}') || text.chars().any(|c| c.is_ascii_alphabetic()));
+            bidi_line(text, font_size, left_to_right)
         }
         fn recommended_rendering_mode(
             &self,
@@ -2083,6 +2333,63 @@ mod tests {
             font_size: Pixels,
         ) -> crate::TextRenderingMode {
             crate::NoopTextSystem.recommended_rendering_mode(font_id, font_size)
+        }
+    }
+
+    /// A line as `BidiTextSystem` lays it out, as a paragraph laid out left to right where
+    /// `left_to_right`.
+    fn bidi_line(text: &str, font_size: Pixels, left_to_right: bool) -> LineLayout {
+        let hebrew = |c: char| ('\u{05D0}'..='\u{05EA}').contains(&c);
+        let mut order: Vec<(usize, char)> = text.char_indices().collect();
+        if left_to_right {
+            // each run of Hebrew, its spaces between its words in it
+            let mut i = 0;
+            while i < order.len() {
+                if !hebrew(order[i].1) {
+                    i += 1;
+                    continue;
+                }
+                let mut end = i;
+                for j in i..order.len() {
+                    if hebrew(order[j].1) {
+                        end = j + 1;
+                    } else if order[j].1 != ' ' {
+                        break;
+                    }
+                }
+                order[i..end].reverse();
+                i = end;
+            }
+        }
+        // a line of Hebrew alone is laid out right to left, as
+        // cosmic-text lays it out: its glyphs in the order of their
+        // text, the first at its right edge
+        let right_to_left = !left_to_right;
+        let n = order.len();
+        let glyphs = order
+            .iter()
+            .enumerate()
+            .map(|(at, (index, c))| ShapedGlyph {
+                id: GlyphId(*c as u32),
+                position: point(
+                    px(if right_to_left { n - 1 - at } else { at } as f32 * 10.),
+                    px(0.),
+                ),
+                index: *index,
+                is_emoji: false,
+            })
+            .collect();
+        LineLayout {
+            font_size,
+            width: px(order.len() as f32 * 10.),
+            ascent: px(10.),
+            descent: px(-3.),
+            runs: vec![ShapedRun {
+                font_id: FontId(0),
+                glyphs,
+            }],
+            len: text.len(),
+            ..Default::default()
         }
     }
 
@@ -2264,6 +2571,269 @@ mod tests {
             );
             row_start = row_end;
         }
+    }
+
+    /// A row of Hebrew alone in a paragraph laid out left to right is laid
+    /// out left to right too, its words right to left within it, so its
+    /// full stop goes at its right end, after the words, where the row was
+    /// laid out as a paragraph of its own, right to left, and the full stop
+    /// went at its left end (elundqvist/kvist#681). A paragraph of Hebrew
+    /// alone keeps each row right to left.
+    #[test]
+    fn a_row_of_hebrew_alone_is_laid_out_as_its_paragraph() {
+        let cache = LineLayoutCache::new(Arc::new(BidiTextSystem));
+        let word = "\u{05D0}\u{05D1}\u{05D2}";
+        let row_of = |text: &str| {
+            let runs = [FontRun {
+                len: text.len(),
+                font_id: FontId(0),
+            }];
+            let wrapped = cache.layout_wrapped_line(text, px(16.), &runs, Some(px(80.)), None);
+            let last_row = wrapped.row_start(wrapped.wrap_boundaries().len() - 1);
+            let glyphs: Vec<ShapedGlyph> = wrapped
+                .runs()
+                .iter()
+                .flat_map(|run| run.glyphs.iter().cloned())
+                .filter(|glyph| glyph.index >= last_row)
+                .collect();
+            let stop = glyphs.iter().find(|glyph| glyph.index == text.len() - 1).unwrap().position.x;
+            let xs: Vec<Pixels> = glyphs.iter().map(|glyph| glyph.position.x).collect();
+            (stop, xs, wrapped)
+        };
+        // Latin on the first row, two words of Hebrew and a full stop on the last
+        let (stop, xs, wrapped) = row_of(&format!("abcdef ghi {word} {word}."));
+        assert_eq!(Some(stop), xs.iter().copied().reduce(Pixels::max), "the stop at the row's right end");
+        // its Hebrew still read right to left, the caret at the row's start at
+        // its left end, by the Latin before it, and at its end at its right
+        let line = &wrapped.unwrapped_layout;
+        let first = format!("abcdef ghi ").len();
+        assert!(line.x_for_index(first + 2) > line.x_for_index(first + 4));
+        let line_height = px(20.);
+        let x = |index| wrapped.position_for_index(index, line_height).unwrap().x;
+        let last_row = wrapped.row_start(wrapped.wrap_boundaries().len() - 1);
+        let row_left = xs.iter().copied().reduce(Pixels::min);
+        assert_eq!(Some(line.x_for_index_in(last_row, last_row..wrapped.len())), row_left, "the row's start");
+        assert_eq!(x(wrapped.len()), px(10.) * xs.len() as f32, "the row's end, after the stop");
+        let (stop, xs, _) = row_of(&format!("{word} {word} {word} {word}."));
+        assert_eq!(Some(stop), xs.iter().copied().reduce(Pixels::min), "right to left as its paragraph");
+    }
+
+    /// A lone letter of Hebrew among Latin goes right to left as the shaper
+    /// says, its carets at its two edges: the one before it, after `ab `,
+    /// at its left edge, by the Latin, and the one after it, before ` c`, at
+    /// its right. A click on its left half goes before it, on its right
+    /// half after it. With the caret before it at its right edge too, both
+    /// stood there and a click on its left half went past it
+    /// (elundqvist/kvist#681). A line of one letter, a paragraph read right
+    /// to left, has Home at its right edge and End at its left.
+    #[test]
+    fn a_lone_letter_of_hebrew_has_a_caret_at_either_edge() {
+        // `ab \u{05D0} c`, one glyph a cluster, 10 px each, in order
+        let glyphs: Vec<ShapedGlyph> = [0, 1, 2, 3, 5, 6]
+            .iter()
+            .enumerate()
+            .map(|(k, index)| glyph_at(k as f32 * 10., *index))
+            .collect();
+        let line = |said: Option<Vec<(Range<usize>, u8)>>| LineLayout {
+            width: px(60.),
+            len: 7,
+            levels: said,
+            ..make_layout(glyphs.clone())
+        };
+        let said = line(Some(vec![(3..5, 1)]));
+        assert!(!said.is_drawn_in_order());
+        assert_eq!(said.x_for_index(3), px(30.), "after `ab `, at its left edge");
+        assert_eq!(said.x_for_index(5), px(40.), "before ` c`, at its right edge");
+        assert_eq!(said.closest_index_for_x(px(32.)), 3, "its left half is before it");
+        assert_eq!(said.closest_index_for_x(px(38.)), 5, "its right half after it");
+        assert_eq!(said.spans_for_range(3..5).to_vec(), [px(30.)..px(40.)]);
+        // a text system that does not say: as Latin, and as before
+        let unsaid = line(None);
+        assert_eq!(unsaid.x_for_index(3), px(30.));
+        assert!(unsaid.is_drawn_in_order());
+        // nor where it says nothing goes right to left
+        assert!(line(Some(Vec::new())).is_drawn_in_order());
+
+        // a line of one letter, all of it at its paragraph's level
+        let one = LineLayout {
+            width: px(10.),
+            len: 2,
+            levels: Some(Vec::new()),
+            paragraph_right_to_left: true,
+            ..make_layout(vec![glyph_at(0., 0)])
+        };
+        assert_eq!(one.x_for_index(0), px(10.));
+        assert_eq!(one.x_for_index(2), px(0.));
+        assert_eq!(one.closest_index_for_x(px(9.)), 0);
+        assert_eq!(one.closest_index_for_x(px(1.)), 2);
+    }
+
+    /// `x_for_index` at each boundary of `line`, `0..=len` of them.
+    fn carets(line: &LineLayout, at: &[usize]) -> Vec<f32> {
+        at.iter().map(|i| f32::from(line.x_for_index(*i))).collect()
+    }
+
+    /// A caret between text at two levels stands by the text at the lower,
+    /// the line's ends at its paragraph's, so each gap between two clusters
+    /// has a caret of its own: the start of a word of Hebrew after Latin at
+    /// the word's left end, after the Latin, and the end of a line that
+    /// ends in Hebrew at the line's right end, where a click right of it
+    /// goes. With every caret at the edge of the cluster after it, the
+    /// Hebrew's start and end both stood at its right end, a letter typed
+    /// after the Latin was drawn left of the caret, and a click right of the
+    /// line went to the Hebrew's start (elundqvist/kvist#681).
+    #[test]
+    fn a_caret_between_two_levels_stands_by_the_lower() {
+        // `ab אב cd`, the Hebrew at level 1
+        let mixed = LineLayout {
+            levels: Some(vec![(3..7, 1)]),
+            ..hebrew_drawn()
+        };
+        assert_eq!(
+            carets(&mixed, &[0, 1, 2, 3, 5, 7, 8, 9, 10]),
+            [0., 10., 20., 30., 40., 50., 60., 70., 80.]
+        );
+        // `ab אב`, drawn `ab בא`
+        let ends = LineLayout {
+            width: px(50.),
+            len: 7,
+            levels: Some(vec![(3..7, 1)]),
+            ..make_layout(vec![
+                glyph_at(0., 0),
+                glyph_at(10., 1),
+                glyph_at(20., 2),
+                glyph_at(30., 5),
+                glyph_at(40., 3),
+            ])
+        };
+        assert_eq!(carets(&ends, &[2, 3, 5, 7]), [20., 30., 40., 50.]);
+        let closest = |line: &LineLayout, x: &[f32]| {
+            x.iter().map(|x| line.closest_index_for_x(px(*x))).collect::<Vec<_>>()
+        };
+        assert_eq!(closest(&ends, &[27., 33., 46., 1000.]), [3, 3, 7, 7], "right of it, its end");
+
+        // `abc שלום 123`, drawn `abc 123 םולש`: the digits at level 2, the
+        // space before them at the Hebrew's 1
+        let digits = LineLayout {
+            levels: Some(vec![(4..9, 1), (9..12, 2)]),
+            ..digits_in_hebrew()
+        };
+        assert_eq!(
+            carets(&digits, &(0..=12).collect::<Vec<_>>()),
+            [0., 10., 20., 30., 40., 110., 100., 90., 80., 70., 50., 60., 120.]
+        );
+        assert_eq!(closest(&digits, &[44., 67., 112., 125.]), [4, 9, 5, 12]);
+
+        // `אב cd` in a paragraph read right to left, drawn `cd בא`: the
+        // Latin at level 2, the line's end at its left end
+        let right_to_left = LineLayout {
+            width: px(50.),
+            len: 7,
+            levels: Some(vec![(5..7, 2)]),
+            paragraph_right_to_left: true,
+            ..make_layout(vec![
+                glyph_at(40., 0),
+                glyph_at(30., 2),
+                glyph_at(20., 4),
+                glyph_at(0., 5),
+                glyph_at(10., 6),
+            ])
+        };
+        assert_eq!(carets(&right_to_left, &[0, 2, 4, 5, 6, 7]), [50., 40., 30., 20., 10., 0.]);
+    }
+
+    /// A row shaped as its paragraph where it would be laid out the other
+    /// way on its own: a row of digits and a space alone in a paragraph of
+    /// Hebrew, which has no strong letter and alone goes left to right, is
+    /// shaped after a U+200F and laid out right to left, its trailing space
+    /// at its left end, as wide as its own glyphs and its indices its own,
+    /// the mark left out (elundqvist/kvist#681).
+    #[test]
+    fn a_row_with_no_letter_in_a_paragraph_of_hebrew_is_laid_out_right_to_left() {
+        let cache = LineLayoutCache::new(Arc::new(BidiTextSystem));
+        let text = "1234567 ";
+        let runs = [FontRun {
+            len: text.len(),
+            font_id: FontId(0),
+        }];
+        assert!(laid_out_left_to_right(text), "alone, left to right");
+        let row = cache.shape_as(text, px(16.), &runs, false);
+        assert_eq!((row.len, row.width), (8, px(80.)));
+        let at = |index: usize| {
+            row.runs
+                .iter()
+                .flat_map(|run| &run.glyphs)
+                .find(|glyph| glyph.index == index)
+                .map(|glyph| f32::from(glyph.position.x))
+        };
+        assert_eq!(at(7), Some(0.), "the space at its left end");
+        assert_eq!(at(0), Some(70.), "its first digit at its right end");
+        let indices: Vec<usize> = row.runs.iter().flat_map(|run| &run.glyphs).map(|glyph| glyph.index).collect();
+        assert_eq!(indices.iter().min(), Some(&0));
+        assert_eq!(indices.len(), 8, "no glyph of the mark's");
+        assert!(row.paragraph_right_to_left);
+        assert_eq!(row.levels, Some(vec![(0..7, 2)]));
+    }
+
+    /// The levels of a line's text are what UAX #9 resolves above its
+    /// paragraph's: Hebrew and the space between its words at 1, digits
+    /// after it at 2, Latin in a paragraph read right to left at 2, and a
+    /// line's trailing spaces at the paragraph's level. A row shaped after a
+    /// direction mark, which the shaper merged into its first letter, keeps
+    /// that letter.
+    #[test]
+    fn the_levels_of_a_lines_text_are_as_uax_9_resolves_them() {
+        let hebrew = "\u{05E9}\u{05DC}\u{05D5}\u{05DD}";
+        assert_eq!(levels_of("abc \u{05E9} def", true), [(4..6, 1)]);
+        assert_eq!(levels_of(&format!("abc {hebrew} {hebrew} "), true), [(4..21, 1)]);
+        assert_eq!(levels_of(&format!("abc {hebrew} 123"), true), [(4..13, 1), (13..16, 2)]);
+        assert_eq!(levels_of(&format!("{hebrew} 123"), false), [(9..12, 2)]);
+        assert_eq!(levels_of(&format!("{hebrew} abc"), false), [(9..12, 2)]);
+        assert!(levels_of(&format!("{hebrew} "), false).is_empty());
+        assert!(levels_of("abc d\u{E9}f", true).is_empty());
+        // a paragraph of Latin with a word of Hebrew first is laid out left to right
+        assert!(laid_out_left_to_right(&format!("{hebrew} abc")) != cfg!(target_os = "macos"));
+        assert!(!laid_out_left_to_right(&format!("{hebrew}.")));
+        assert!(laid_out_left_to_right("123 ..."));
+
+        let mut merged = LineLayout {
+            width: px(30.),
+            ..make_layout(vec![glyph_at(0., 0), glyph_at(10., 5), glyph_at(20., 7)])
+        };
+        leave_out_mark(&mut merged, 3, true);
+        let indices: Vec<usize> = merged.runs[0].glyphs.iter().map(|glyph| glyph.index).collect();
+        assert_eq!((indices, merged.width), (vec![0, 2, 4], px(30.)));
+    }
+
+    /// The levels a line shaped in parts says are its parts', from where
+    /// each starts, a stretch at one level across two parts one stretch,
+    /// and nothing where one does not say; a line split keeps what each
+    /// half has of them.
+    #[test]
+    fn the_levels_follow_a_line_put_together_or_split() {
+        let mut line = LineLayout {
+            levels: Some(vec![(1..3, 1)]),
+            ..Default::default()
+        };
+        let part = |said: Option<Vec<(Range<usize>, u8)>>| LineLayout {
+            levels: said,
+            ..Default::default()
+        };
+        line.join_levels(&part(Some(vec![(0..2, 1), (2..3, 2), (4..6, 1)])), 3);
+        assert_eq!(line.levels, Some(vec![(1..5, 1), (5..6, 2), (7..9, 1)]));
+        line.join_levels(&part(None), 10);
+        assert_eq!(line.levels, None);
+
+        let line = LineLayout {
+            len: 10,
+            levels: Some(vec![(1..5, 1), (7..9, 2)]),
+            paragraph_right_to_left: true,
+            ..make_layout(vec![glyph_at(0., 0)])
+        };
+        assert_eq!(line.levels_within(0..4), Some(vec![(1..4, 1)]));
+        assert_eq!(line.levels_within(4..10), Some(vec![(0..1, 1), (3..5, 2)]));
+        let (before, after) = line.split_at(4);
+        assert!(before.paragraph_right_to_left && after.paragraph_right_to_left);
     }
 
     /// A long line of words, as pasted into a one-line box, in no order

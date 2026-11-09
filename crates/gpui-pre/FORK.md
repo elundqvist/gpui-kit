@@ -455,14 +455,48 @@ asks (section 4(b)); each says so at its top:
   glyphs each come after the one before in both orders is found to be one
   in a pass over them and takes the code it took. `spans_for_range` gives
   where the text of a range is drawn, a stretch for each part of the line
-  it covers, and `end_x_for_index` where a caret after the text before an
-  index stands. `WrappedLineLayout::position_for_index` measures a row's
+  it covers. `WrappedLineLayout::position_for_index` measures a row's
   carets from the row's left edge, where they were measured from the
   caret at its start, the right end of a row of Hebrew, and stood left of
   the row, and its end from where its own text ends; a click beside such a
   row goes to the row's boundary nearest it. Tests of a row of Hebrew, of
   Hebrew in Latin with its glyphs in either order, of digits in Hebrew, of
   the spans of a range and of a wrapped row of Hebrew.
+- `src/text_system/line_layout.rs`: which way a cluster goes, and its
+  bidi level, are what UAX #9 resolves for its text
+  (elundqvist/kvist#681): the new `LineLayout::levels` holds the levels
+  above the paragraph's, each stretch with its level, and
+  `LineLayout::paragraph_right_to_left` the paragraph's direction, found
+  as the line is shaped (`levels_of`, in the paragraph's direction as the
+  text system lays it out, `laid_out_left_to_right`, its trailing spaces
+  at the paragraph's level; a line with no right-to-left letter is not
+  looked at further) and carried through a line split or put together
+  from pieces or rows. A caret between text at two levels stands at the
+  edge of the text at the lower, the line's ends, or a row's
+  (`x_for_index_in`, which `position_for_index` takes a row's carets
+  from), at the paragraph's level: in `abc ש def` the caret before the
+  letter at its left edge and after it at its right, at the start of a
+  word of Hebrew after Latin at its left end, at the end of a line that
+  ends in Hebrew at the line's right end, and before digits after Hebrew
+  right of them, so each gap between clusters has a caret of its own,
+  where with each at the edge of the cluster after it the two ends of
+  Hebrew among Latin stood at its right end and a click right of a line
+  ending in Hebrew went to its start. A line of one letter of Hebrew, a
+  paragraph read right to left, has its start at its right edge; a line
+  made by hand, which says no level, is read from the order its
+  clusters are drawn in, its carets at the edge of the cluster after
+  each, as before. A row of a wrapped line laid out apart (#648) is laid
+  out in its paragraph's direction: one the text system would lay out
+  the other way on its own, a row of Hebrew alone in a paragraph of
+  Latin, is shaped after U+200E (U+200F the other way), whose glyph is
+  left out and the rest put back at their own indices from the row's
+  left edge (`shape_as`, `leave_out_mark`), where it was laid out as a
+  paragraph of its own, right to left, its spaces and full stop at its
+  left end. Tests of a lone letter, of a line of one, of carets between
+  levels in Latin with Hebrew and digits and in a paragraph of Hebrew
+  with Latin, of a row of Hebrew in a paragraph of Latin and of one of
+  Hebrew, of a row of digits in a paragraph of Hebrew, of the levels
+  found and of a line put together and split.
 
 ## Tests
 

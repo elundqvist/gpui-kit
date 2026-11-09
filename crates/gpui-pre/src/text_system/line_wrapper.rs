@@ -2000,7 +2000,7 @@ mod tests {
                     glyphs,
                 }],
                 len: text.len(),
-                drawn: Default::default(),
+                ..Default::default()
             }
         }
         fn recommended_rendering_mode(

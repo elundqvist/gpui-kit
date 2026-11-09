@@ -676,6 +676,15 @@ pub(crate) fn drawn_spans(
     row: &gpui::LineLayout,
     range: Range<usize>,
 ) -> Option<SmallVec<[Range<Pixels>; 2]>> {
+    drawn_spans_by(row, range, |index| row.x_for_index(index))
+}
+
+/// `drawn_spans`, `caret` saying where gpui has the caret at an index (`x_for_index`).
+fn drawn_spans_by(
+    row: &gpui::LineLayout,
+    range: Range<usize>,
+    caret: impl Fn(usize) -> Pixels,
+) -> Option<SmallVec<[Range<Pixels>; 2]>> {
     let mut glyphs = row.runs.iter().flat_map(|run| &run.glyphs);
     let mut last = glyphs.next()?;
     let in_order = glyphs.all(|glyph| {
@@ -686,7 +695,22 @@ pub(crate) fn drawn_spans(
         last = glyph;
         follows
     });
-    if in_order {
+    // a row drawn in order is painted from caret to caret where the carets at the range's
+    // ends stand at the left edges of their clusters, as in a row of Latin; a line of one
+    // letter of Hebrew, a paragraph read right to left, is drawn in order with the caret
+    // before the letter at its right edge and after it at its left, and painted so it was
+    // nothing (elundqvist/kvist#681)
+    let left_edge = |index: usize| {
+        row.runs
+            .iter()
+            .flat_map(|run| &run.glyphs)
+            .find(|glyph| glyph.index >= index)
+            .map_or(row.width, |glyph| glyph.position.x)
+    };
+    if in_order
+        && caret(range.start) == left_edge(range.start)
+        && caret(range.end) == left_edge(range.end)
+    {
         return None;
     }
     let mut clusters: Vec<(usize, Pixels)> = row
@@ -1735,6 +1759,52 @@ mod tests {
         // a row of Latin is painted from caret to caret, as it was
         let latin = mixed_row([(0., 0), (10., 1), (20., 2), (30., 3), (40., 5), (50., 7), (60., 8), (70., 9)]);
         assert_eq!(spans(&latin, 3..7), None);
+    }
+
+    /// A row drawn in order is painted from caret to caret where the carets at the range's
+    /// ends stand at the left edges of their clusters, as a lone letter of Hebrew among Latin
+    /// has them, and over each cluster's own box where they stand elsewhere, as in a line of
+    /// one letter of Hebrew, a paragraph read right to left, whose caret before the letter
+    /// stands at its right edge: painted from caret to caret, it was nothing
+    /// (elundqvist/kvist#681). gpui-base builds on the published gpui, which knows no level
+    /// of bidi text, so the carets are said here as the fork's gpui has them.
+    #[test]
+    fn a_row_in_order_is_painted_by_its_clusters_where_its_carets_are_not_at_their_left() {
+        let row_of = |width: f32, len: usize, at: &[(f32, usize)]| gpui::LineLayout {
+            width: px(width),
+            len,
+            runs: vec![gpui::ShapedRun {
+                font_id: gpui::FontId(0),
+                glyphs: at
+                    .iter()
+                    .map(|(x, index)| gpui::ShapedGlyph {
+                        id: gpui::GlyphId(0),
+                        position: point(px(*x), px(0.)),
+                        index: *index,
+                        is_emoji: false,
+                    })
+                    .collect(),
+            }],
+            ..Default::default()
+        };
+        let spans = |spans: Option<SmallVec<[Range<Pixels>; 2]>>| {
+            spans.map(|spans| spans.iter().map(|span| (f32::from(span.start), f32::from(span.end))).collect::<Vec<_>>())
+        };
+        // `ab ש cd`, its carets at the left edge of the cluster after each
+        let lone = row_of(70., 8, &[(0., 0), (10., 1), (20., 2), (30., 3), (40., 5), (50., 6), (60., 7)]);
+        let left = |index: usize| match index {
+            0..=3 => px(index as f32 * 10.),
+            4 | 5 => px(40.),
+            index => px((index - 1) as f32 * 10.),
+        };
+        assert_eq!(spans(drawn_spans_by(&lone, 3..5, left)), None, "the letter, caret to caret");
+        assert_eq!(spans(drawn_spans_by(&lone, 0..8, left)), None);
+        // `ש` alone, Home at its right edge and End at its left
+        let one = row_of(10., 2, &[(0., 0)]);
+        let read_right_to_left = |index: usize| if index == 0 { px(10.) } else { px(0.) };
+        assert_eq!(spans(drawn_spans_by(&one, 0..2, read_right_to_left)), Some(vec![(0., 10.)]));
+        // the published gpui's carets: each at the left edge of the cluster after it
+        assert_eq!(spans(drawn_spans(&one, 0..2)), None);
     }
 
     #[test]

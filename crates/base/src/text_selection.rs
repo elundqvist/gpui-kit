@@ -385,49 +385,111 @@ fn project_ranges(
 /// stretch of a row they cover, where `text` has a letter written right to left in it: in
 /// such text a selection painted from the caret at its start to the caret at its end was a
 /// rectangle of no width, or one over what lay between, and on a row read right to left the
-/// rest of the row after its start lies on its left (elundqvist/kvist#669). `None` in text
-/// with no such letter, whose selections are painted as they were.
+/// rest of the row after its start lies on its left (elundqvist/kvist#669). Each cluster is
+/// painted over the box it is drawn in, from its glyph to the glyph drawn next to its right,
+/// found from the glyphs, as a caret at a cluster's edge cannot tell which way it goes: a
+/// line of one letter of Hebrew, whose caret before it stands at its right edge and after it
+/// at its left, was painted as nothing (elundqvist/kvist#681). `None` where no line the
+/// range covers has such a letter, whose selections are painted as they were. The lines
+/// before the range are passed over, and those after it not looked at.
 pub(crate) fn drawn_selection(
     text: &str,
     range: Range<usize>,
     layout: &TextLayout,
 ) -> Option<Vec<Bounds<Pixels>>> {
-    let selected = text.get(range.clone())?;
-    if !selected.chars().any(right_to_left) {
+    text.get(range.clone())?;
+    let line_height = layout.line_height();
+    let origin = layout.bounds().origin;
+    // each line the range covers, the range's part of it, and the top of its first row
+    let mut covered = Vec::new();
+    let mut read_right_to_left = false;
+    let (mut line_start, mut top) = (0, origin.y);
+    for line in layout.line_layouts() {
+        if line_start > range.end {
+            break;
+        }
+        let line_end = line_start + line.len();
+        let (from, to) = (range.start.max(line_start), range.end.min(line_end));
+        if from < to {
+            read_right_to_left |= text
+                .get(line_start..line_end)
+                .is_some_and(|line| line.chars().any(right_to_left));
+            covered.push((line.clone(), from - line_start..to - line_start, top));
+        }
+        top += line.size(line_height).height;
+        line_start = line_end + 1;
+    }
+    if !read_right_to_left {
         return None;
     }
-    let line_height = layout.line_height();
-    // each row's stretches, by the row's top
-    let mut rows: Vec<(Pixels, Vec<Range<Pixels>>)> = Vec::new();
-    for (at, c) in selected.char_indices() {
-        let offset = range.start + at;
-        let Some(start) = layout.position_for_index(offset) else {
-            continue;
-        };
-        let span = match layout.position_for_index(offset + c.len_utf8()) {
-            Some(end) if end.y == start.y => start.x.min(end.x)..start.x.max(end.x),
-            _ => start.x..start.x + line_height.half(),
-        };
-        match rows.iter_mut().find(|(top, _)| *top == start.y) {
-            Some((_, spans)) => spans.push(span),
-            None => rows.push((start.y, vec![span])),
-        }
-    }
     let mut drawn = Vec::new();
-    for (top, mut spans) in rows {
-        spans.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
-        let mut merged: Vec<Range<Pixels>> = Vec::new();
-        for span in spans {
-            match merged.last_mut() {
-                Some(last) if span.start <= last.end + px(0.5) => last.end = last.end.max(span.end),
-                _ => merged.push(span),
-            }
-        }
-        drawn.extend(merged.into_iter().map(|span| {
-            Bounds::from_corners(point(span.start, top), point(span.end, top + line_height))
+    for (line, range, y) in covered {
+        drawn.extend(cluster_boxes(&line, range).into_iter().map(|(row, span)| {
+            let top = y + line_height * row as f32;
+            Bounds::from_corners(
+                point(origin.x + span.start, top),
+                point(origin.x + span.end, top + line_height),
+            )
         }));
     }
     Some(drawn)
+}
+
+/// The boxes the clusters of `line` with their text in `range` are drawn in, each stretch a
+/// row's, as the row and the stretch from the row's left edge: a cluster from where its
+/// leftmost glyph is drawn to where the cluster drawn next to its right is, or the line's
+/// end, so a cluster of two glyphs, a Devanagari `ि` drawn before its letter, is one box,
+/// not one to its own second glyph. A row is drawn from its first glyph at its left edge,
+/// its glyphs after the rows' before it.
+fn cluster_boxes(line: &gpui::WrappedLineLayout, range: Range<usize>) -> Vec<(usize, Range<Pixels>)> {
+    let layout = &line.unwrapped_layout;
+    // each glyph's row, from where the rows begin among the glyphs
+    let starts: Vec<(usize, usize)> = line
+        .wrap_boundaries()
+        .iter()
+        .map(|boundary| (boundary.run_ix, boundary.glyph_ix))
+        .collect();
+    let mut glyphs: Vec<(usize, usize, Pixels)> = Vec::new();
+    for (run_ix, run) in layout.runs.iter().enumerate() {
+        for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
+            let row = starts.partition_point(|start| *start <= (run_ix, glyph_ix));
+            glyphs.push((glyph.index, row, glyph.position.x));
+        }
+    }
+    let rows = starts.len() + 1;
+    let mut row_left = vec![Pixels::MAX; rows];
+    for (_, row, x) in &glyphs {
+        row_left[*row] = row_left[*row].min(*x);
+    }
+    // a cluster's glyphs share its index: its box from the leftmost
+    glyphs.sort_by(|a, b| (a.0, a.2).partial_cmp(&(b.0, b.2)).unwrap_or(std::cmp::Ordering::Equal));
+    glyphs.dedup_by_key(|(index, _, _)| *index);
+    let mut lefts: Vec<Pixels> = glyphs.iter().map(|(_, _, x)| *x).collect();
+    lefts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let right_of = |left: Pixels| {
+        let next = lefts.partition_point(|x| *x <= left);
+        lefts.get(next).copied().unwrap_or(layout.width)
+    };
+    let mut covered: Vec<(usize, Range<Pixels>)> = glyphs
+        .iter()
+        .filter(|(index, _, _)| range.contains(index))
+        .map(|(_, row, x)| (*row, *x - row_left[*row]..right_of(*x) - row_left[*row]))
+        .collect();
+    covered.sort_by(|a, b| {
+        (a.0, a.1.start)
+            .partial_cmp(&(b.0, b.1.start))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut merged: Vec<(usize, Range<Pixels>)> = Vec::new();
+    for (row, span) in covered {
+        match merged.last_mut() {
+            Some((last_row, last)) if *last_row == row && span.start <= last.end + px(0.5) => {
+                last.end = last.end.max(span.end)
+            }
+            _ => merged.push((row, span)),
+        }
+    }
+    merged
 }
 
 /// Whether `c` is a letter written right to left, of Hebrew, Arabic and the scripts beside
@@ -2498,6 +2560,73 @@ mod tests {
         assert_eq!(reversed.ranges(), &[Some(1..7)]);
         assert!(forward.is_active());
         assert!(reversed.is_active());
+    }
+
+    /// A selection in text with a letter of Hebrew in it is painted over
+    /// the box each cluster it covers is drawn in, from its glyph to the
+    /// next one drawn, a box a row's stretch, and over nothing else: the
+    /// letter alone, the text before it alone, and both, each its own
+    /// width, where carets at a lone letter's edges could not tell
+    /// (elundqvist/kvist#681). Text with no such letter is painted as before.
+    #[gpui::test]
+    fn a_selection_in_text_with_hebrew_is_painted_over_the_clusters_it_covers(
+        cx: &mut TestAppContext,
+    ) {
+        let (text, layout) = laid_out_runs(&["ab \u{05E9} cd"], cx).pop().unwrap();
+        let x = |index: usize| {
+            layout.bounds().origin.x
+                + layout.line_layouts()[0].unwrapped_layout.runs[0]
+                    .glyphs
+                    .iter()
+                    .find(|glyph| glyph.index >= index)
+                    .map_or(layout.line_layouts()[0].unwrapped_layout.width, |glyph| {
+                        glyph.position.x
+                    })
+        };
+        let painted = |range: Range<usize>| {
+            drawn_selection(&text, range, &layout)
+                .unwrap()
+                .iter()
+                .map(|bounds| (bounds.origin.x, bounds.origin.x + bounds.size.width))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(painted(3..5), [(x(3), x(5))], "the letter");
+        assert_eq!(painted(0..3), [(x(0), x(3))], "what is before it");
+        assert_eq!(painted(0..8), [(x(0), x(8))], "all of it");
+        assert_eq!(painted(6..8), [(x(6), x(8))]);
+        let row_top = layout.position_for_index(0).unwrap().y;
+        let bounds = drawn_selection(&text, 3..5, &layout).unwrap()[0];
+        assert_eq!((bounds.origin.y, bounds.size.height), (row_top, layout.line_height()));
+        assert!(drawn_selection("ab cd", 0..2, &layout).is_none());
+    }
+
+    /// A cluster drawn as two glyphs, a Devanagari `ि` drawn before its
+    /// letter, is painted as one box, from its leftmost glyph to the cluster
+    /// drawn next to its right: it was painted to its own second glyph, a
+    /// hole left in the selection (elundqvist/kvist#681).
+    #[test]
+    fn a_cluster_of_two_glyphs_is_painted_as_one_box() {
+        let glyph = |x: f32, index: usize| gpui::ShapedGlyph {
+            id: gpui::GlyphId(0),
+            position: point(px(x), px(0.)),
+            index,
+            is_emoji: false,
+        };
+        let line = gpui::WrappedLineLayout {
+            unwrapped_layout: std::sync::Arc::new(gpui::LineLayout {
+                width: px(40.),
+                len: 4,
+                runs: vec![gpui::ShapedRun {
+                    font_id: gpui::FontId(0),
+                    glyphs: vec![glyph(0., 0), glyph(10., 1), glyph(20., 1), glyph(30., 3)],
+                }],
+                ..Default::default()
+            }),
+            wrap_boundaries: Default::default(),
+            wrap_width: None,
+        };
+        assert_eq!(cluster_boxes(&line, 1..3), [(0, px(10.)..px(30.))]);
+        assert_eq!(cluster_boxes(&line, 0..4), [(0, px(0.)..px(40.))]);
     }
 
     #[gpui::test]
