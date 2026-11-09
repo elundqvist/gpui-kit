@@ -416,6 +416,12 @@ impl WindowTextSystem {
         self.line_layout_cache.truncate_layouts(index)
     }
 
+    /// The bytes of text this window has shaped, which a line found laid
+    /// out in its cache adds nothing to: for a check of what a change costs.
+    pub fn shaped_bytes(&self) -> usize {
+        self.line_layout_cache.shaped_bytes()
+    }
+
     /// Shape the given line, at the given font_size, for painting to the screen.
     /// Subsets of the line can be styled independently with the `runs` parameter.
     ///

@@ -8,7 +8,10 @@ use std::{
     borrow::Borrow,
     hash::{Hash, Hasher},
     ops::Range,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use super::LineWrapper;
@@ -369,6 +372,100 @@ pub(crate) fn has_right_to_left(text: &str) -> bool {
         .any(|c| !c.is_ascii() && matches!(bidi_class(c), BidiClass::R | BidiClass::AL))
 }
 
+/// How long, in bytes, a line is past which it is shaped in pieces
+/// (`pieces`).
+const LONG_LINE: usize = 1024;
+
+/// The fewest bytes a piece of a long line has (`pieces`).
+const LEAST_PIECE: usize = 128;
+
+/// How long a stretch of a long line with spaces in it goes uncut at most
+/// (`pieces`).
+const MOST_PIECE: usize = 4 * LONG_LINE;
+
+/// Where `text` is cut into pieces shaped apart, or `None` where it is
+/// shaped whole: a line longer than `LONG_LINE` is cut before one in 64
+/// of its spaces, which in a line of words makes pieces of some 400
+/// bytes, each piece then laid out as a line of its own in
+/// the cache and the line put together from them. A key typed in a long
+/// line shapes again the piece it changed and finds the rest in the
+/// cache, where a one-line box shaped its whole line at every key and
+/// typing a line cost the square of its length (elundqvist/kvist#664).
+/// The spaces cut at are picked by the 16 bytes before each, and not by
+/// how far they are from the last cut, so an edit moves only the cuts
+/// near it and the pieces past it are found again. Where they pick none
+/// for `MOST_PIECE` bytes, as in the same few words pasted over and over,
+/// whose 16 bytes before each space are alike, the first space past that
+/// is cut at: a key typed at the line's end, as in a box, then shapes its
+/// last piece, where it shaped the whole line.
+///
+/// A space takes no ligature, kerning or joining over it, so the pieces
+/// are what the line is shaped whole. Not so a line with a right-to-left
+/// letter or a direction mark in it, whose order is the whole line's, nor
+/// one with a tab, whose width may depend on where it stands: they are
+/// shaped whole. A stretch with no space in it is a piece however long,
+/// as a line of CJK or of base64 is: what a letter's neighbour does to it
+/// a cut there would lose.
+fn pieces(text: &str) -> Option<SmallVec<[usize; 16]>> {
+    if text.len() <= LONG_LINE
+        || text.contains('\t')
+        || has_right_to_left(text)
+        || text
+            .chars()
+            .any(|c| matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
+    {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut cuts = SmallVec::new();
+    let mut last = 0;
+    for (at, _) in bytes.iter().enumerate().filter(|(_, b)| **b == b' ') {
+        if at < last + LEAST_PIECE {
+            continue;
+        }
+        // FNV-1a over the bytes before the space, its top six bits naught
+        let before = &bytes[at - 16..at];
+        let hash = before.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+        // a space is a whole character, but not one a joiner before it
+        // ties to what it joins
+        if (hash >> 58 == 0 || at >= last + MOST_PIECE) && !text[..at].ends_with('\u{200D}') {
+            cuts.push(at);
+            last = at;
+        }
+    }
+    (!cuts.is_empty()).then_some(cuts)
+}
+
+/// The pieces of `text` cut at `cuts` (`pieces`) that `previous` holds,
+/// taken into `current` as the line made of them is.
+fn keep_pieces(
+    text: &str,
+    font_size: Pixels,
+    runs: &[FontRun],
+    cuts: &[usize],
+    previous: &mut FrameCache,
+    current: &mut FrameCache,
+) {
+    let mut start = 0;
+    for end in cuts.iter().copied().chain([text.len()]) {
+        let runs = runs_within(runs, start..end);
+        let piece = &CacheKeyRef {
+            text: &text[start..end],
+            font_size,
+            runs: &runs,
+            wrap_width: None,
+            force_width: None,
+        } as &dyn AsCacheKeyRef;
+        if let Some((key, layout)) = previous.lines.remove_entry(piece) {
+            current.lines.insert(key.clone(), layout);
+            current.used_lines.push(key);
+        }
+        start = end;
+    }
+}
+
 /// The part of `runs` over `range` of their text.
 fn runs_within(runs: &[FontRun], range: Range<usize>) -> SmallVec<[FontRun; 1]> {
     let mut within = SmallVec::new();
@@ -584,11 +681,16 @@ pub(crate) struct LineLayoutCache {
     previous_frame: Mutex<FrameCache>,
     current_frame: RwLock<FrameCache>,
     platform_text_system: Arc<dyn PlatformTextSystem>,
+    /// The bytes of text handed to the platform text system to be shaped.
+    shaped_bytes: AtomicUsize,
 }
 
 #[derive(Default)]
 struct FrameCache {
     lines: FxHashMap<Arc<CacheKey>, Arc<LineLayout>>,
+    /// Where each line laid out in pieces is cut (`pieces`), carried with it
+    /// from frame to frame so that its pieces are without cutting it again.
+    cuts: FxHashMap<Arc<CacheKey>, Arc<[usize]>>,
     wrapped_lines: FxHashMap<Arc<CacheKey>, Arc<WrappedLineLayout>>,
     used_lines: Vec<Arc<CacheKey>>,
     used_wrapped_lines: Vec<Arc<CacheKey>>,
@@ -634,7 +736,20 @@ impl LineLayoutCache {
             previous_frame: Mutex::default(),
             current_frame: RwLock::default(),
             platform_text_system,
+            shaped_bytes: AtomicUsize::new(0),
         }
+    }
+
+    /// The bytes of text shaped so far, which a layout found in the cache
+    /// adds nothing to: for a check of what a change costs.
+    pub fn shaped_bytes(&self) -> usize {
+        self.shaped_bytes.load(Ordering::Relaxed)
+    }
+
+    /// `text` shaped by the platform's text system.
+    fn shape(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
+        self.shaped_bytes.fetch_add(text.len(), Ordering::Relaxed);
+        self.platform_text_system.layout_line(text, font_size, runs)
     }
 
     pub fn layout_index(&self) -> LineLayoutIndex {
@@ -654,6 +769,9 @@ impl LineLayoutCache {
         for key in &previous_frame.used_lines[range.start.lines_index..range.end.lines_index] {
             if let Some((key, line)) = previous_frame.lines.remove_entry(key) {
                 current_frame.lines.insert(key, line);
+            }
+            if let Some((key, cuts)) = previous_frame.cuts.remove_entry(key) {
+                current_frame.cuts.insert(key, cuts);
             }
             current_frame.used_lines.push(key.clone());
         }
@@ -705,6 +823,7 @@ impl LineLayoutCache {
         let mut curr_frame = self.current_frame.write();
         std::mem::swap(&mut *prev_frame, &mut *curr_frame);
         curr_frame.lines.clear();
+        curr_frame.cuts.clear();
         curr_frame.wrapped_lines.clear();
         curr_frame.used_lines.clear();
         curr_frame.used_wrapped_lines.clear();
@@ -815,7 +934,7 @@ impl LineLayoutCache {
         let mut kept_starts = SmallVec::new();
         let mut start = 0;
         for end in ends {
-            let row = self.platform_text_system.layout_line(
+            let row = self.shape(
                 &text[start..end],
                 font_size,
                 &runs_within(runs, start..end),
@@ -901,15 +1020,38 @@ impl LineLayoutCache {
         }
 
         let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
-        if let Some((key, layout)) = self.previous_frame.lock().lines.remove_entry(key) {
+        let mut previous_frame = self.previous_frame.lock();
+        if let Some((key, layout)) = previous_frame.lines.remove_entry(key) {
+            // and its pieces, which the line after the next key is laid
+            // out from, with them
+            if let Some(cuts) = previous_frame.cuts.remove(&key) {
+                keep_pieces(
+                    &key.text,
+                    key.font_size,
+                    &key.runs,
+                    &cuts,
+                    &mut previous_frame,
+                    &mut current_frame,
+                );
+                current_frame.cuts.insert(key.clone(), cuts);
+            }
             current_frame.lines.insert(key.clone(), layout.clone());
             current_frame.used_lines.push(key);
             layout
         } else {
+            drop(previous_frame);
             let text = SharedString::from(text);
-            let mut layout = self
-                .platform_text_system
-                .layout_line(&text, font_size, runs);
+            let cuts = pieces(&text);
+            let mut layout = match &cuts {
+                // its pieces are laid out through the cache, which takes the lock
+                Some(cuts) => {
+                    drop(current_frame);
+                    let layout = self.layout_in_pieces(&text, font_size, runs, cuts);
+                    current_frame = self.current_frame.write();
+                    layout
+                }
+                None => self.shape(&text, font_size, runs),
+            };
 
             if let Some(force_width) = force_width {
                 apply_force_width_to_layout(&mut layout, force_width);
@@ -923,10 +1065,61 @@ impl LineLayoutCache {
                 force_width,
             });
             let layout = Arc::new(layout);
+            if let Some(cuts) = cuts {
+                current_frame.cuts.insert(key.clone(), cuts.as_slice().into());
+            }
             current_frame.lines.insert(key.clone(), layout.clone());
             current_frame.used_lines.push(key);
             layout
         }
+    }
+
+    /// `text` laid out a piece at a time, each piece from `cuts` to the
+    /// next a line of its own in the cache, and put back together, each
+    /// piece's glyphs where the pieces before it end (`pieces`).
+    fn layout_in_pieces(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+        cuts: &[usize],
+    ) -> LineLayout {
+        let mut line = LineLayout {
+            font_size,
+            len: text.len(),
+            ..Default::default()
+        };
+        let mut start = 0;
+        // where each piece starts, summed in f64 as the pen is (elundqvist/kvist#617):
+        // in f32 a line of thousands of pieces drifted from the line shaped whole
+        let mut offset = 0f64;
+        for end in cuts.iter().copied().chain([text.len()]) {
+            let runs = runs_within(runs, start..end);
+            let piece = self.layout_line(&text[start..end], font_size, &runs, None);
+            for run in &piece.runs {
+                let mut glyphs = run.glyphs.clone();
+                for glyph in &mut glyphs {
+                    glyph.position.x = px((offset + f64::from(f32::from(glyph.position.x))) as f32);
+                    glyph.index += start;
+                }
+                match line.runs.last_mut() {
+                    Some(last) if last.font_id == run.font_id => last.glyphs.extend(glyphs),
+                    _ => line.runs.push(ShapedRun {
+                        font_id: run.font_id,
+                        glyphs,
+                    }),
+                }
+            }
+            offset += f64::from(f32::from(piece.width));
+            line.width = px(offset as f32);
+            (line.ascent, line.descent) = if start == 0 {
+                (piece.ascent, piece.descent)
+            } else {
+                (line.ascent.max(piece.ascent), line.descent.max(piece.descent))
+            };
+            start = end;
+        }
+        line
     }
 
     /// Try to retrieve a previously-shaped line layout using a caller-provided content hash.
@@ -1056,9 +1249,7 @@ impl LineLayoutCache {
         }
 
         let text = materialize_text();
-        let mut layout = self
-            .platform_text_system
-            .layout_line(&text, font_size, runs);
+        let mut layout = self.shape(&text, font_size, runs);
 
         if let Some(force_width) = force_width {
             apply_force_width_to_layout(&mut layout, force_width);
@@ -1754,5 +1945,132 @@ mod tests {
             );
             row_start = row_end;
         }
+    }
+
+    /// A long line of words, as pasted into a one-line box, in no order
+    /// that repeats.
+    fn words(len: usize) -> String {
+        let words = ["alpha", "beta", "gamma", "delta", "epsilon", "omicron"];
+        let mut text = String::new();
+        let mut seed = 7u32;
+        while text.len() < len {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            text.push_str(words[(seed >> 16) as usize % words.len()]);
+            text.push(' ');
+        }
+        text.truncate(len);
+        text
+    }
+
+    /// A long line laid out in pieces is the line shaped whole: its
+    /// glyphs, where they stand and what they stand for, and its width.
+    #[test]
+    fn a_long_line_laid_out_in_pieces_is_the_line_shaped_whole() {
+        let text = words(7000);
+        assert!(pieces(&text).is_some_and(|cuts| cuts.len() > 10));
+        let cache = LineLayoutCache::new(Arc::new(crate::NoopTextSystem));
+        let runs = [FontRun {
+            len: text.len(),
+            font_id: FontId(0),
+        }];
+        let pieced = cache.layout_line(text.as_str(), px(14.), &runs, None);
+        let whole = crate::NoopTextSystem.layout_line(&text, px(14.), &runs);
+        // as near as a sum of 7,000 advances is to their own sums
+        let near = |a: Pixels, b: Pixels| (a - b).abs() <= b.abs() * 1e-4 + px(0.01);
+        assert!(near(pieced.width, whole.width));
+        assert_eq!(
+            (pieced.len, pieced.ascent, pieced.descent),
+            (whole.len, whole.ascent, whole.descent)
+        );
+        let glyphs = |l: &LineLayout| {
+            l.runs
+                .iter()
+                .flat_map(|r| r.glyphs.iter().map(move |g| (r.font_id, g.id, g.index, g.position)))
+                .collect::<Vec<_>>()
+        };
+        let (pieced, whole) = (glyphs(&pieced), glyphs(&whole));
+        assert_eq!(pieced.len(), whole.len());
+        for (p, w) in pieced.iter().zip(&whole) {
+            assert_eq!((p.0, p.1, p.2), (w.0, w.1, w.2));
+            assert!(near(p.3.x, w.3.x) && p.3.y == w.3.y, "{p:?} {w:?}");
+        }
+    }
+
+    /// The same words pasted over and over, whose 16 bytes before each
+    /// space are alike and picked for a cut at none of them, are cut at
+    /// least every `MOST_PIECE` bytes, and a key typed at the line's end
+    /// shapes its last piece: uncut, the line was shaped whole at every
+    /// key (elundqvist/kvist#664).
+    #[test]
+    fn the_same_words_pasted_over_and_over_are_cut_into_pieces() {
+        for word in ["lorem ", "ipsum dolor ", "select * from t where x = 1 "] {
+            let text = word.repeat(8000 / word.len());
+            let cuts = pieces(&text).expect("cut");
+            let mut last = 0;
+            for cut in cuts.iter().copied().chain([text.len()]) {
+                assert!(cut - last <= MOST_PIECE + word.len(), "a piece of {} bytes", cut - last);
+                last = cut;
+            }
+        }
+        let cache = LineLayoutCache::new(Arc::new(crate::NoopTextSystem));
+        let mut text = "lorem ".repeat(1500);
+        for key in 0..20 {
+            let runs = [FontRun {
+                len: text.len(),
+                font_id: FontId(0),
+            }];
+            let before = cache.shaped_bytes();
+            cache.layout_line(&text, px(14.), &runs, None);
+            cache.finish_frame();
+            let shaped = cache.shaped_bytes() - before;
+            if key > 0 {
+                assert!(shaped <= MOST_PIECE * 2, "{shaped} bytes shaped at key {key}");
+            }
+            text.push('x');
+        }
+    }
+
+    /// Typing in a line of 7,000 characters shapes again the piece the
+    /// key changed, at its end or in its middle, frame after frame as a
+    /// one-line box lays it out: it shaped the whole line at every key,
+    /// and typing a line cost the square of its length
+    /// (elundqvist/kvist#664).
+    #[test]
+    fn a_key_typed_in_a_long_line_shapes_the_piece_it_changed() {
+        let cache = LineLayoutCache::new(Arc::new(crate::NoopTextSystem));
+        let lay_out = |text: &str| {
+            let runs = [FontRun {
+                len: text.len(),
+                font_id: FontId(0),
+            }];
+            let before = cache.shaped_bytes();
+            cache.layout_line(text, px(14.), &runs, None);
+            cache.finish_frame();
+            cache.shaped_bytes() - before
+        };
+        let mut text = words(7000);
+        assert_eq!(lay_out(&text), text.len(), "the first frame shapes it all");
+        assert_eq!(lay_out(&text), 0, "the next finds it");
+        for key in 0..50 {
+            text.push(if key % 6 == 5 { ' ' } else { 'x' });
+            let shaped = lay_out(&text);
+            assert!(shaped <= LONG_LINE, "{shaped} bytes shaped at key {key}");
+        }
+        for key in 0..50 {
+            text.insert(3000 + key, 'y');
+            let shaped = lay_out(&text);
+            assert!(
+                shaped <= LONG_LINE * 2,
+                "{shaped} bytes shaped at key {key} in the middle"
+            );
+        }
+        // a line with a Hebrew word in it, which is laid out as a whole,
+        // is shaped whole
+        let hebrew = format!("{}\u{05D0}\u{05D1}", words(3000));
+        assert!(pieces(&hebrew).is_none());
+        assert_eq!(lay_out(&hebrew), hebrew.len());
+        // and a short line, and one with no space to cut it at
+        assert!(pieces(&words(LONG_LINE)).is_none());
+        assert!(pieces(&"x".repeat(7000)).is_none());
     }
 }

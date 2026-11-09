@@ -409,6 +409,30 @@ asks (section 4(b)); each says so at its top:
   still a task of the scheduler, whose clock drives it. A test, with
   the threaded dispatcher, of a timer with every thread of the pool
   held.
+- `src/text_system/line_layout.rs` and `src/text_system.rs`: a line
+  longer than 1,024 bytes is shaped in pieces, cut before one in 64 of
+  its spaces, picked by the 16 bytes before each (`pieces`), each piece a
+  line of its own in the layout cache and the line put together from
+  them (elundqvist/kvist#664). A key typed in a long line shapes again
+  the piece it changed and finds the rest in the cache, where a one-line
+  box shaped its whole line at every key and typing a line cost the
+  square of its length: a key at the end of Kvist's palette holding
+  7,000 characters took 15.7 ms of CPU, and takes 8.3 ms, as in an empty
+  box. A line carried into the next frame takes its pieces with it, and
+  where it is cut, so a long line in view is not cut again at each frame. A
+  space takes no ligature, kerning or joining over it, so the pieces are
+  the line shaped whole; a line with a right-to-left letter, a direction
+  mark or a tab in it is shaped whole, and so is a stretch with no space.
+  Where the 16 bytes pick no space for 4 KB, as in the same words pasted
+  over and over, the first space past that is cut at. Each piece starts
+  where the ones before it end, summed in f64. A line cut so is kept in
+  the cache as its pieces and as the line put together from them, twice
+  the memory of its glyphs. `WindowTextSystem::shaped_bytes` counts the
+  bytes handed to the platform to be shaped, the rows of a line laid out
+  row by row among them. Tests that a line laid out in pieces is the line
+  shaped whole, that a key typed at the end or in the middle of a line
+  of 7,000 characters shapes no more than a piece or two, and that the
+  same words pasted over and over are cut too.
 
 ## Tests
 
