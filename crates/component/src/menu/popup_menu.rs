@@ -308,6 +308,9 @@ pub struct PopupMenu {
     scrollable: bool,
     external_link_icon: bool,
     scroll_handle: ScrollHandle,
+    /// The item to scroll to once the items have been laid out, and whether a frame has
+    /// been drawn waiting for that (`PopupMenu::lit_checked`).
+    scroll_to_lit: Option<(usize, bool)>,
     // This will update on render
     submenu_anchor: (Anchor, Pixels),
 
@@ -344,6 +347,7 @@ impl PopupMenu {
             bounds: Bounds::default(),
             scrollable: false,
             scroll_handle: ScrollHandle::default(),
+            scroll_to_lit: None,
             external_link_icon: true,
             size: Size::default(),
             submenu_anchor: (Anchor::TopLeft, Pixels::ZERO),
@@ -715,6 +719,48 @@ impl PopupMenu {
         self
     }
 
+    /// Light the first of the items added so far that is checked and can be
+    /// chosen, as the menu opens, the one a select has chosen: the keyboard
+    /// starts from it, as in VS Code's select and a native one, Down going on
+    /// to the item after it, Up to the one before and Return keeping it,
+    /// where the first Down lit the menu's first item (elundqvist/kvist#678).
+    /// A menu with no such item opens with none lit. A menu with more items
+    /// than it has room for opens scrolled to it (`scroll_to_lit`).
+    pub fn lit_checked(mut self) -> Self {
+        if let Some(ix) = self
+            .menu_items
+            .iter()
+            .position(|item| item.is_clickable() && item.is_checked())
+        {
+            self.selected_index = Some(ix);
+            self.selected_by_pointer = false;
+            self.scroll_to_lit = Some((ix, false));
+        }
+        self
+    }
+
+    /// Whether the menu is drawn hidden this frame, as it waits to be laid out before it
+    /// scrolls to the item lit as it opened, which it then does: a scroll asked of a menu
+    /// not yet laid out has no room to go by and is lost, so a select of more options than
+    /// fit opened at its top, the option chosen out of sight and no row lit
+    /// (elundqvist/kvist#678). It waits one frame, drawn hidden, so the menu is first seen
+    /// scrolled, and scrolls the next whatever it has.
+    fn scroll_to_lit_item(&mut self, window: &mut Window) -> bool {
+        match self.scroll_to_lit {
+            Some((ix, waited)) if waited || self.scroll_handle.bounds().size.height > px(0.) => {
+                self.scroll_handle.scroll_to_item(ix);
+                self.scroll_to_lit = None;
+                false
+            }
+            Some((ix, _)) => {
+                self.scroll_to_lit = Some((ix, true));
+                window.request_animation_frame();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Replace all menu items by re-running a builder on this menu, keeping its
     /// identity (focus, parent menu, layer priority).
     ///
@@ -769,9 +815,10 @@ impl PopupMenu {
             }
         });
         self.selected_by_pointer = by_pointer && self.selected_index.is_some();
-        if let Some(ix) = self.selected_index.filter(|_| !by_pointer) {
-            self.scroll_handle.scroll_to_item(ix);
-        }
+        self.scroll_to_lit = self
+            .selected_index
+            .filter(|_| !by_pointer)
+            .map(|ix| (ix, false));
         cx.notify();
     }
 
@@ -1509,6 +1556,7 @@ struct RenderOptions {
 impl Render for PopupMenu {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_submenu_menu_anchor(window);
+        let unplaced = self.scroll_to_lit_item(window);
 
         // Submenus attached via the public `item()` + `PopupMenuItem::submenu()`
         // path (from contexts that only have the menu value, e.g. a table
@@ -1568,6 +1616,7 @@ impl Render for PopupMenu {
             .on_mouse_down_out(cx.listener(Self::on_mouse_down_out))
             .popover_style(cx)
             .text_color(cx.theme().popover_foreground)
+            .when(unplaced, |this| this.invisible())
             .relative()
             .occlude()
             // the room around the items is the menu's, not the scroll's:
@@ -1641,6 +1690,47 @@ mod tests {
             }
             label => menu.item(PopupMenuItem::new(label)),
         })
+    }
+
+    /// A select's menu opens on the option it has chosen, lit, so Down goes
+    /// to the option after it and Up to the one before, where the first Down
+    /// lit the first option (elundqvist/kvist#678); a menu not told to opens
+    /// with none lit, and one with nothing checked that can be chosen too.
+    #[gpui::test]
+    fn a_menu_told_to_starts_from_its_checked_item(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::init);
+        let options = |menu: PopupMenu| {
+            ["GET", "POST", "PUT", "PATCH"].iter().fold(menu.label("Method"), |menu, m| {
+                menu.item(PopupMenuItem::new(*m).checked(*m == "PUT"))
+            })
+        };
+        let (menu, cx) = cx.add_window_view(|_, cx| options(PopupMenu::new(cx)).lit_checked());
+        assert_eq!(menu.update(cx, |menu, _| menu.selected_index), Some(3));
+        let key = |cx: &mut gpui::VisualTestContext, down: bool| {
+            cx.update(|window, cx| {
+                menu.update(cx, |menu, cx| {
+                    if down {
+                        menu.select_down(&SelectDown, window, cx);
+                    } else {
+                        menu.select_up(&SelectUp, window, cx);
+                    }
+                    menu.selected_index
+                })
+            })
+        };
+        assert_eq!(key(cx, true), Some(4), "Down from PUT is PATCH");
+        assert_eq!(key(cx, false), Some(3));
+        assert_eq!(key(cx, false), Some(2), "Up from PUT is POST");
+
+        let (menu, cx) = cx.add_window_view(|_, cx| options(PopupMenu::new(cx)));
+        assert_eq!(menu.update(cx, |menu, _| menu.selected_index), None);
+        let (menu, cx) = cx.add_window_view(|_, cx| {
+            PopupMenu::new(cx)
+                .item(PopupMenuItem::new("A"))
+                .item(PopupMenuItem::new("B").checked(true).disabled(true))
+                .lit_checked()
+        });
+        assert_eq!(menu.update(cx, |menu, _| menu.selected_index), None);
     }
 
     /// A menu rebuilt while it is open, because what it lists changed, kept
@@ -1797,6 +1887,55 @@ mod tests {
         draw(cx);
         let offset = menu.update(cx, |menu, _| menu.scroll_handle.offset());
         assert!(offset.y < px(-600.), "{offset:?}");
+    }
+
+    /// A menu lit on its checked item, with more items than fit, opens
+    /// scrolled to it, and so does one rebuilt with the keyboard's item out
+    /// of sight: asked before the items were laid out, the scroll was lost,
+    /// and a select of 40 options with one near its end chosen opened at its
+    /// top, no row lit to be seen (elundqvist/kvist#678).
+    #[gpui::test]
+    fn a_menu_lit_on_an_item_out_of_sight_opens_scrolled_to_it(cx: &mut gpui::TestAppContext) {
+        let options = |menu: PopupMenu, checked: usize| {
+            (0..40).fold(menu, |menu, i| {
+                menu.item(PopupMenuItem::new(format!("Option {i}")).checked(i == checked))
+            })
+        };
+        // opened in a window already drawn at its size
+        cx.update(crate::init);
+        let (host, cx) = cx.add_window_view(|_, cx| Shown(cx.new(|cx| PopupMenu::new(cx))));
+        cx.simulate_resize(gpui::size(px(240.), px(480.)));
+        draw(cx);
+        let menu = host.update(cx, |host, cx| {
+            host.0 = cx.new(|cx| options(PopupMenu::new(cx), 37).lit_checked());
+            cx.notify();
+            host.0.clone()
+        });
+        draw(cx);
+        draw(cx);
+        let in_sight = |cx: &mut gpui::VisualTestContext, ix: usize| {
+            menu.update(cx, |menu, _| {
+                let (offset, room) = (menu.scroll_handle.offset(), menu.scroll_handle.bounds());
+                let item = menu.scroll_handle.bounds_for_item(ix).expect("the item laid out");
+                let top = item.top() + offset.y;
+                assert!(
+                    top >= room.top() - px(0.5) && top + item.size.height <= room.bottom() + px(0.5),
+                    "{item:?} scrolled by {offset:?} in {room:?}"
+                );
+                (menu.selected_index, offset.y)
+            })
+        };
+        let (lit, offset) = in_sight(cx, 37);
+        assert_eq!(lit, Some(37));
+        assert!(offset < px(-600.), "{offset:?}");
+
+        // scrolled back to the top, then rebuilt: the keyboard's item again
+        menu.update(cx, |menu, _| menu.scroll_handle.set_offset(gpui::point(px(0.), px(0.))));
+        cx.update(|window, cx| {
+            menu.update(cx, |menu, cx| menu.rebuild(window, cx, |menu, _, _| options(menu, 37)))
+        });
+        draw(cx);
+        assert_eq!(in_sight(cx, 37).0, Some(37));
     }
 
     /// A submenu at the foot of a menu that scrolls, scrolled to and opened,
