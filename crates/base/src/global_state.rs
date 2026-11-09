@@ -1,6 +1,6 @@
 use std::rc::{Rc, Weak};
 
-use gpui::{App, Entity, Global, OwnedMenu};
+use gpui::{App, Entity, Global, OwnedMenu, Pixels, Size};
 
 use crate::text::TextViewState;
 
@@ -17,6 +17,9 @@ pub struct GlobalState {
     deferred_popovers: Vec<Weak<()>>,
     suppress_text_selection: bool,
     pub(crate) text_view_state_stack: Vec<Entity<TextViewState>>,
+    /// The room of each popup being laid out, the innermost last
+    /// (`Positioner::content_room`).
+    pub(crate) popup_rooms: Vec<Size<Pixels>>,
     selection_document_order: u64,
 }
 
@@ -29,6 +32,7 @@ impl GlobalState {
             deferred_popovers: Vec::new(),
             suppress_text_selection: false,
             text_view_state_stack: Vec::new(),
+            popup_rooms: Vec::new(),
             selection_document_order: 1,
         }
     }

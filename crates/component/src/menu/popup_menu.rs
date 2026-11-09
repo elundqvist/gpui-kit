@@ -1224,12 +1224,26 @@ impl PopupMenu {
     /// menu as tall as its room stood the inset lower than its room, its
     /// last row past the window's foot. A scrollable menu with no height of
     /// its own keeps to half the window, and 450 px, as it did.
-    fn room(&self, viewport: gpui::Size<Pixels>, inset: Pixels) -> gpui::Size<Pixels> {
+    ///
+    /// A menu hung from a trigger keeps to the room of its popup, `popup`
+    /// (`Positioner::content_room`), the side of the trigger with more room
+    /// and no more, and scrolls: one taller than the room on both sides was
+    /// held into the window over its own trigger (elundqvist/kvist#665).
+    fn room(
+        &self,
+        viewport: gpui::Size<Pixels>,
+        inset: Pixels,
+        popup: Option<gpui::Size<Pixels>>,
+    ) -> gpui::Size<Pixels> {
         let margin = WINDOW_MARGIN + inset;
         let room = gpui::Size {
             width: (viewport.width - margin * 2.).max(px(0.)),
             height: (viewport.height - margin * 2.).max(px(0.)),
         };
+        let room = popup.map_or(room, |popup| gpui::Size {
+            width: room.width.min(popup.width),
+            height: room.height.min(popup.height),
+        });
         let height = match self.max_height {
             Some(height) => height,
             None if self.scrollable => (viewport.height * 0.5).min(px(450.)),
@@ -1519,10 +1533,13 @@ impl Render for PopupMenu {
 
         // the items' room, inside the menu's own padding
         let pad = rems(0.25).to_pixels(window.rem_size());
+        // a submenu hangs from its row, not from the popup's trigger
+        let popup = gpui_base::Positioner::content_room(cx).filter(|_| self.parent_menu.is_none());
         let room = self
             .room(
                 window.viewport_size(),
                 window.client_inset().unwrap_or(px(0.)),
+                popup,
             )
             .map(|v| (v - pad * 2.).max(px(0.)));
 
@@ -1846,7 +1863,8 @@ mod tests {
         let scrolls = menu.update(cx, |menu, _| menu.scroll_handle.max_offset());
         assert_eq!(scrolls.y, px(0.), "{scrolls:?}");
         let room = |menu: &PopupMenu, inset: f32| {
-            menu.room(gpui::size(px(640.), px(480.)), px(inset)).height
+            menu.room(gpui::size(px(640.), px(480.)), px(inset), None)
+                .height
         };
         assert_eq!(menu.update(cx, |menu, _| room(menu, 0.)), px(464.));
         assert_eq!(menu.update(cx, |menu, _| room(menu, 20.)), px(424.));
@@ -1929,5 +1947,90 @@ mod tests {
             menu.set_selected_index(1, cx);
         });
         assert_eq!(rebuild(cx, &["Restart", "Alpha", "Beta"]), Some(2));
+    }
+
+    /// A button `top` px down a window with a menu of 30 items, and the
+    /// menu it last built.
+    struct Tall {
+        top: f32,
+        menu: Rc<std::cell::RefCell<Option<WeakEntity<PopupMenu>>>>,
+    }
+
+    impl Render for Tall {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            use crate::menu::DropdownMenu as _;
+            let menu = self.menu.clone();
+            div().size_full().child(
+                div().absolute().top(px(self.top)).left(px(20.)).child(
+                    div().debug_selector(|| "tall-trigger".into()).child(
+                        crate::button::Button::new("trigger")
+                            .label("Open")
+                            .dropdown_menu(move |popup, _, cx| {
+                                *menu.borrow_mut() = Some(cx.entity().downgrade());
+                                (0..30).fold(popup, |popup, i| {
+                                    popup.item(PopupMenuItem::new(format!("Item {i}")))
+                                })
+                            }),
+                    ),
+                ),
+            )
+        }
+    }
+
+    /// A menu taller than the room on either side of its button goes on
+    /// the side with more room, keeps to it and scrolls, as VS Code's
+    /// does: it was held into the window over its own button, Settings'
+    /// list of providers in a window 480 px high (elundqvist/kvist#665).
+    #[gpui::test]
+    fn a_menu_taller_than_the_room_on_both_sides_keeps_to_the_roomier(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_base::GlobalState::init(cx);
+            cx.set_global(crate::Theme::default());
+            crate::init(cx);
+        });
+        for (top, below) in [(150., true), (300., false)] {
+            let menu: Rc<std::cell::RefCell<Option<WeakEntity<PopupMenu>>>> = Rc::default();
+            let (_, cx) = cx.add_window_view({
+                let menu = menu.clone();
+                move |_, _| Tall { top, menu }
+            });
+            cx.simulate_resize(gpui::size(px(640.), px(480.)));
+            let draw = |cx: &mut gpui::VisualTestContext| {
+                cx.run_until_parked();
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+            };
+            draw(cx);
+            let trigger = cx.debug_bounds("tall-trigger").expect("the button");
+            cx.simulate_click(trigger.center(), Default::default());
+            for _ in 0..3 {
+                draw(cx);
+            }
+            let menu = menu
+                .borrow()
+                .clone()
+                .and_then(|m| m.upgrade())
+                .expect("the menu");
+            let (bounds, scrolls) = menu.update(cx, |menu, _| {
+                (menu.bounds, menu.scroll_handle.max_offset().y)
+            });
+            assert!(
+                bounds.top() >= px(8.) && bounds.bottom() <= px(472.),
+                "out of the window: {bounds:?}"
+            );
+            if below {
+                assert!(
+                    bounds.top() >= trigger.bottom(),
+                    "{bounds:?} over {trigger:?}"
+                );
+            } else {
+                assert!(
+                    bounds.bottom() <= trigger.top(),
+                    "{bounds:?} over {trigger:?}"
+                );
+            }
+            assert!(scrolls > px(0.), "its list does not scroll: {bounds:?}");
+        }
     }
 }

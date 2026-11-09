@@ -10,7 +10,7 @@ use gpui::{
     Window, point, px,
 };
 
-use crate::Placement;
+use crate::{GlobalState, Placement};
 
 /// Alignment of a popup along the side it is placed on.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -147,6 +147,17 @@ impl Positioner {
         self
     }
 
+    /// The room the popup being laid out has (`room`), for its content to
+    /// keep to as it renders, or `None` outside a popup: a menu taller
+    /// than the room on both sides of its trigger keeps to the side with
+    /// more and scrolls, as VS Code's does, where it was held into the
+    /// window over its own trigger (elundqvist/kvist#665). Set while the
+    /// popup's content is laid out, which is when a view in it renders.
+    pub fn content_room(cx: &App) -> Option<Size<Pixels>> {
+        cx.try_global::<GlobalState>()
+            .and_then(|state| state.popup_rooms.last().copied())
+    }
+
     /// Where this element puts a popup of `popup_size` in a window of
     /// `viewport_size` with no client inset: for a check of where a popup
     /// opens without drawing it.
@@ -202,6 +213,63 @@ fn resolve(
     }
 }
 
+/// The room a popup has on each side of its trigger, inside the window's
+/// `margin` and past the `offset` gap it keeps from the trigger.
+struct Sides {
+    left: Pixels,
+    right: Pixels,
+    above: Pixels,
+    below: Pixels,
+}
+
+impl Sides {
+    fn of(
+        trigger_bounds: Bounds<Pixels>,
+        viewport_size: Size<Pixels>,
+        margin: Pixels,
+        offset: Pixels,
+    ) -> Self {
+        let right_limit = (viewport_size.width - margin).max(margin);
+        let bottom_limit = (viewport_size.height - margin).max(margin);
+        Sides {
+            left: (trigger_bounds.left() - margin - offset).max(px(0.)),
+            right: (right_limit - trigger_bounds.right() - offset).max(px(0.)),
+            above: (trigger_bounds.top() - margin - offset).max(px(0.)),
+            below: (bottom_limit - trigger_bounds.bottom() - offset).max(px(0.)),
+        }
+    }
+}
+
+/// The most room a popup placed by `strategy` has in a window of
+/// `viewport_size`, `margin` kept from its edges: one put on a side of its
+/// trigger has, across that side, the room on the side of the two with
+/// more of it (`resolve_placement` puts a popup that fits it there), and
+/// along it the window's; one hung from a corner has the window's.
+fn room(strategy: Strategy, viewport_size: Size<Pixels>, margin: Pixels) -> Size<Pixels> {
+    let window = Size::new(
+        (viewport_size.width - margin * 2.).max(px(0.)),
+        (viewport_size.height - margin * 2.).max(px(0.)),
+    );
+    let Strategy::Side {
+        trigger_bounds,
+        placement,
+        offset,
+        ..
+    } = strategy
+    else {
+        return window;
+    };
+    let sides = Sides::of(trigger_bounds, viewport_size, margin, offset);
+    match placement {
+        Some(Placement::Left | Placement::Right) => {
+            Size::new(sides.left.max(sides.right), window.height)
+        }
+        Some(Placement::Top | Placement::Bottom) | None => {
+            Size::new(window.width, sides.above.max(sides.below))
+        }
+    }
+}
+
 /// The side a popup goes on. The room on each side is past the `offset`
 /// gap the popup keeps from its trigger: a popup that fitted below only
 /// without its gap stayed below and was held into the window over its
@@ -214,12 +282,12 @@ fn resolve_placement(
     offset: Pixels,
     preferred: Option<Placement>,
 ) -> Placement {
-    let right_limit = (viewport_size.width - margin).max(margin);
-    let bottom_limit = (viewport_size.height - margin).max(margin);
-    let available_left = (trigger_bounds.left() - margin - offset).max(px(0.));
-    let available_right = (right_limit - trigger_bounds.right() - offset).max(px(0.));
-    let available_above = (trigger_bounds.top() - margin - offset).max(px(0.));
-    let available_below = (bottom_limit - trigger_bounds.bottom() - offset).max(px(0.));
+    let Sides {
+        left: available_left,
+        right: available_right,
+        above: available_above,
+        below: available_below,
+    } = Sides::of(trigger_bounds, viewport_size, margin, offset);
 
     match preferred {
         Some(Placement::Right) if popup_size.width <= available_right => Placement::Right,
@@ -316,11 +384,19 @@ impl Element for Positioner {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        let margin = self.margin + window.client_inset().unwrap_or(px(0.));
+        GlobalState::init(cx);
+        GlobalState::global_mut(cx).popup_rooms.push(room(
+            self.strategy,
+            window.viewport_size(),
+            margin,
+        ));
         let child_layout_ids = self
             .children
             .iter_mut()
             .map(|child| child.request_layout(window, cx))
             .collect::<Vec<_>>();
+        GlobalState::global_mut(cx).popup_rooms.pop();
         let layout_id = window.request_layout(
             Style {
                 position: Position::Absolute,
@@ -688,5 +764,46 @@ mod tests {
         assert_eq!(position.1, Placement::Bottom);
         assert_eq!(position.0.top(), WINDOW_MARGIN);
         assert_eq!(position.0.left(), px(60.));
+    }
+
+    /// A popup's room is the side of its trigger with more of it, past
+    /// the gap, and the window's along that side: a menu taller than the
+    /// room on both sides keeps to it, where it was held into the window
+    /// over its trigger (elundqvist/kvist#665). One hung from a corner
+    /// has the window's.
+    #[test]
+    fn a_popups_room_is_its_roomier_side() {
+        let strategy = |placement| Strategy::Side {
+            trigger_bounds: trigger(200., 100., 40., 20.),
+            placement,
+            align: Align::Start,
+            offset: px(6.),
+        };
+        // 100 above less the margin and the gap, 400 below the trigger's
+        // foot, at 120, less the same
+        assert_eq!(
+            room(strategy(Some(Placement::Bottom)), viewport(), MARGIN),
+            Size::new(px(492.), px(270.))
+        );
+        assert_eq!(
+            room(strategy(Some(Placement::Top)), viewport(), MARGIN),
+            Size::new(px(492.), px(270.))
+        );
+        // 200 to its left, 260 to its right
+        assert_eq!(
+            room(strategy(Some(Placement::Right)), viewport(), MARGIN),
+            Size::new(px(250.), px(392.))
+        );
+        assert_eq!(
+            room(
+                Strategy::Corner {
+                    anchor: Anchor::TopLeft,
+                    position: point(px(10.), px(10.)),
+                },
+                viewport(),
+                MARGIN
+            ),
+            Size::new(px(492.), px(392.))
+        );
     }
 }
