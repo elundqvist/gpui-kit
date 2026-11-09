@@ -85,8 +85,8 @@ impl TextSelector {
         };
 
         let end = offset + char.len_utf8();
-        let prev_chars = text.chars_at(offset).reversed().take(128);
-        let next_chars = text.chars_at(end).take(128);
+        let prev_chars = text.chars_at(offset).reversed();
+        let next_chars = text.chars_at(end);
         Some(word_range_from_chars(offset, char, prev_chars, next_chars))
     }
 }
@@ -118,8 +118,8 @@ mod tests {
             (1, 0, Some("abcde")),
             (1, 4, Some("abcde")),
             (1, 5, Some(" ")),
-            (1, 6, Some("中")),
-            (1, 9, Some("文")),
+            (1, 6, Some("中文")),
+            (1, 9, Some("中文")),
             (1, 13, Some("🎉")),
             (1, 20, Some("test")),
             (2, 5, Some("[")),
@@ -208,7 +208,7 @@ mod tests {
         assert_eq!(taken("hello world"), "world");
         assert_eq!(taken("trailing   "), "   ");
         assert_eq!(taken("  é_word"), "é_word");
-        assert_eq!(taken("中文"), "文", "as a double-click on it takes it");
+        assert_eq!(taken("中文"), "中文", "as a double-click on it takes it");
         // the end of the text, with no line break
         assert_eq!(taken("last"), "last");
         // punctuation, and an empty line: nothing, a caret at the end

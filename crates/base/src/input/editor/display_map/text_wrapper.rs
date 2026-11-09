@@ -1015,6 +1015,13 @@ impl LineLayout {
         x > row.width + last.half()
     }
 
+    /// Where the cluster drawn under `x` starts, on a layout of one row, `x` taken as
+    /// [`Self::closest_index_for_x`] takes it: `None` past the row's end.
+    pub(crate) fn index_for_x(&self, x: Pixels, last_layout: &LastLayout) -> Option<usize> {
+        let x = x - last_layout.alignment_offset(self.longest_width);
+        self.wrapped_lines.first()?.index_for_x(x - self.line_indent(0))
+    }
+
     pub(crate) fn index_for_position(
         &self,
         pos: Point<Pixels>,
@@ -1660,6 +1667,24 @@ mod tests {
         for (x, at) in [(2., 0), (4., 1), (8., 1), (10., 2), (16., 3)] {
             assert_eq!(closest_grapheme_edge(&abc, px(x)), at, "a click at {x} on abc");
         }
+    }
+
+    /// The letter under the pointer is the one whose box it is in, which a double-click
+    /// takes the word of, where the boundary nearest the pointer on the right half of a
+    /// word's last letter is past the word, and a double-click there took the space after
+    /// it; past a row's end there is none.
+    #[test]
+    fn the_letter_under_the_pointer_is_the_one_it_is_on() {
+        let line = shaped("hello world");
+        let mut layout = LineLayout::new();
+        layout.set_wrapped_lines(smallvec::smallvec![line]);
+        let last_layout = test_last_layout(px(20.));
+        // `o` runs from 24 to 30
+        assert_eq!(layout.closest_index_for_x(px(28.), &last_layout), 5);
+        assert_eq!(layout.index_for_x(px(28.), &last_layout), Some(4));
+        assert_eq!(layout.index_for_position(point(px(28.), px(5.)), &last_layout), Some(4));
+        assert_eq!(layout.index_for_x(px(31.), &last_layout), Some(5), "the space");
+        assert_eq!(layout.index_for_x(px(70.), &last_layout), None, "past the row's end");
     }
 
     /// `ab אב cd` laid out with its glyphs at `xs`, each 10 px on, as a bidi shaper draws

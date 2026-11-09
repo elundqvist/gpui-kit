@@ -309,6 +309,17 @@ pub fn paste_unanswered(window: &Window, cx: &App) -> bool {
         })
 }
 
+/// What a point in the text is taken for (`text_index_for_mouse_position`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    /// The boundary nearest it, where a click puts the caret.
+    Caret,
+    /// That, and nothing past the end of a row, for a hover.
+    Hover,
+    /// Where the letter under it starts, which a double-click takes the word of.
+    Letter,
+}
+
 /// A paste waiting for the clipboard: what holds its window's input, until
 /// it lands or is given up, and whether its window says that it waits.
 struct PasteWait {
@@ -2301,9 +2312,15 @@ impl<M: InputModeKind> InputBaseState<M> {
             return;
         }
 
-        // Double click to select word
+        // Double click to select word: the word of the letter under the pointer, as the
+        // read-only view takes it; the boundary nearest the pointer, on the right half of a
+        // word's last letter, is past the word, and took the space after it. Past a row's
+        // end, the boundary there (`word_range`).
         if event.button == MouseButton::Left && event.click_count == 2 {
-            self.select_word(offset, window, cx);
+            let under = self
+                .text_index_for_mouse_position(event.position, Pick::Letter)
+                .map_or(offset, |(under, _)| under);
+            self.select_word(under, window, cx);
             return;
         }
 
@@ -2370,7 +2387,7 @@ impl<M: InputModeKind> InputBaseState<M> {
         // none, where it took the last line's end and showed its problem, and
         // so is the room past a row's end (elundqvist/kvist#656)
         let over_text = within_bounds
-            .then(|| self.text_index_for_mouse_position(event.position, true))
+            .then(|| self.text_index_for_mouse_position(event.position, Pick::Hover))
             .flatten();
         let Some((offset, _)) = over_text else {
             // Clear hover when mouse leaves the input
@@ -3049,17 +3066,19 @@ impl<M: InputModeKind> InputBaseState<M> {
     /// caret one row below the pointer.
     pub(crate) fn index_for_mouse_position(&self, position: Point<Pixels>) -> (usize, bool) {
         // Mouse is below all visible lines, return end of text
-        self.text_index_for_mouse_position(position, false)
+        self.text_index_for_mouse_position(position, Pick::Caret)
             .unwrap_or((self.text.len(), false))
     }
 
     /// `index_for_mouse_position`, or `None` below the last line drawn,
-    /// where there is no text, and for a `hover` past the end of a row of
-    /// a multi-line text (`LineLayout::is_past_row_end`).
+    /// where there is no text, and for a `Pick::Hover` past the end of a row
+    /// of a multi-line text (`LineLayout::is_past_row_end`); for a
+    /// `Pick::Letter`, where the letter under it starts, `None` past a row's
+    /// end.
     fn text_index_for_mouse_position(
         &self,
         position: Point<Pixels>,
-        hover: bool,
+        pick: Pick,
     ) -> Option<(usize, bool)> {
         // If the text is empty, always return 0
         if self.text.len() == 0 {
@@ -3104,7 +3123,10 @@ impl<M: InputModeKind> InputBaseState<M> {
 
             // Return offset by use closest_index_for_x if is single line mode.
             if self.is_single_line() {
-                let local_index = line_layout.closest_index_for_x(pos.x, last_layout);
+                let local_index = match pick {
+                    Pick::Letter => line_layout.index_for_x(pos.x, last_layout)?,
+                    _ => line_layout.closest_index_for_x(pos.x, last_layout),
+                };
                 // A single line never wraps, so there is no boundary to disambiguate.
                 return Some((self.resolve_index(line_start_offset + local_index), false));
             }
@@ -3113,8 +3135,12 @@ impl<M: InputModeKind> InputBaseState<M> {
             if let Some((local_index, line_end_affinity)) =
                 line_layout.closest_index_for_position(pos, last_layout)
             {
-                if hover && line_layout.is_past_row_end(pos, last_layout) {
+                if pick == Pick::Hover && line_layout.is_past_row_end(pos, last_layout) {
                     return None;
+                }
+                if pick == Pick::Letter {
+                    let under = line_layout.index_for_position(pos, last_layout)?;
+                    return Some((self.resolve_index(line_start_offset + under), false));
                 }
                 return Some((
                     self.resolve_index(line_start_offset + local_index),
