@@ -255,6 +255,7 @@ impl Inline {
 
     /// Paint the selection background.
     fn paint_selection(
+        text: &str,
         selection: &Selection,
         text_layout: &TextLayout,
         bounds: &Bounds<Pixels>,
@@ -265,6 +266,19 @@ impl Inline {
         let mut end = selection.end;
         if end < start {
             std::mem::swap(&mut start, &mut end);
+        }
+        if let Some(drawn) = crate::text_selection::drawn_selection(text, start..end, text_layout) {
+            for rect in drawn {
+                window.paint_quad(quad(
+                    rect,
+                    px(0.),
+                    color,
+                    Edges::default(),
+                    gpui::transparent_black(),
+                    BorderStyle::default(),
+                ));
+            }
+            return;
         }
         let Some(start_position) = text_layout.position_for_index(start) else {
             return;
@@ -452,7 +466,7 @@ impl Element for Inline {
                 .text_view_state()
                 .map(|state| state.read(cx).text_view_style.selection())
                 .unwrap_or_else(|| crate::Theme::global(cx).tokens.colors.selection);
-            Self::paint_selection(selection, &text_layout, &bounds, window, color);
+            Self::paint_selection(&self.text, selection, &text_layout, &bounds, window, color);
         }
 
         if is_selectable {

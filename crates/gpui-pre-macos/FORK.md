@@ -40,6 +40,11 @@ asks (section 4(b)); each says so at its top:
   lock is not held while AppKit is told: it may grow the window to the
   new least size and call the delegate at once. The window cannot be
   had in a test; checked on a Mac under Kvist.
+- `src/text_system.rs`: a line laid out takes the fields of gpui-pre's
+  `LineLayout` it does not set from `Default::default()`, so it builds
+  with gpui-pre as published and with the fork's, whose
+  `LineLayout::drawn` keeps where a line's clusters are drawn
+  (elundqvist/kvist#669). Not built here: it needs a Mac.
 
 ## Running its tests
 

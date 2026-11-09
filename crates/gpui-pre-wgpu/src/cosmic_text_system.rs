@@ -859,6 +859,7 @@ impl CosmicTextSystemState {
                 descent: Pixels::ZERO,
                 runs: Vec::new(),
                 len: text.len(),
+                ..Default::default()
             };
         };
 
@@ -947,6 +948,7 @@ impl CosmicTextSystemState {
             descent: descent.into(),
             runs,
             len: text.len(),
+            ..Default::default()
         }
     }
 }

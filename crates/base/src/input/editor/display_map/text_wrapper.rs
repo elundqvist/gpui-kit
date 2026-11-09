@@ -657,11 +657,72 @@ fn closest_grapheme_edge(line: &ShapedLine, x: Pixels) -> usize {
     let start = cursor.prev_boundary(text, 0).ok().flatten().unwrap_or(0);
     let mut cursor = unicode_segmentation::GraphemeCursor::new(ix, text.len(), true);
     let end = cursor.next_boundary(text, 0).ok().flatten().unwrap_or(text.len());
-    if line.x_for_index(end) - x < x - line.x_for_index(start) {
+    // the distances, as the carets in letters drawn right to left stand right of x for its
+    // start and left of it for its end (elundqvist/kvist#669)
+    if (line.x_for_index(end) - x).abs() < (x - line.x_for_index(start)).abs() {
         end
     } else {
         start
     }
+}
+
+/// Where the text in `range` of `row` is drawn, left to right, where some of its clusters
+/// are drawn right to left: each stretch its clusters cover, a cluster from where it is
+/// drawn to where the one drawn next to its right is. `None` where each is drawn to the
+/// right of the one before it in the text, whose range is drawn from the caret at its
+/// start to the caret at its end. Painted so, a selection of a word of Hebrew was a sliver
+/// beside it, and one from Latin into Hebrew lit what lay between (elundqvist/kvist#669).
+pub(crate) fn drawn_spans(
+    row: &gpui::LineLayout,
+    range: Range<usize>,
+) -> Option<SmallVec<[Range<Pixels>; 2]>> {
+    let mut glyphs = row.runs.iter().flat_map(|run| &run.glyphs);
+    let mut last = glyphs.next()?;
+    let in_order = glyphs.all(|glyph| {
+        if glyph.index == last.index {
+            return true;
+        }
+        let follows = last.index < glyph.index && last.position.x <= glyph.position.x;
+        last = glyph;
+        follows
+    });
+    if in_order {
+        return None;
+    }
+    let mut clusters: Vec<(usize, Pixels)> = row
+        .runs
+        .iter()
+        .flat_map(|run| &run.glyphs)
+        .map(|glyph| (glyph.index, glyph.position.x))
+        .collect();
+    clusters.sort_by_key(|(index, _)| *index);
+    clusters.dedup_by(|later, first| {
+        let same = later.0 == first.0;
+        if same {
+            first.1 = first.1.min(later.1);
+        }
+        same
+    });
+    let mut lefts: Vec<Pixels> = clusters.iter().map(|(_, left)| *left).collect();
+    lefts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let right_of = |left: Pixels| {
+        let next = lefts.partition_point(|x| *x <= left);
+        lefts.get(next).copied().unwrap_or(row.width)
+    };
+    let mut covered: SmallVec<[Range<Pixels>; 4]> = clusters
+        .iter()
+        .filter(|(index, _)| range.contains(index))
+        .map(|(_, left)| *left..right_of(*left))
+        .collect();
+    covered.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+    let mut spans: SmallVec<[Range<Pixels>; 2]> = SmallVec::new();
+    for span in covered {
+        match spans.last_mut() {
+            Some(last) if span.start <= last.end + px(0.01) => last.end = last.end.max(span.end),
+            _ => spans.push(span),
+        }
+    }
+    Some(spans)
 }
 
 /// The layout info of a line with soft wrapped lines.
@@ -826,6 +887,44 @@ impl LineLayout {
         }
 
         None
+    }
+
+    /// Where the text in `range` of this line, a local byte range, is drawn, where a row it
+    /// covers is drawn in part right to left: on such a row each stretch its clusters cover
+    /// (`drawn_spans`), and on a row drawn in order from the caret at its start to the caret
+    /// at its end, each as the row's index and its x from the line's left edge. `None` where
+    /// each row it covers is drawn in order (elundqvist/kvist#669).
+    pub(crate) fn drawn_spans(
+        &self,
+        range: Range<usize>,
+        last_layout: &LastLayout,
+    ) -> Option<Vec<(usize, Range<Pixels>)>> {
+        let x_offset = last_layout.alignment_offset(self.longest_width);
+        let mut spans = Vec::new();
+        let mut apart = false;
+        let mut start = 0;
+        for (i, row) in self.wrapped_lines.iter().enumerate() {
+            let end = start + row.len;
+            let (from, to) = (range.start.max(start), range.end.min(end));
+            if from < to {
+                let left = x_offset + self.line_indent(i);
+                let (from, to) = (from - start, to - start);
+                let row_spans = match drawn_spans(row, from..to) {
+                    Some(drawn) => {
+                        apart = true;
+                        drawn
+                    }
+                    None => smallvec::smallvec![row.x_for_index(from)..row.x_for_index(to)],
+                };
+                spans.extend(
+                    row_spans
+                        .into_iter()
+                        .map(|span| (i, span.start + left..span.end + left)),
+                );
+            }
+            start = end;
+        }
+        apart.then_some(spans)
     }
 
     /// Get the closest index for the given x in this line layout.
@@ -1561,6 +1660,56 @@ mod tests {
         for (x, at) in [(2., 0), (4., 1), (8., 1), (10., 2), (16., 3)] {
             assert_eq!(closest_grapheme_edge(&abc, px(x)), at, "a click at {x} on abc");
         }
+    }
+
+    /// `ab אב cd` laid out with its glyphs at `xs`, each 10 px on, as a bidi shaper draws
+    /// it: the Hebrew word drawn right to left.
+    fn mixed_row(order: [(f32, usize); 8]) -> gpui::LineLayout {
+        gpui::LineLayout {
+            width: px(80.),
+            len: 10,
+            runs: vec![gpui::ShapedRun {
+                font_id: gpui::FontId(0),
+                glyphs: order
+                    .iter()
+                    .map(|(x, index)| gpui::ShapedGlyph {
+                        id: gpui::GlyphId(0),
+                        position: point(px(*x), px(0.)),
+                        index: *index,
+                        is_emoji: false,
+                    })
+                    .collect(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A range in a row drawn in part right to left is painted over where its text is
+    /// drawn: the word of Hebrew picked in `ab אב cd`, its glyphs in the order of their
+    /// text or in the order they are drawn, and `b א` in two stretches. Painted from the
+    /// caret at its start to the caret at its end, the word was a 6 px sliver beside it
+    /// (elundqvist/kvist#669).
+    #[test]
+    fn a_range_in_right_to_left_letters_is_painted_where_it_is_drawn() {
+        let spans = |row: &gpui::LineLayout, range: Range<usize>| {
+            drawn_spans(row, range).map(|spans| {
+                spans
+                    .iter()
+                    .map(|span| (f32::from(span.start), f32::from(span.end)))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let in_text = [(0., 0), (10., 1), (20., 2), (40., 3), (30., 5), (50., 7), (60., 8), (70., 9)];
+        let as_drawn = [(0., 0), (10., 1), (20., 2), (30., 5), (40., 3), (50., 7), (60., 8), (70., 9)];
+        for order in [in_text, as_drawn] {
+            let row = mixed_row(order);
+            assert_eq!(spans(&row, 3..7), Some(vec![(30., 50.)]), "the word of Hebrew");
+            assert_eq!(spans(&row, 1..5), Some(vec![(10., 30.), (40., 50.)]), "`b א`");
+            assert_eq!(spans(&row, 0..10), Some(vec![(0., 80.)]), "the whole row");
+        }
+        // a row of Latin is painted from caret to caret, as it was
+        let latin = mixed_row([(0., 0), (10., 1), (20., 2), (30., 3), (40., 5), (50., 7), (60., 8), (70., 9)]);
+        assert_eq!(spans(&latin, 3..7), None);
     }
 
     #[test]

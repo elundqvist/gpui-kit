@@ -433,6 +433,36 @@ asks (section 4(b)); each says so at its top:
   shaped whole, that a key typed at the end or in the middle of a line
   of 7,000 characters shapes no more than a piece or two, and that the
   same words pasted over and over are cut too.
+- `src/text_system/line_layout.rs`: `LineLayout::x_for_index`,
+  `closest_index_for_x` and `index_for_x` follow the order glyphs are
+  drawn in, which is not their text's in right-to-left letters
+  (elundqvist/kvist#669): a caret before a cluster drawn right to left
+  stands at its right edge, where it is read from, and past the last at
+  that one's far end, where the caret stood at each letter's left edge, a
+  letter in from the right end of a row of Hebrew at its start and at its
+  left edge at its end; a click goes to the boundary whose caret stands
+  nearest it, of two in one place the one on the side of the cluster
+  clicked, where in the Hebrew of a mixed line it took the index the same
+  distance from the word's other end. A cluster goes right to left where
+  it is drawn next to the one before it in the text on its right, or next
+  to the one after it on its left, whichever order the glyphs come in: in
+  the order they are drawn in a line with a left-to-right letter, in
+  their text's in a line of right-to-left letters alone. Digits in Hebrew,
+  each drawn to the right of the one before, go left to right. Where the
+  clusters are drawn is found once for a line, the first time a caret or
+  a click asks, and kept in the new `LineLayout::drawn` (`DrawnOrder`,
+  which a line laid out takes with `Default::default()`); a line whose
+  glyphs each come after the one before in both orders is found to be one
+  in a pass over them and takes the code it took. `spans_for_range` gives
+  where the text of a range is drawn, a stretch for each part of the line
+  it covers, and `end_x_for_index` where a caret after the text before an
+  index stands. `WrappedLineLayout::position_for_index` measures a row's
+  carets from the row's left edge, where they were measured from the
+  caret at its start, the right end of a row of Hebrew, and stood left of
+  the row, and its end from where its own text ends; a click beside such a
+  row goes to the row's boundary nearest it. Tests of a row of Hebrew, of
+  Hebrew in Latin with its glyphs in either order, of digits in Hebrew, of
+  the spans of a range and of a wrapped row of Hebrew.
 
 ## Tests
 

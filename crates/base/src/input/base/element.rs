@@ -677,6 +677,10 @@ impl<M: InputModeKind> TextElement<M> {
             return None;
         }
 
+        if let Some(path) = Self::layout_drawn_range(&range, last_layout, bounds) {
+            return Some(path);
+        }
+
         let line_height = last_layout.line_height;
         let visible_top = last_layout.visible_top;
         let lines = &last_layout.lines;
@@ -818,6 +822,78 @@ impl<M: InputModeKind> TextElement<M> {
             builder.line_to(path_origin + *p);
         }
 
+        builder.build().ok()
+    }
+
+    /// `layout_match_range` where a row the range covers is drawn in part right to left: a
+    /// rectangle over each stretch of each row its text covers (`LineLayout::drawn_spans`),
+    /// where one from the caret at its start to the caret at its end was painted, a sliver
+    /// beside a word of Hebrew picked, and in a mixed line over what lay between
+    /// (elundqvist/kvist#669). `None` where each row it covers is drawn in order.
+    fn layout_drawn_range(
+        range: &Range<usize>,
+        last_layout: &LastLayout,
+        bounds: &Bounds<Pixels>,
+    ) -> Option<Path<Pixels>> {
+        let line_height = last_layout.line_height;
+        let mut offset_y = last_layout.visible_top;
+        let mut rects: Vec<Bounds<Pixels>> = Vec::new();
+        let mut apart = false;
+        for (line_start, line) in last_layout
+            .visible_line_byte_offsets
+            .iter()
+            .zip(last_layout.lines.iter())
+        {
+            let line_start = *line_start;
+            if line_start >= range.end {
+                break;
+            }
+            let line_end = line_start + line.len();
+            if line_end >= range.start {
+                let local = range.start.saturating_sub(line_start)..(range.end - line_start).min(line.len());
+                match line.drawn_spans(local.clone(), last_layout) {
+                    Some(spans) => {
+                        apart = true;
+                        rects.extend(spans.into_iter().map(|(row, span)| {
+                            let top = offset_y + line_height * row as f32;
+                            Bounds::from_corners(point(span.start, top), point(span.end, top + line_height))
+                        }));
+                    }
+                    None => {
+                        // a row drawn in order, from the caret at its start to the one at its
+                        // end, as `layout_match_range` paints it, and an empty line 6 px wide
+                        let start = line.position_for_index(local.start, last_layout, false);
+                        let end = line.position_for_index(local.end, last_layout, true);
+                        if let (Some(start), Some(end)) = (start, end) {
+                            let rows = ((end.y - start.y) / line_height).round() as usize;
+                            for row in 0..=rows {
+                                let top = start.y + line_height * row as f32;
+                                let left = if row == 0 { start.x } else { line.wrap_indent };
+                                let right = if row == rows { end.x } else { line.size(line_height).width };
+                                let right = if local.is_empty() { left + px(6.) } else { right };
+                                rects.push(Bounds::from_corners(
+                                    point(left, offset_y + top),
+                                    point(right, offset_y + top + line_height),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            offset_y += line.size(line_height).height;
+        }
+        if !apart {
+            return None;
+        }
+        let origin = bounds.origin + point(last_layout.line_number_width, px(0.));
+        let mut builder = gpui::PathBuilder::fill();
+        for rect in rects.iter().filter(|rect| rect.size.width > px(0.)) {
+            builder.move_to(origin + rect.origin);
+            builder.line_to(origin + rect.top_right());
+            builder.line_to(origin + rect.bottom_right());
+            builder.line_to(origin + rect.bottom_left());
+            builder.close();
+        }
         builder.build().ok()
     }
 

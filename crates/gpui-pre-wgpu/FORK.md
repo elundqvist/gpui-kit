@@ -159,6 +159,11 @@ asks (section 4(b)); a source file says so at its top:
   left and its extension after it, no glyph of the mark and its width
   the two parts', of Hebrew alone right to left, and of the indices past
   the mark.
+- `src/cosmic_text_system.rs`: a line laid out takes the fields of
+  gpui-pre's `LineLayout` it does not set from `Default::default()`, so it
+  builds with gpui-pre as published and with the fork's, whose
+  `LineLayout::drawn` keeps where a line's clusters are drawn
+  (elundqvist/kvist#669).
 
 ## Tests
 

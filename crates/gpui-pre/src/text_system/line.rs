@@ -77,6 +77,7 @@ impl ShapedLine {
             descent: layout.descent,
             runs: layout.runs.clone(),
             len,
+            drawn: Default::default(),
         });
         self
     }
@@ -859,6 +860,7 @@ mod tests {
                     glyphs: shaped_glyphs,
                 }],
                 len: text.len(),
+                drawn: Default::default(),
             }),
             text: SharedString::new(text),
             decoration_runs: SmallVec::from(decorations.to_vec()),
@@ -977,6 +979,7 @@ mod tests {
                     },
                 ],
                 len: 6,
+                drawn: Default::default(),
             }),
             text: "abcdef".into(),
             decoration_runs: SmallVec::new(),
@@ -1348,6 +1351,7 @@ mod tests {
                     ],
                 }],
                 len: 18,
+                drawn: Default::default(),
             }),
             text: "😀\u{20dd}😀😀EFE".into(),
             decoration_runs: SmallVec::new(),

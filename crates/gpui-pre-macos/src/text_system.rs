@@ -1,3 +1,5 @@
+// Changed in elundqvist/gpui-kit from gpui-pre-macos 0.3.3 as published to crates.io: FORK.md at
+// the crate's root says what and why (elundqvist/kvist#669).
 use anyhow::anyhow;
 use cocoa::appkit::CGFloat;
 use collections::{HashMap, HashSet};
@@ -624,6 +626,7 @@ impl MacTextSystemState {
             ascent: max_ascent.into(),
             descent: max_descent.into(),
             len: text.len(),
+            ..Default::default()
         }
     }
 }

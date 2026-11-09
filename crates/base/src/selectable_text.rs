@@ -73,18 +73,25 @@ impl SelectableText {
     }
 
     fn paint_selection(
+        text: &str,
         layout: &gpui::TextLayout,
         range: Range<usize>,
         color: Hsla,
         window: &mut Window,
     ) {
-        let (Some(start), Some(end)) = (
-            layout.position_for_index(range.start),
-            layout.position_for_index(range.end),
-        ) else {
-            return;
+        let quads = match crate::text_selection::drawn_selection(text, range.clone(), layout) {
+            Some(drawn) => drawn,
+            None => {
+                let (Some(start), Some(end)) = (
+                    layout.position_for_index(range.start),
+                    layout.position_for_index(range.end),
+                ) else {
+                    return;
+                };
+                selection_quad_bounds(start, end, layout.bounds(), layout.line_height())
+            }
         };
-        for bounds in selection_quad_bounds(start, end, layout.bounds(), layout.line_height()) {
+        for bounds in quads {
             window.paint_quad(PaintQuad {
                 bounds,
                 background: color.into(),
@@ -224,7 +231,7 @@ impl Element for SelectableText {
             .selection_color
             .unwrap_or_else(|| crate::Theme::global(cx).tokens.colors.selection);
         for range in projection.ranges().iter().flatten().cloned() {
-            Self::paint_selection(&layout, range, color, window);
+            Self::paint_selection(&self.text, &layout, range, color, window);
         }
         self.styled_text.paint(
             global_id,

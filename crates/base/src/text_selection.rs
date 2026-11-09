@@ -381,6 +381,72 @@ fn project_ranges(
     }
 }
 
+/// Where the characters of `text` in `range` are drawn in `layout`, a rectangle over each
+/// stretch of a row they cover, where `text` has a letter written right to left in it: in
+/// such text a selection painted from the caret at its start to the caret at its end was a
+/// rectangle of no width, or one over what lay between, and on a row read right to left the
+/// rest of the row after its start lies on its left (elundqvist/kvist#669). `None` in text
+/// with no such letter, whose selections are painted as they were.
+pub(crate) fn drawn_selection(
+    text: &str,
+    range: Range<usize>,
+    layout: &TextLayout,
+) -> Option<Vec<Bounds<Pixels>>> {
+    let selected = text.get(range.clone())?;
+    if !selected.chars().any(right_to_left) {
+        return None;
+    }
+    let line_height = layout.line_height();
+    // each row's stretches, by the row's top
+    let mut rows: Vec<(Pixels, Vec<Range<Pixels>>)> = Vec::new();
+    for (at, c) in selected.char_indices() {
+        let offset = range.start + at;
+        let Some(start) = layout.position_for_index(offset) else {
+            continue;
+        };
+        let span = match layout.position_for_index(offset + c.len_utf8()) {
+            Some(end) if end.y == start.y => start.x.min(end.x)..start.x.max(end.x),
+            _ => start.x..start.x + line_height.half(),
+        };
+        match rows.iter_mut().find(|(top, _)| *top == start.y) {
+            Some((_, spans)) => spans.push(span),
+            None => rows.push((start.y, vec![span])),
+        }
+    }
+    let mut drawn = Vec::new();
+    for (top, mut spans) in rows {
+        spans.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+        let mut merged: Vec<Range<Pixels>> = Vec::new();
+        for span in spans {
+            match merged.last_mut() {
+                Some(last) if span.start <= last.end + px(0.5) => last.end = last.end.max(span.end),
+                _ => merged.push(span),
+            }
+        }
+        drawn.extend(merged.into_iter().map(|span| {
+            Bounds::from_corners(point(span.start, top), point(span.end, top + line_height))
+        }));
+    }
+    Some(drawn)
+}
+
+/// Whether `c` is a letter written right to left, of Hebrew, Arabic and the scripts beside
+/// them, or a mark that has text drawn so.
+fn right_to_left(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0590}'..='\u{08FF}'
+            | '\u{FB1D}'..='\u{FDFF}'
+            | '\u{FE70}'..='\u{FEFF}'
+            | '\u{10800}'..='\u{10FFF}'
+            | '\u{1E800}'..='\u{1EFFF}'
+            | '\u{200F}'
+            | '\u{202B}'
+            | '\u{202E}'
+            | '\u{2067}'
+    )
+}
+
 fn selection_range_for_run(
     run: &TextSelectionRun,
     selection_start: Point<Pixels>,

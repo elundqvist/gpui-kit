@@ -31,6 +31,9 @@ pub struct LineLayout {
     pub runs: Vec<ShapedRun>,
     /// The length of the line in utf-8 bytes
     pub len: usize,
+    /// Where its clusters are drawn, where some are drawn right to left: found the first
+    /// time a caret or a click in it asks. A line laid out takes `Default::default()`.
+    pub drawn: DrawnOrder,
 }
 
 /// A run of text that has been shaped .
@@ -59,10 +62,13 @@ pub struct ShapedGlyph {
 }
 
 impl LineLayout {
-    /// The index for the character at the given x coordinate
+    /// The index for the character at the given x coordinate: in a line some of whose
+    /// clusters are drawn right to left, the cluster drawn over it (elundqvist/kvist#669)
     pub fn index_for_x(&self, x: Pixels) -> Option<usize> {
         if x >= self.width {
             None
+        } else if let Some(drawn) = self.drawn() {
+            Some(drawn.under(x).map_or(0, |c| drawn.clusters[c].start))
         } else {
             for run in self.runs.iter().rev() {
                 for glyph in run.glyphs.iter().rev() {
@@ -84,7 +90,23 @@ impl LineLayout {
     /// cluster, and a click on its right half, on the left of its second glyph, went to its
     /// start, which that glyph's start was taken for; the last cluster ends at the line's
     /// width, so a click on its left half goes before it, where it went to the line's end.
+    ///
+    /// In a line some of whose clusters are drawn right to left, it is the boundary whose
+    /// caret (`x_for_index`) stands nearest `x`: a click in a word of Hebrew took the index
+    /// the same distance from the word's other end (elundqvist/kvist#669). Where two
+    /// boundaries have their carets there alike, as the start of a word of Hebrew after
+    /// Latin and the end of the Hebrew before the Latin after it do, it is the one on the
+    /// side of `x` that the cluster drawn over it is read from.
     pub fn closest_index_for_x(&self, x: Pixels) -> usize {
+        match self.drawn() {
+            Some(drawn) => drawn.closest(x, 0..self.len, self.len),
+            None => self.closest_in_order(x),
+        }
+    }
+
+    /// `closest_index_for_x` in a line each of whose clusters is drawn to the right of the
+    /// one before it.
+    fn closest_in_order(&self, x: Pixels) -> usize {
         // the cluster before x: where it starts, and its index
         let mut prev_index = 0;
         let mut prev_x = px(0.);
@@ -117,8 +139,34 @@ impl LineLayout {
         self.len
     }
 
-    /// The x position of the character at the given index
+    /// `closest_index_for_x` among the boundaries of the text in `range`, its end taken as
+    /// the end of that text (`end_x_for_index`): the row of a wrapped line that `range` is,
+    /// whose end is not where the next row's start is drawn where it is read right to left.
+    pub(crate) fn closest_index_in(&self, x: Pixels, range: Range<usize>) -> usize {
+        match self.drawn() {
+            Some(drawn) => drawn.closest(x, range, self.len),
+            None => self.closest_in_order(x),
+        }
+    }
+
+    /// The x position of the character at the given index: where a caret before it
+    /// stands, at its left edge where it is drawn left to right and at its right edge where
+    /// it is drawn right to left, and past the last, at that one's far end as it is read. A
+    /// caret in a word of Hebrew stood at the left edge of each letter, so at the start of
+    /// the word it was a letter in from its right end, and at the row's left edge at its
+    /// end (elundqvist/kvist#669). Which way a cluster is drawn its neighbours in the text
+    /// tell: drawn next to the one before it on its right, or the one after it on its left,
+    /// it is drawn right to left. Digits in Hebrew are drawn left to right, each to the
+    /// right of the one before, and a lone letter among letters drawn the other way is
+    /// taken to be drawn as they are.
     pub fn x_for_index(&self, index: usize) -> Pixels {
+        if let Some(drawn) = self.drawn() {
+            let c = drawn.clusters.partition_point(|cluster| cluster.start < index);
+            return match drawn.clusters.get(c) {
+                Some(cluster) => cluster.caret(),
+                None => drawn.clusters.last().map_or(self.width, Cluster::caret_after),
+            };
+        }
         for run in &self.runs {
             for glyph in &run.glyphs {
                 if glyph.index >= index {
@@ -127,6 +175,60 @@ impl LineLayout {
             }
         }
         self.width
+    }
+
+    /// Where a caret at `index` stands as the end of the text before it: at the far end of
+    /// the cluster before it as it is read, where `x_for_index` has the caret at a line's
+    /// end. At the end of a row of a wrapped line that is the row's own end, where
+    /// `x_for_index` has the start of the row after it.
+    pub fn end_x_for_index(&self, index: usize) -> Pixels {
+        match self.drawn() {
+            Some(drawn) => {
+                match drawn.clusters.partition_point(|cluster| cluster.start < index) {
+                    0 => self.x_for_index(index),
+                    c => drawn.clusters[c - 1].caret_after(),
+                }
+            }
+            None => self.x_for_index(index),
+        }
+    }
+
+    /// Where the text in `range` is drawn, left to right: one span from the caret at its
+    /// start to the caret at its end in a line of left-to-right letters, and in a line some
+    /// of whose clusters are drawn right to left, each stretch its clusters cover. A
+    /// selection painted from its start's caret to its end's was a sliver beside a word of
+    /// Hebrew picked, and in a mixed line lit what lay between (elundqvist/kvist#669).
+    pub fn spans_for_range(&self, range: Range<usize>) -> SmallVec<[Range<Pixels>; 1]> {
+        let Some(drawn) = self.drawn() else {
+            return smallvec::smallvec![self.x_for_index(range.start)..self.x_for_index(range.end)];
+        };
+        let from = drawn.clusters.partition_point(|cluster| cluster.start < range.start);
+        let to = drawn.clusters.partition_point(|cluster| cluster.start < range.end);
+        let mut covered: SmallVec<[Range<Pixels>; 4]> = drawn.clusters[from..to.max(from)]
+            .iter()
+            .map(|cluster| cluster.left..cluster.right)
+            .collect();
+        covered.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+        let mut spans: SmallVec<[Range<Pixels>; 1]> = SmallVec::new();
+        for span in covered {
+            match spans.last_mut() {
+                Some(last) if span.start <= last.end + px(0.01) => last.end = last.end.max(span.end),
+                _ => spans.push(span),
+            }
+        }
+        spans
+    }
+
+    /// Whether each cluster of the line is drawn to the right of the one before it in its
+    /// text, as in a line of left-to-right letters: a caret, a click and a selection in it
+    /// are then where they were before right-to-left text was read (`x_for_index`).
+    pub fn is_drawn_in_order(&self) -> bool {
+        self.drawn().is_none()
+    }
+
+    /// Where the line's clusters are drawn, where some are drawn right to left.
+    fn drawn(&self) -> Option<&Drawn> {
+        self.drawn.0.get_or_init(|| Drawn::of(self).map(Box::new)).as_deref()
     }
 
     /// The corresponding Font at the given index
@@ -189,6 +291,7 @@ impl LineLayout {
             descent: self.descent,
             runs: left_runs,
             len: byte_index,
+            drawn: Default::default(),
         };
 
         let right = LineLayout {
@@ -198,6 +301,7 @@ impl LineLayout {
             descent: self.descent,
             runs: right_runs,
             len: self.len - byte_index,
+            drawn: Default::default(),
         };
 
         (left, right)
@@ -370,6 +474,182 @@ pub(crate) fn has_right_to_left(text: &str) -> bool {
     use unicode_bidi::{BidiClass, bidi_class};
     text.chars()
         .any(|c| !c.is_ascii() && matches!(bidi_class(c), BidiClass::R | BidiClass::AL))
+}
+
+/// Where the clusters of a line are drawn, where some of them are drawn right to left,
+/// found the first time a caret or a click in the line asks (`LineLayout::x_for_index`,
+/// elundqvist/kvist#669); in a line of left-to-right letters, nothing. A line laid out
+/// takes `Default::default()`, and one whose glyphs are moved after a caret was asked of
+/// it takes it anew.
+#[derive(Default, Debug)]
+pub struct DrawnOrder(std::sync::OnceLock<Option<Box<Drawn>>>);
+
+/// The clusters of a line some of whose clusters are drawn right to left.
+#[derive(Debug)]
+struct Drawn {
+    /// The clusters in the order of their text.
+    clusters: Box<[Cluster]>,
+    /// Where each is in `clusters`, in the order they are drawn, left to right.
+    by_x: Box<[u32]>,
+}
+
+impl Drawn {
+    /// The clusters of `line` and where they are drawn, `None` where each is drawn to
+    /// the right of the one before it in the text.
+    fn of(line: &LineLayout) -> Option<Self> {
+        let mut glyphs = line.runs.iter().flat_map(|run| &run.glyphs);
+        let mut last = glyphs.next()?;
+        let mut in_order = true;
+        for glyph in glyphs {
+            if glyph.index != last.index {
+                if glyph.index < last.index || glyph.position.x < last.position.x {
+                    in_order = false;
+                    break;
+                }
+                last = glyph;
+            }
+        }
+        if in_order {
+            return None;
+        }
+        let mut clusters: Vec<Cluster> = line
+            .runs
+            .iter()
+            .flat_map(|run| &run.glyphs)
+            .map(|glyph| Cluster {
+                start: glyph.index,
+                left: glyph.position.x,
+                right: line.width,
+                right_to_left: false,
+            })
+            .collect();
+        clusters.sort_by_key(|cluster| cluster.start);
+        clusters.dedup_by(|later, first| {
+            let same = later.start == first.start;
+            if same {
+                first.left = first.left.min(later.left);
+            }
+            same
+        });
+        if clusters.windows(2).all(|pair| pair[0].left <= pair[1].left) {
+            return None;
+        }
+        let mut by_x: Vec<u32> = (0..clusters.len() as u32).collect();
+        by_x.sort_by(|a, b| {
+            let (a, b) = (clusters[*a as usize].left, clusters[*b as usize].left);
+            a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        // each ends where the one drawn next to its right begins
+        let mut rank = vec![0u32; clusters.len()];
+        for (k, c) in by_x.iter().enumerate() {
+            rank[*c as usize] = k as u32;
+        }
+        for pair in by_x.windows(2) {
+            clusters[pair[0] as usize].right = clusters[pair[1] as usize].left;
+        }
+        // drawn next to the one before it in the text on its right, or next to the one
+        // after it on its left: right to left. Drawn next to them the other way, or next
+        // to neither, left to right; the two ways never both hold.
+        for c in 0..clusters.len() {
+            let r = rank[c];
+            let before = c.checked_sub(1).map(|b| rank[b]);
+            let after = rank.get(c + 1).copied();
+            clusters[c].right_to_left =
+                before == Some(r + 1) || (r > 0 && after == Some(r - 1));
+        }
+        Some(Self {
+            clusters: clusters.into(),
+            by_x: by_x.into(),
+        })
+    }
+
+    /// The cluster drawn over `x`, where it is in `clusters`: none left of the first.
+    fn under(&self, x: Pixels) -> Option<usize> {
+        let k = self
+            .by_x
+            .partition_point(|c| self.clusters[*c as usize].left <= x);
+        k.checked_sub(1).map(|k| self.by_x[k] as usize)
+    }
+
+    /// Where the text after the `c`th cluster starts.
+    fn end_of(&self, c: usize, len: usize) -> usize {
+        self.clusters.get(c + 1).map_or(len, |next| next.start)
+    }
+
+    /// The boundary of the text in `range` whose caret stands nearest `x`, the end of
+    /// `range` taken as the end of its text; of two whose carets stand there alike, the one
+    /// on the side of `x` that the cluster drawn over it is read from.
+    fn closest(&self, x: Pixels, range: Range<usize>, len: usize) -> usize {
+        let from = self.clusters.partition_point(|cluster| cluster.start < range.start);
+        let to = self.clusters.partition_point(|cluster| cluster.start < range.end);
+        let end = match to.checked_sub(1) {
+            Some(last) if last >= from => self.clusters[last].caret_after(),
+            _ => return range.start,
+        };
+        let mut carets = self.clusters[from..to]
+            .iter()
+            .map(|cluster| (cluster.start, cluster.caret()))
+            .chain([(range.end, end)]);
+        // the side of the cluster under x it is read from
+        let side = self
+            .under(x)
+            .or_else(|| self.by_x.first().map(|c| *c as usize))
+            .map(|c| {
+                let cluster = &self.clusters[c];
+                let right_half = x >= (cluster.left + cluster.right) / 2.;
+                if right_half == cluster.right_to_left {
+                    cluster.start
+                } else {
+                    self.end_of(c, len)
+                }
+            });
+        let nearest = carets
+            .clone()
+            .map(|(_, caret)| (caret - x).abs())
+            .fold(Pixels::MAX, Pixels::min);
+        if let Some(side) = side
+            && carets
+                .clone()
+                .any(|(index, caret)| index == side && (caret - x).abs() <= nearest + px(0.5))
+        {
+            return side;
+        }
+        carets
+            .find(|(_, caret)| (*caret - x).abs() <= nearest)
+            .map_or(range.start, |(index, _)| index)
+    }
+}
+
+/// A cluster of a line's glyphs, drawn from `left` to `right`, its text from `start`
+/// (`Drawn`).
+#[derive(Debug)]
+struct Cluster {
+    start: usize,
+    left: Pixels,
+    right: Pixels,
+    right_to_left: bool,
+}
+
+impl Cluster {
+    /// Where a caret before the cluster stands: at its left edge, or its right edge where
+    /// it is drawn right to left.
+    fn caret(&self) -> Pixels {
+        if self.right_to_left {
+            self.right
+        } else {
+            self.left
+        }
+    }
+
+    /// Where a caret after the cluster stands: at its right edge, or its left edge where
+    /// it is drawn right to left.
+    fn caret_after(&self) -> Pixels {
+        if self.right_to_left {
+            self.left
+        } else {
+            self.right
+        }
+    }
 }
 
 /// How long, in bytes, a line is past which it is shaped in pieces
@@ -634,15 +914,28 @@ impl WrappedLineLayout {
 
         let mut position_in_unwrapped_line = position;
         position_in_unwrapped_line.x += wrapped_line_start_x;
+        // beside a row with text read right to left in it, the boundary of the row whose
+        // caret stands nearest: its end is on its left where the row is read so
+        let beside = position_in_unwrapped_line.x < wrapped_line_start_x
+            || position_in_unwrapped_line.x >= wrapped_line_end_x;
+        if beside && !self.unwrapped_layout.is_drawn_in_order() {
+            return Err(self.unwrapped_layout.closest_index_in(
+                position_in_unwrapped_line.x,
+                wrapped_line_start_index..wrapped_line_end_index,
+            ));
+        }
         if position_in_unwrapped_line.x < wrapped_line_start_x {
             Err(wrapped_line_start_index)
         } else if position_in_unwrapped_line.x >= wrapped_line_end_x {
             Err(wrapped_line_end_index)
         } else {
             if closest {
-                Ok(self
-                    .unwrapped_layout
-                    .closest_index_for_x(position_in_unwrapped_line.x))
+                // among the row's own boundaries, its end the end of its text: in a
+                // row read right to left, the next row's start is drawn on that row
+                Ok(self.unwrapped_layout.closest_index_in(
+                    position_in_unwrapped_line.x,
+                    wrapped_line_start_index..wrapped_line_end_index,
+                ))
             } else {
                 Ok(self
                     .unwrapped_layout
@@ -650,6 +943,15 @@ impl WrappedLineLayout {
                     .unwrap())
             }
         }
+    }
+
+    /// Where the row after the `ix`th wrap boundary begins to be drawn: its first glyph
+    /// drawn, at its left edge.
+    fn boundary_x(&self, ix: usize) -> Pixels {
+        let boundary = self.wrap_boundaries[ix];
+        self.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix]
+            .position
+            .x
     }
 
     /// Returns the pixel position for the given byte index.
@@ -667,9 +969,22 @@ impl WrappedLineLayout {
                 line_start_ix = line_end_ix;
                 continue;
             } else {
-                let line_start_x = self.unwrapped_layout.x_for_index(line_start_ix);
-                let x = self.unwrapped_layout.x_for_index(index) - line_start_x;
-                return Some(point(x, line_y));
+                // from the row's left edge, where its first glyph drawn is: the caret
+                // at the row's start stands at its right end where it is read right to
+                // left, and every caret in it was taken from there, left of the row
+                // (elundqvist/kvist#669)
+                let line_start_x = match ix.checked_sub(1) {
+                    Some(boundary) => self.boundary_x(boundary),
+                    None => Pixels::ZERO,
+                };
+                // the end of a row before another is its own end, not where the next
+                // row's start is drawn
+                let x = if index == line_end_ix && ix < self.wrap_boundaries.len() {
+                    self.unwrapped_layout.end_x_for_index(index)
+                } else {
+                    self.unwrapped_layout.x_for_index(index)
+                };
+                return Some(point(x - line_start_x, line_y));
             }
         }
 
@@ -1278,6 +1593,8 @@ impl LineLayoutCache {
 // otherwise they get displaced into the next cell. We detect them by checking
 // whether shaped x has advanced by at least half a cell beyond the last base.
 fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
+    // where its clusters are drawn is found again for where they are moved to
+    layout.drawn = DrawnOrder::default();
     let mut glyph_pos: usize = 0;
     // NEG_INFINITY ensures the first glyph is always classified as a base.
     let mut last_base_shaped_x = px(f32::NEG_INFINITY);
@@ -1475,6 +1792,7 @@ mod tests {
                 glyphs,
             }],
             len: 0,
+            drawn: Default::default(),
         }
     }
 
@@ -1756,6 +2074,7 @@ mod tests {
                     glyphs,
                 }],
                 len: text.len(),
+                drawn: Default::default(),
             }
         }
         fn recommended_rendering_mode(
@@ -2072,5 +2391,215 @@ mod tests {
         // and a short line, and one with no space to cut it at
         assert!(pieces(&words(LONG_LINE)).is_none());
         assert!(pieces(&"x".repeat(7000)).is_none());
+    }
+
+    /// A line of three Hebrew letters drawn right to left, each 10 px wide,
+    /// its glyphs in the order of their text, and a line of Latin with a
+    /// Hebrew word in it, `ab אב cd`, its glyphs in the order of their text
+    /// as a bidi shaper may give them.
+    fn hebrew() -> (LineLayout, LineLayout) {
+        let alone = LineLayout {
+            width: px(30.),
+            len: 6,
+            ..make_layout(vec![glyph_at(20., 0), glyph_at(10., 2), glyph_at(0., 4)])
+        };
+        let mixed = LineLayout {
+            width: px(80.),
+            len: 10,
+            ..make_layout(vec![
+                glyph_at(0., 0),
+                glyph_at(10., 1),
+                glyph_at(20., 2),
+                glyph_at(40., 3),
+                glyph_at(30., 5),
+                glyph_at(50., 7),
+                glyph_at(60., 8),
+                glyph_at(70., 9),
+            ])
+        };
+        (alone, mixed)
+    }
+
+    /// `ab אב cd` with its glyphs in the order they are drawn, as
+    /// cosmic-text gives a line with a left-to-right letter in it.
+    fn hebrew_drawn() -> LineLayout {
+        LineLayout {
+            width: px(80.),
+            len: 10,
+            ..make_layout(vec![
+                glyph_at(0., 0),
+                glyph_at(10., 1),
+                glyph_at(20., 2),
+                glyph_at(30., 5),
+                glyph_at(40., 3),
+                glyph_at(50., 7),
+                glyph_at(60., 8),
+                glyph_at(70., 9),
+            ])
+        }
+    }
+
+    /// A caret in letters drawn right to left stands at the right edge of
+    /// the letter after it, as it is read: at the start of a word of
+    /// Hebrew at its right end, and at its end at its left. It stood at
+    /// each letter's left edge, at the row's left edge at the word's end
+    /// (elundqvist/kvist#669).
+    #[test]
+    fn a_caret_in_right_to_left_letters_stands_where_they_are_read_from() {
+        let (alone, mixed) = hebrew();
+        let at = |line: &LineLayout, ix: &[usize]| {
+            ix.iter().map(|i| f32::from(line.x_for_index(*i))).collect::<Vec<_>>()
+        };
+        assert_eq!(at(&alone, &[0, 2, 4, 6]), [30., 20., 10., 0.]);
+        // the Latin as it was, the word of Hebrew from its right end, its
+        // glyphs in either order
+        for mixed in [mixed, hebrew_drawn()] {
+            assert_eq!(
+                at(&mixed, &[0, 1, 2, 3, 5, 7, 8, 9, 10]),
+                [0., 10., 20., 50., 40., 50., 60., 70., 80.]
+            );
+        }
+        // a line of Latin alone as it was
+        let latin = LineLayout {
+            width: px(30.),
+            len: 3,
+            ..make_layout(vec![glyph_at(0., 0), glyph_at(10., 1), glyph_at(20., 2)])
+        };
+        assert_eq!(at(&latin, &[0, 1, 2, 3]), [0., 10., 20., 30.]);
+    }
+
+    /// A click in letters drawn right to left goes to the boundary whose
+    /// caret stands nearest it, and so does what is under the pointer: it
+    /// took the index the same distance from the word's other end
+    /// (elundqvist/kvist#669).
+    #[test]
+    fn a_click_in_right_to_left_letters_goes_where_it_lands() {
+        let (alone, mixed) = hebrew();
+        let closest = |line: &LineLayout, x: &[f32]| {
+            x.iter().map(|x| line.closest_index_for_x(px(*x))).collect::<Vec<_>>()
+        };
+        // the right end of the word is its start, its left end its end
+        assert_eq!(closest(&alone, &[35., 29., 24., 14., 4., -5.]), [0, 0, 2, 4, 6, 6]);
+        assert_eq!(alone.index_for_x(px(25.)), Some(0));
+        assert_eq!(alone.index_for_x(px(5.)), Some(4));
+        // a word of two letters, its first drawn at its right end
+        let two = LineLayout {
+            width: px(20.),
+            len: 4,
+            ..make_layout(vec![glyph_at(10., 0), glyph_at(0., 2)])
+        };
+        assert_eq!(closest(&two, &[16., 9., 3.]), [0, 2, 4]);
+        for mixed in [mixed, hebrew_drawn()] {
+            assert_eq!(closest(&mixed, &[2., 18., 38., 43., 64., 90.]), [0, 2, 5, 5, 8, 10]);
+            assert_eq!(mixed.index_for_x(px(33.)), Some(5));
+            assert_eq!(mixed.index_for_x(px(45.)), Some(3));
+        }
+    }
+
+    /// `abc שלום 123`, a letter a byte, with its glyphs in the order they
+    /// are drawn, as cosmic-text gives a line with Latin in it: the digits
+    /// after the Hebrew drawn left of it, left to right.
+    fn digits_in_hebrew() -> LineLayout {
+        let order = [0, 1, 2, 3, 9, 10, 11, 8, 7, 6, 5, 4];
+        LineLayout {
+            width: px(120.),
+            len: 12,
+            ..make_layout(
+                order
+                    .iter()
+                    .enumerate()
+                    .map(|(at, index)| glyph_at(at as f32 * 10., *index))
+                    .collect(),
+            )
+        }
+    }
+
+    /// Digits in a run of Hebrew are drawn left to right, each to the
+    /// right of the one before: a caret before each stands at its left
+    /// edge, and after a number at a line's end at its right. The digit
+    /// right of the space before it was taken to be drawn right to left,
+    /// and the carets before the Hebrew and the space stood on the number,
+    /// as the first glyph past them in the text was its first digit
+    /// (elundqvist/kvist#669).
+    #[test]
+    fn a_caret_in_digits_in_right_to_left_letters_stands_as_they_are_read() {
+        let line = digits_in_hebrew();
+        let at: Vec<f32> = (0..=12).map(|i| f32::from(line.x_for_index(i))).collect();
+        assert_eq!(
+            at,
+            [0., 10., 20., 30., 120., 110., 100., 90., 80., 40., 50., 60., 70.]
+        );
+        let closest = |x: &[f32]| x.iter().map(|x| line.closest_index_for_x(px(*x))).collect::<Vec<_>>();
+        assert_eq!(closest(&[34., 44., 67., 76., 103., 118., 125.]), [3, 9, 12, 8, 6, 4, 4]);
+        // where the end of the Hebrew and the start of the Latin after it
+        // have their carets alike, the side of the cluster clicked
+        let split = hebrew_drawn();
+        assert_eq!(split.closest_index_for_x(px(49.)), 3, "on the right half of `א`");
+        assert_eq!(split.closest_index_for_x(px(51.)), 7, "on the left half of the space");
+    }
+
+    /// What a selection paints is where its text is drawn: the Hebrew
+    /// picked in a mixed line, glyphs in either order, and a stretch from
+    /// the Latin into the Hebrew in two spans, not what lies between
+    /// their carets (elundqvist/kvist#669).
+    #[test]
+    fn a_range_in_right_to_left_letters_spans_where_it_is_drawn() {
+        let spans = |line: &LineLayout, range: Range<usize>| {
+            line.spans_for_range(range)
+                .iter()
+                .map(|span| (f32::from(span.start), f32::from(span.end)))
+                .collect::<Vec<_>>()
+        };
+        let (alone, mixed) = hebrew();
+        for mixed in [mixed, hebrew_drawn()] {
+            assert_eq!(spans(&mixed, 3..7), [(30., 50.)], "the word of Hebrew");
+            assert_eq!(spans(&mixed, 0..5), [(0., 30.), (40., 50.)], "`ab ` and `א`");
+        }
+        assert_eq!(spans(&alone, 0..6), [(0., 30.)]);
+        assert_eq!(spans(&alone, 0..2), [(20., 30.)]);
+        let line = digits_in_hebrew();
+        assert_eq!(spans(&line, 4..8), [(80., 120.)]);
+        assert_eq!(spans(&line, 2..10), [(20., 50.), (70., 120.)]);
+        // a line of Latin alone, from caret to caret as it was
+        let latin = LineLayout {
+            width: px(30.),
+            len: 3,
+            ..make_layout(vec![glyph_at(0., 0), glyph_at(10., 1), glyph_at(20., 2)])
+        };
+        assert!(latin.is_drawn_in_order());
+        assert_eq!(spans(&latin, 1..3), [(10., 30.)]);
+    }
+
+    /// The carets of a wrapped row of Hebrew alone stand within the row,
+    /// its start at its right end and its end at its left, and a click
+    /// left of it goes to its end: each was taken from the caret at the
+    /// row's start, which stands at its right end, and stood left of the
+    /// row (elundqvist/kvist#669).
+    #[test]
+    fn a_caret_in_a_wrapped_row_of_hebrew_stands_within_the_row() {
+        let cache = LineLayoutCache::new(Arc::new(BidiTextSystem));
+        let word = "\u{05D0}\u{05D1}\u{05D2}";
+        let text = [word; 6].join(" ");
+        let runs = [FontRun {
+            len: text.len(),
+            font_id: FontId(0),
+        }];
+        let wrapped = cache.layout_wrapped_line(&text, px(16.), &runs, Some(px(80.)), None);
+        let line_height = px(20.);
+        let second = wrapped.row_start(0);
+        assert_eq!(second, 14, "two words a row");
+        for (index, _) in text.char_indices().chain([(text.len(), ' ')]) {
+            let at = wrapped.position_for_index(index, line_height).unwrap();
+            assert!(
+                px(0.) <= at.x && at.x <= px(80.),
+                "the caret at {index} at {at:?}, outside its row"
+            );
+        }
+        let x = |index| f32::from(wrapped.position_for_index(index, line_height).unwrap().x);
+        assert_eq!((x(0), x(second)), (80., 0.), "the first row's start and end");
+        assert_eq!((x(second + 2), x(text.len())), (70., 0.), "the next rows'");
+        let row = |x: f32| point(px(x), line_height * 1.5);
+        assert_eq!(wrapped.closest_index_for_position(row(78.), line_height), Ok(second));
+        assert_eq!(wrapped.closest_index_for_position(row(-5.), line_height), Err(2 * second));
     }
 }
